@@ -1,5 +1,5 @@
 [build]
-builder = "nixpacks"
+builder = "railpack"
 buildCommand = "npm --prefix shared run build && npm run build"
 
 [deploy]
