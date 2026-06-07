@@ -1,0 +1,9 @@
+[build]
+builder = "nixpacks"
+buildCommand = "npm --prefix shared run build && npm run build"
+
+[deploy]
+startCommand = "node dist/main.js"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
