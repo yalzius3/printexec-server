@@ -68,10 +68,6 @@ const CONTENT_TYPES: Record<string, string> = {
   ".txt": "text/plain",
   ".csv": "text/csv"
 };
-const UPLOAD_ROOTS = [
-  path.resolve(process.cwd(), "uploads"),
-  path.resolve(process.cwd(), "server", "uploads"),
-];
 
 @Controller("uploads")
 export class UploadsController {
@@ -98,26 +94,20 @@ export class UploadsController {
       throw new BadRequestException("Invalid file name.");
     }
 
-    let resolved: string | null = null;
-    let stat: fs.Stats | null = null;
-    for (const root of UPLOAD_ROOTS) {
-      const candidate = path.resolve(root, companyIdParam, filename);
-      // Defense in depth: the resolved path must stay inside a known uploads root.
-      if (candidate !== root && !candidate.startsWith(root + path.sep)) {
-        continue;
-      }
-      try {
-        const candidateStat = await fs.promises.stat(candidate);
-        if (!candidateStat.isFile()) continue;
-        resolved = candidate;
-        stat = candidateStat;
-        break;
-      } catch {
-        // Try the legacy root next.
-      }
+    const root = path.resolve(process.cwd(), "uploads");
+    const resolved = path.resolve(root, companyIdParam, filename);
+    // Defense in depth: the resolved path must stay inside the uploads root.
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new ForbiddenException("You do not have access to this file.");
     }
 
-    if (!resolved || !stat) {
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(resolved);
+    } catch {
+      throw new NotFoundException("File not found.");
+    }
+    if (!stat.isFile()) {
       throw new NotFoundException("File not found.");
     }
 
@@ -141,7 +131,7 @@ export class UploadsController {
       throw new BadRequestException("No file uploaded");
     }
 
-    const uploadDir = path.join(UPLOAD_ROOTS[0]!, companyId);
+    const uploadDir = path.join(process.cwd(), "uploads", companyId);
     await fs.promises.mkdir(uploadDir, { recursive: true });
 
     const extension = path.extname(data.filename);
