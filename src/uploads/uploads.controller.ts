@@ -17,14 +17,14 @@ import "@fastify/multipart";
 import { CompanyId } from "../common/company-id.decorator";
 import { Public } from "../auth/public.decorator";
 import { UploadCookieGuard } from "../auth/upload-cookie.guard";
+import { ConfigService } from "@nestjs/config";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as fs from "fs";
 import * as path from "path";
 import * as zlib from "zlib";
 import { v4 as uuidv4 } from "uuid";
-import { pipeline } from "stream";
 import { promisify } from "util";
 
-const pump = promisify(pipeline);
 const inflateRaw = promisify(zlib.inflateRaw);
 
 // Cap inflated ZIP-entry output to defuse zip bombs (a tiny compressed entry
@@ -69,8 +69,19 @@ const CONTENT_TYPES: Record<string, string> = {
   ".csv": "text/csv"
 };
 
+const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "uploads";
+
 @Controller("uploads")
 export class UploadsController {
+  private readonly supabase: SupabaseClient;
+
+  constructor(private readonly config: ConfigService) {
+    this.supabase = createClient(
+      this.config.getOrThrow<string>("SUPABASE_URL"),
+      this.config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY")
+    );
+  }
+
   // Guarded file serving. Replaces the former @fastify/static mount, which
   // bypassed all auth and let any party read any company's files by guessing a
   // URL. Authorized via the signed upload-session cookie (UploadCookieGuard,
@@ -94,27 +105,21 @@ export class UploadsController {
       throw new BadRequestException("Invalid file name.");
     }
 
-    const root = path.resolve(process.cwd(), "uploads");
-    const resolved = path.resolve(root, companyIdParam, filename);
-    // Defense in depth: the resolved path must stay inside the uploads root.
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      throw new ForbiddenException("You do not have access to this file.");
-    }
-
-    let stat: fs.Stats;
-    try {
-      stat = await fs.promises.stat(resolved);
-    } catch {
+    // Durable bytes live in Supabase Storage — the Railway container disk is
+    // ephemeral (wiped on every restart/redeploy). The object key mirrors the
+    // historical on-disk layout: "<companyId>/<filename>".
+    const { data, error } = await this.supabase.storage
+      .from(UPLOAD_BUCKET)
+      .download(`${companyIdParam}/${filename}`);
+    if (error || !data) {
       throw new NotFoundException("File not found.");
     }
-    if (!stat.isFile()) {
-      throw new NotFoundException("File not found.");
-    }
+    const bytes = Buffer.from(await data.arrayBuffer());
 
     const contentType = CONTENT_TYPES[path.extname(filename).toLowerCase()] ?? "application/octet-stream";
     reply.header("Content-Type", contentType);
-    reply.header("Content-Length", stat.size);
-    return reply.send(fs.createReadStream(resolved));
+    reply.header("Content-Length", bytes.byteLength);
+    return reply.send(bytes);
   }
 
   @Post()
@@ -131,50 +136,51 @@ export class UploadsController {
       throw new BadRequestException("No file uploaded");
     }
 
-    const uploadDir = path.join(process.cwd(), "uploads", companyId);
-    await fs.promises.mkdir(uploadDir, { recursive: true });
-
     const extension = path.extname(data.filename);
     const filename = `${uuidv4()}${extension}`;
-    const filePath = path.join(uploadDir, filename);
+    const objectKey = `${companyId}/${filename}`;
 
+    // Buffer the upload, then persist the durable copy to Supabase Storage. The
+    // Railway container disk is ephemeral (wiped on restart/redeploy), so files
+    // must live off-box to survive.
+    let buffer: Buffer;
     try {
-      await pump(data.file, fs.createWriteStream(filePath));
+      buffer = await data.toBuffer();
     } catch (err) {
-      // Drop any partial file before surfacing the error.
-      await fs.promises.unlink(filePath).catch(() => { /* ignore */ });
       const code = (err as { code?: string } | null)?.code;
       if (code === "FST_REQ_FILE_TOO_LARGE") {
         throw new PayloadTooLargeException("File exceeds the upload size limit.");
       }
-      throw new InternalServerErrorException("Failed to save file");
+      throw new InternalServerErrorException("Failed to read upload");
     }
 
     if (data.file.truncated) {
-      await fs.promises.unlink(filePath).catch(() => { /* ignore */ });
       throw new PayloadTooLargeException("File exceeds the upload size limit.");
     }
 
-    // When the client asks (?parse=slicer), best-effort parse the slicer file.
-    // Failure is silent — the operator can always type the values.
+    const contentType = CONTENT_TYPES[extension.toLowerCase()] ?? "application/octet-stream";
+    const { error } = await this.supabase.storage
+      .from(UPLOAD_BUCKET)
+      .upload(objectKey, buffer, { contentType, upsert: false });
+    if (error) {
+      throw new InternalServerErrorException("Failed to save file");
+    }
+
+    // When the client asks (?parse=slicer), best-effort parse the slicer file
+    // from the in-memory buffer. Failure is silent — the operator can always
+    // type the values.
     const parse = (req.query as { parse?: string } | undefined)?.parse;
     let parsed: SlicerParseResult = {};
     if (parse === "slicer") {
-      const ext = extension.toLowerCase();
-      const buffer = ext === ".gcode" || ext === ".gco" || ext === ".g"
-        ? Buffer.from(await this.readGcodeWindowText(filePath), "latin1")
-        : await fs.promises.readFile(filePath);
       parsed = await this.parseSlicerFile(buffer, extension);
     }
-
-    const { size } = await fs.promises.stat(filePath);
 
     // Returned URL is served by the guarded GET route below under the API prefix
     // so it travels through the same proxy/CORS path as the rest of the app.
     return {
       url: `/api/uploads/${companyId}/${filename}`,
       originalName: data.filename,
-      size,
+      size: buffer.length,
       ...(parsed.slicer_print_time_minutes != null ? { slicer_print_time_minutes: parsed.slicer_print_time_minutes } : {}),
       ...(parsed.slicer_filament_used_grams != null ? { slicer_filament_used_grams: parsed.slicer_filament_used_grams } : {}),
     };
