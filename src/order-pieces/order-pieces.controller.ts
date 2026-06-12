@@ -19,10 +19,28 @@ import {
   updateOrderPieceSchema
 } from "../orders/orders.schemas";
 import { OrderPiecesService } from "./order-pieces.service";
+import { z } from "zod";
+
+const bulkDeletePiecesSchema = z.object({
+  piece_ids: z.array(z.string().uuid()).min(1).max(500),
+  force: z.boolean().optional()
+});
 
 @Controller("order-pieces")
 export class OrderPiecesController {
   constructor(private readonly orderPiecesService: OrderPiecesService) {}
+
+  // Transactional batch delete: removes all listed pieces, then re-evaluates
+  // each affected bed once (all-removed → delete bed, some-kept → disassemble).
+  @Post("bulk-delete")
+  @RequirePermission("action_orders")
+  bulkDeletePieces(
+    @CompanyId() companyId: string,
+    @Body() body: unknown
+  ) {
+    const { piece_ids, force } = parseWithSchema(bulkDeletePiecesSchema, body);
+    return this.orderPiecesService.deletePieces(companyId, piece_ids, { force: force ?? false });
+  }
 
   @Get()
   @RequirePermission("view_orders")

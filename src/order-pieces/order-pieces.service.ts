@@ -523,6 +523,67 @@ export class OrderPiecesService {
     return { deleted: true, piece_id: pieceId };
   }
 
+  /**
+   * Delete several pieces in ONE transaction, then re-evaluate each affected
+   * bed exactly once. This makes "remove all of a bed's pieces" settle on a
+   * DELETED bed (zero left) instead of the orphaned 'disassembled' state the
+   * per-piece path leaves when it disassembles on the first removal. Per-piece
+   * guards, spool release, history and order re-derivation are unchanged.
+   */
+  async deletePieces(
+    companyId: string,
+    pieceIds: string[],
+    options?: { force?: boolean }
+  ) {
+    const force = options?.force ?? false;
+    const uniqueIds = [...new Set(pieceIds)];
+
+    // Same guards the single delete applies, validated up front.
+    const pieces: Array<{ piece_id: string; order_id: string; bed_id: string | null; piece_name: string; status: string }> = [];
+    for (const pieceId of uniqueIds) {
+      const piece = await this.getPieceById(companyId, pieceId);
+      const order = await this.assertOrderExists(companyId, piece.order_id);
+      if (!force) {
+        this.assertOrderOpenForPieceChanges(order.status);
+        if (["printing", "done", "failed"].includes(piece.status)) {
+          throw new BadRequestException(
+            "Printing or completed piece records cannot be deleted."
+          );
+        }
+      }
+      pieces.push(piece);
+    }
+
+    await this.databaseService.transaction(async (client) => {
+      const bedIds = new Set<string>();
+      const orderIds = new Set<string>();
+
+      for (const piece of pieces) {
+        await releasePieceSpoolsTx(client, companyId, piece.piece_id);
+        await this.databaseService.query(
+          `DELETE FROM order_pieces WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, piece.piece_id],
+          client
+        );
+        if (piece.bed_id) bedIds.add(piece.bed_id);
+        orderIds.add(piece.order_id);
+        await this.logPieceHistory(client, companyId, null, piece.order_id, piece.piece_name, "deleted",
+          `Piece "${piece.piece_name}" deleted.`);
+      }
+
+      // ONE re-evaluation per affected bed, now that every selected piece is
+      // gone: all-removed → bed deleted; some kept → bed disassembled.
+      for (const bedId of bedIds) {
+        await reevaluateBedAfterPieceRemoval(client, companyId, bedId);
+      }
+      for (const orderId of orderIds) {
+        await this.syncOrderStatus(companyId, orderId, client);
+      }
+    });
+
+    return { deleted: uniqueIds.length, piece_ids: uniqueIds };
+  }
+
   async duplicatePiece(
     companyId: string,
     pieceId: string,

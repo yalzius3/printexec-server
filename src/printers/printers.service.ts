@@ -420,10 +420,10 @@ export class PrintersService {
           VALUES (
             $1, $2, FALSE, FALSE, FALSE,
             NULL, NULL, NULL, NULL, NULL, NULL,
-            NULL, NULL, NULL, 0, NULL
+            NULL, NULL, NULL, $3, NULL
           )
         `,
-        [createdPrinterRow.printer_id, companyId],
+        [createdPrinterRow.printer_id, companyId, input.total_print_hours ?? 0],
         client
       );
 
@@ -851,7 +851,11 @@ export class PrintersService {
           WHERE noz.asset_id = ps.current_nozzle_asset_id LIMIT 1) AS current_nozzle_label,
         ps.maintenance_started_at,
         ps.maintenance_reason,
-        COALESCE(
+        -- Total worked hours = an operator-owned BASE (initialized at creation,
+        -- editable via the stock PATCH) PLUS auto-accumulated completed-print
+        -- time. The base is exposed separately so the editor can show/edit it.
+        ps.total_print_hours AS total_print_hours_base,
+        (COALESCE(ps.total_print_hours, 0) + COALESCE(
           (SELECT ROUND(SUM(mins)::numeric / 60.0, 2) FROM (
              SELECT COALESCE(op.actual_print_time_minutes, op.slicer_print_time_minutes, 0) AS mins
                FROM order_pieces op
@@ -863,8 +867,8 @@ export class PrintersService {
               WHERE pb.assigned_printer_id = pi.printer_id AND pb.company_id = pi.company_id
                 AND pb.status = 'done'
            ) u),
-          ps.total_print_hours
-        ) AS total_print_hours,
+          0
+        )) AS total_print_hours,
         ps.last_maintenance_at,
         ps.last_updated_at AS stock_last_updated_at
       FROM printer_instances pi

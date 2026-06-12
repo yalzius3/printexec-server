@@ -235,7 +235,10 @@ export const createPrinterSchema = z
     serial_number: serialNumberSchema.optional(),
     purchase_date: dateSchema,
     location: z.string().trim().min(1).optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    // Operator-set starting meter for hours already worked before this printer
+    // was added to the system. Editable later via the stock PATCH.
+    total_print_hours: z.coerce.number().min(0).optional()
   })
   .superRefine((value, ctx) => {
     if (!value.printer_ref_id && !value.custom_reference) {

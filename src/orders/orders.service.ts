@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import type { z } from "zod";
 import { recordOrderHistory } from "../common/order-history";
+import { reevaluateBedAfterPieceRemoval } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import {
@@ -508,9 +509,9 @@ export class OrdersService {
 
     await this.databaseService.transaction(async (client) => {
       // Snapshot pieces before cascading so they can be logged individually.
-      const pieces = await client.query<{ piece_id: string; piece_name: string }>(
+      const pieces = await client.query<{ piece_id: string; piece_name: string; bed_id: string | null }>(
         `
-          SELECT piece_id, piece_name
+          SELECT piece_id, piece_name, bed_id
           FROM order_pieces
           WHERE order_id = $1
             AND company_id = $2
@@ -534,6 +535,16 @@ export class OrdersService {
         WHERE order_id = $1
           AND company_id = $2
       `, [orderId, companyId]);
+
+      // 2b. Re-evaluate any bed those pieces belonged to, ONCE per bed (a bed
+      //     may also hold pieces from other orders): all gone → delete the bed;
+      //     some kept → disassemble it. Mirrors the piece-delete cascade.
+      const affectedBedIds = [
+        ...new Set(pieces.rows.map((p) => p.bed_id).filter((b): b is string => !!b))
+      ];
+      for (const bedId of affectedBedIds) {
+        await reevaluateBedAfterPieceRemoval(client, companyId, bedId);
+      }
 
       // 3. Delete the order
       await client.query(`
