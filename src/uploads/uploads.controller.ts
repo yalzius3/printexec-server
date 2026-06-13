@@ -112,6 +112,10 @@ export class UploadsController {
       .from(UPLOAD_BUCKET)
       .download(`${companyIdParam}/${filename}`);
     if (error || !data) {
+      console.error(
+        `[uploads] Supabase download failed bucket="${UPLOAD_BUCKET}" key="${companyIdParam}/${filename}":`,
+        (error as { message?: string } | null)?.message ?? "no data"
+      );
       throw new NotFoundException("File not found.");
     }
     const bytes = Buffer.from(await data.arrayBuffer());
@@ -163,6 +167,12 @@ export class UploadsController {
       .from(UPLOAD_BUCKET)
       .upload(objectKey, buffer, { contentType, upsert: false });
     if (error) {
+      // Surface the real reason (e.g. "Bucket not found", RLS, size) in logs —
+      // the generic 500 below hides it from the operator.
+      console.error(
+        `[uploads] Supabase upload failed bucket="${UPLOAD_BUCKET}" key="${objectKey}" size=${buffer.length}:`,
+        (error as { message?: string; name?: string; statusCode?: string } | null)?.message ?? error
+      );
       throw new InternalServerErrorException("Failed to save file");
     }
 
