@@ -12,6 +12,7 @@ import { OrderAttachmentsModule } from "./order-attachments/order-attachments.mo
 import { OrderPiecesModule } from "./order-pieces/order-pieces.module";
 import { OrdersModule } from "./orders/orders.module";
 import { PrintersModule } from "./printers/printers.module";
+import { SimpleJobsModule } from "./simple-jobs/simple-jobs.module";
 import { StaffModule } from "./staff/staff.module";
 import { UploadsModule } from "./uploads/uploads.module";
 import { SupabaseAuthGuard } from "./auth/supabase.guard";
@@ -30,6 +31,7 @@ import { PermissionGuard } from "./auth/permission.guard";
     OrderPiecesModule,
     OrdersModule,
     PrintersModule,
+    SimpleJobsModule,
     StaffModule,
     UploadsModule
   ],
