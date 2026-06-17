@@ -80,14 +80,63 @@ export class AuthController {
       throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
     }
 
-    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, u.role, u.permissions, u.display_name, u.email
+    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
     );
     if (!rows.length) return null;
     return rows[0];
+  }
+
+  // Owner-only: switch the company between 'advanced' and 'simple'. Soft — it
+  // never blocks; the client warns when the other mode still has active work.
+  // Returns the refreshed profile so the client can update in place.
+  @Public()
+  @Post("operation-mode")
+  async setOperationMode(
+    @Headers("authorization") authHeader: string,
+    @Body() body: unknown
+  ) {
+    if (!authHeader?.startsWith("Bearer ")) {
+      throw new UnauthorizedException("Missing token.");
+    }
+    const token = authHeader.slice(7);
+    const { data, error } = await this.supabase.auth.getUser(token);
+    if (error || !data.user) {
+      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
+    }
+
+    const parsed = z.object({ mode: z.enum(["advanced", "simple"]) }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("mode must be 'advanced' or 'simple'.");
+    }
+
+    const me = await this.db.query<{ company_id: string; role: string }>(
+      "SELECT company_id, role FROM users WHERE id = $1",
+      [data.user.id]
+    );
+    const owner = me.rows[0];
+    if (!owner) {
+      throw new NotFoundException("No company for this user.");
+    }
+    if (owner.role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the operation mode.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET operation_mode = $1 WHERE company_id = $2",
+      [parsed.data.mode, owner.company_id]
+    );
+
+    const { rows } = await this.db.query(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
+       FROM users u JOIN companies c ON c.company_id = u.company_id
+       WHERE u.id = $1`,
+      [data.user.id]
+    );
+    return rows[0] ?? null;
   }
 
   // Email-existence pre-check. Called from the account step BEFORE the client
@@ -144,7 +193,7 @@ export class AuthController {
     );
     if (existing.rows.length) {
       const user = await this.db.query(
-        `SELECT u.id AS user_id, u.company_id, c.name AS company_name, u.role, u.permissions, u.display_name, u.email
+        `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
          FROM users u JOIN companies c ON c.company_id = u.company_id
          WHERE u.id = $1`,
         [userId]
