@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post } from "@nestjs/common";
+import { Body, Controller, Get, Post, Query } from "@nestjs/common";
 import { z } from "zod";
 import { CompanyId } from "../common/company-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
@@ -8,6 +8,11 @@ import { SimpleJobsService } from "./simple-jobs.service";
 const assignSchema = z.object({
   piece_ids: z.array(z.string().uuid()).min(1).max(500),
   printer_id: z.string().uuid(),
+});
+
+const availabilitySchema = z.object({
+  horizon: z.enum(["day", "week", "month", "deadline"]).default("week"),
+  deadline: z.string().max(40).optional(),
 });
 
 // Simple-mode Jobs surface. Additive — the Advanced /jobs endpoints are
@@ -28,5 +33,12 @@ export class SimpleJobsController {
   assign(@CompanyId() companyId: string, @Body() body: unknown) {
     const { piece_ids, printer_id } = parseWithSchema(assignSchema, body);
     return this.simpleJobsService.assign(companyId, piece_ids, printer_id);
+  }
+
+  @Get("printer-availability")
+  @RequirePermission("view_orders")
+  availability(@CompanyId() companyId: string, @Query() query: unknown) {
+    const { horizon, deadline } = parseWithSchema(availabilitySchema, query);
+    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline);
   }
 }

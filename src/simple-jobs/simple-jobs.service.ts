@@ -24,6 +24,7 @@ export class SimpleJobsService {
           op.piece_id,
           op.order_id,
           o.order_number AS order_reference,
+          o.deadline AS order_deadline,
           op.piece_name,
           op.status,
           op.assigned_printer_id,
@@ -129,5 +130,79 @@ export class SimpleJobsService {
     }
 
     return { assigned: assignable.length, skipped };
+  }
+
+  // Informational printer availability for the assign picker — every printer in
+  // the fleet (no filtering), each with: when it next goes idle (end of the
+  // block running now, else now), and how many free minutes remain in the
+  // chosen window. Pure wall-clock math against the scheduled/printing blocks;
+  // no constraints, no optimization.
+  async printerAvailability(
+    companyId: string,
+    horizon: "day" | "week" | "month" | "deadline",
+    deadlineIso?: string
+  ) {
+    const now = new Date();
+    const dayMs = 24 * 60 * 60 * 1000;
+    let windowEnd: Date;
+    if (horizon === "day") windowEnd = new Date(now.getTime() + dayMs);
+    else if (horizon === "month") windowEnd = new Date(now.getTime() + 30 * dayMs);
+    else if (horizon === "deadline") {
+      const d = deadlineIso ? new Date(deadlineIso) : null;
+      windowEnd = d && !Number.isNaN(d.getTime()) && d.getTime() > now.getTime() ? d : new Date(now.getTime() + 7 * dayMs);
+    } else {
+      windowEnd = new Date(now.getTime() + 7 * dayMs); // week (default)
+    }
+
+    const result = await this.db.query<{
+      printer_id: string;
+      brand: string;
+      model: string;
+      running_until: string | null;
+      busy_minutes: string | number;
+    }>(
+      `
+        SELECT
+          pi.printer_id,
+          pi.brand,
+          pi.model,
+          MAX(CASE WHEN op.scheduled_start_at <= now() AND op.scheduled_end_at > now()
+                   THEN op.scheduled_end_at END) AS running_until,
+          COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+              LEAST(op.scheduled_end_at, $2::timestamptz) - GREATEST(op.scheduled_start_at, now())
+            )) / 60.0
+          ) FILTER (
+            WHERE op.scheduled_end_at > now() AND op.scheduled_start_at < $2::timestamptz
+          ), 0) AS busy_minutes
+        FROM printer_instances pi
+        LEFT JOIN order_pieces op
+          ON op.assigned_printer_id = pi.printer_id
+          AND op.company_id = pi.company_id
+          AND op.status IN ('scheduled', 'printing')
+          AND op.scheduled_start_at IS NOT NULL
+          AND op.scheduled_end_at IS NOT NULL
+        WHERE pi.company_id = $1
+        GROUP BY pi.printer_id, pi.brand, pi.model
+        ORDER BY pi.brand, pi.model
+      `,
+      [companyId, windowEnd.toISOString()]
+    );
+
+    const windowMinutes = (windowEnd.getTime() - now.getTime()) / 60000;
+    return {
+      window_end: windowEnd.toISOString(),
+      printers: result.rows.map((r) => {
+        const busy = Number(r.busy_minutes) || 0;
+        return {
+          printer_id: r.printer_id,
+          brand: r.brand,
+          model: r.model,
+          // null = idle now; otherwise when the current block ends.
+          next_idle_at: r.running_until,
+          free_minutes: Math.max(0, Math.round(windowMinutes - busy)),
+        };
+      }),
+    };
   }
 }
