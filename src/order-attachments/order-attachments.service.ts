@@ -1,6 +1,10 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
-import type { CreateAttachmentInput, AttachmentKind } from "./order-attachments.schemas";
+import type {
+  AttachmentKind,
+  CreateAttachmentInput,
+  UpdateAttachmentInput,
+} from "./order-attachments.schemas";
 
 interface AttachmentRow {
   attachment_id: string;
@@ -75,6 +79,30 @@ export class OrderAttachmentsService {
         input.notes ?? null,
       ]
     );
+    return res.rows[0]!;
+  }
+
+  async update(
+    companyId: string,
+    orderId: string,
+    attachmentId: string,
+    input: UpdateAttachmentInput
+  ): Promise<AttachmentRow> {
+    await this.assertOrderInCompany(companyId, orderId);
+    if (input.original_name === undefined) {
+      throw new BadRequestException("No fields to update.");
+    }
+    const res = await this.databaseService.query<AttachmentRow>(
+      `UPDATE order_attachments
+          SET original_name = $4
+        WHERE attachment_id = $1 AND order_id = $2 AND company_id = $3
+        RETURNING attachment_id, company_id, order_id, file_url, original_name,
+                  mime_type, size_bytes, kind, uploaded_at, uploaded_by, notes`,
+      [attachmentId, orderId, companyId, input.original_name]
+    );
+    if (res.rowCount === 0) {
+      throw new NotFoundException("Attachment not found.");
+    }
     return res.rows[0]!;
   }
 

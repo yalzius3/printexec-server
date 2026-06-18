@@ -463,9 +463,13 @@ export class JobsService {
   private jobSelectSql(
     hasStl: boolean,
     whereClause: string,
-    orderBy = "op.created_at DESC"
+    orderBy = "op.created_at DESC",
+    excludeDraftOrders = false
   ): string {
     const stlProjection = hasStl ? "op.stl_file_url" : "NULL::text AS stl_file_url";
+    const orderStatusClause = excludeDraftOrders
+      ? `AND o.status IN ('confirmed','in_progress','completed')`
+      : "";
     return `
       SELECT
         op.piece_id,
@@ -534,6 +538,7 @@ export class JobsService {
       LEFT JOIN printer_instances pi  ON pi.printer_id = op.assigned_printer_id
       LEFT JOIN filament_reference fr ON fr.filament_ref_id = op.required_filament_ref_id
       ${whereClause}
+      ${orderStatusClause}
       ORDER BY ${orderBy}
     `;
   }
@@ -578,7 +583,7 @@ export class JobsService {
     if (await this.hasBedColumn()) {
       wheres.push(`op.bed_id IS NULL`);
     }
-    const sql = this.jobSelectSql(hasStl, `WHERE ${wheres.join(" AND ")}`);
+    const sql = this.jobSelectSql(hasStl, `WHERE ${wheres.join(" AND ")}`, "op.created_at DESC", true);
     const result = await this.databaseService.query<JobRow>(sql, values);
     return result.rows;
   }
@@ -1830,7 +1835,18 @@ export class JobsService {
    * so beds drop into the same timeline structures as pieces. `whereClause`
    * receives the print_beds alias `pb`.
    */
-  private bedAsJobSelectSql(whereClause: string, orderBy: string): string {
+  private bedAsJobSelectSql(whereClause: string, orderBy: string, excludeDraftOrders = false): string {
+    const orderStatusClause = excludeDraftOrders
+      ? `
+         AND EXISTS (
+           SELECT 1
+             FROM order_pieces op
+             JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
+            WHERE op.company_id = pb.company_id
+              AND op.bed_id = pb.bed_id
+              AND o.status IN ('confirmed','in_progress','completed')
+         )`
+      : "";
     return `
       SELECT pb.bed_id AS piece_id,
              NULL::uuid AS order_id,
@@ -1863,6 +1879,7 @@ export class JobsService {
         FROM print_beds pb
         LEFT JOIN printer_instances pi ON pi.printer_id = pb.assigned_printer_id
        ${whereClause}
+       ${orderStatusClause}
        ORDER BY ${orderBy}
     `;
   }
@@ -1897,7 +1914,8 @@ export class JobsService {
              AND op.status IN ('scheduled','printing','done','failed')
              AND op.scheduled_start_at < $4
              AND op.scheduled_end_at   > $3`,
-          "op.scheduled_start_at ASC"
+          "op.scheduled_start_at ASC",
+          true
         ),
         [companyId, printerId, query.from, query.to]
       ),
@@ -1907,7 +1925,8 @@ export class JobsService {
           `WHERE op.company_id = $1
              AND op.assigned_printer_id = $2
              AND op.status IN ('assigned','ready')`,
-          "o.deadline ASC NULLS LAST, op.created_at ASC"
+          "o.deadline ASC NULLS LAST, op.created_at ASC",
+          true
         ),
         [companyId, printerId]
       ),
@@ -1929,7 +1948,8 @@ export class JobsService {
             `WHERE pb.company_id = $1 AND pb.assigned_printer_id = $2
                AND pb.status IN ('scheduled','printing','done','failed')
                AND pb.scheduled_start_at < $4 AND pb.scheduled_end_at > $3`,
-            "pb.scheduled_start_at ASC"
+            "pb.scheduled_start_at ASC",
+            true
           ),
           [companyId, printerId, query.from, query.to]
         ),
@@ -1937,7 +1957,8 @@ export class JobsService {
           this.bedAsJobSelectSql(
             `WHERE pb.company_id = $1 AND pb.assigned_printer_id = $2
                AND pb.status IN ('assigned','ready')`,
-            "pb.effective_deadline ASC NULLS LAST, pb.created_at ASC"
+            "pb.effective_deadline ASC NULLS LAST, pb.created_at ASC",
+            true
           ),
           [companyId, printerId]
         ),
@@ -1986,7 +2007,8 @@ export class JobsService {
              AND op.status IN ('scheduled','printing','done','failed')
              AND op.scheduled_start_at < $4
              AND op.scheduled_end_at   > $3`,
-          "op.scheduled_start_at ASC"
+          "op.scheduled_start_at ASC",
+          true
         ),
         [companyId, nozzleAssetId, query.from, query.to]
       ),
@@ -1996,7 +2018,8 @@ export class JobsService {
           `WHERE op.company_id = $1
              AND op.assigned_nozzle_asset_id = $2
              AND op.status IN ('assigned','ready')`,
-          "o.deadline ASC NULLS LAST, op.created_at ASC"
+          "o.deadline ASC NULLS LAST, op.created_at ASC",
+          true
         ),
         [companyId, nozzleAssetId]
       ),
@@ -2012,7 +2035,8 @@ export class JobsService {
             `WHERE pb.company_id = $1 AND pb.assigned_nozzle_asset_id = $2
                AND pb.status IN ('scheduled','printing','done','failed')
                AND pb.scheduled_start_at < $4 AND pb.scheduled_end_at > $3`,
-            "pb.scheduled_start_at ASC"
+            "pb.scheduled_start_at ASC",
+            true
           ),
           [companyId, nozzleAssetId, query.from, query.to]
         ),
@@ -2020,7 +2044,8 @@ export class JobsService {
           this.bedAsJobSelectSql(
             `WHERE pb.company_id = $1 AND pb.assigned_nozzle_asset_id = $2
                AND pb.status IN ('assigned','ready')`,
-            "pb.effective_deadline ASC NULLS LAST, pb.created_at ASC"
+            "pb.effective_deadline ASC NULLS LAST, pb.created_at ASC",
+            true
           ),
           [companyId, nozzleAssetId]
         ),
@@ -2075,7 +2100,8 @@ export class JobsService {
              AND op.status IN ('scheduled','printing','done','failed')
              AND op.scheduled_start_at < $4
              AND op.scheduled_end_at   > $3`,
-          "op.scheduled_start_at ASC"
+          "op.scheduled_start_at ASC",
+          true
         ),
         [companyId, spoolAssetId, query.from, query.to]
       ),
@@ -2617,7 +2643,8 @@ export class JobsService {
              AND op.status IN ('scheduled','printing','done','failed')
              AND op.scheduled_start_at < $3
              AND op.scheduled_end_at   > $2`,
-          "op.scheduled_start_at ASC"
+          "op.scheduled_start_at ASC",
+          true
         ),
         [companyId, query.from, query.to]
       ),
@@ -2627,7 +2654,8 @@ export class JobsService {
           // Both 'assigned' and 'ready' are unscheduled — they belong in the
           // click-to-place bucket.
           `WHERE op.company_id = $1 AND op.status IN ('assigned','ready')`,
-          "o.deadline ASC NULLS LAST, op.created_at ASC"
+          "o.deadline ASC NULLS LAST, op.created_at ASC",
+          true
         ),
         [companyId]
       ),

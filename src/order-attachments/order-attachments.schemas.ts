@@ -24,3 +24,8 @@ export const createAttachmentSchema = z.object({
   notes: z.string().max(1000).nullable().optional(),
 }).strict();
 export type CreateAttachmentInput = z.infer<typeof createAttachmentSchema>;
+
+export const updateAttachmentSchema = z.object({
+  original_name: z.string().min(1).max(255).optional(),
+}).strict();
+export type UpdateAttachmentInput = z.infer<typeof updateAttachmentSchema>;

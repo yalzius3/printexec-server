@@ -5,13 +5,14 @@ import {
   Get,
   Param,
   Post,
+  Patch,
   Req,
 } from "@nestjs/common";
 import { CompanyId } from "../common/company-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import { OrderAttachmentsService } from "./order-attachments.service";
-import { createAttachmentSchema } from "./order-attachments.schemas";
+import { createAttachmentSchema, updateAttachmentSchema } from "./order-attachments.schemas";
 import type { AuthRequest } from "../auth/supabase.guard";
 
 @Controller("orders/:orderId/attachments")
@@ -40,6 +41,22 @@ export class OrderAttachmentsController {
       orderId,
       parseWithSchema(createAttachmentSchema, body),
       req.userId
+    );
+  }
+
+  @Patch(":attachmentId")
+  @RequirePermission("action_orders")
+  update(
+    @CompanyId() companyId: string,
+    @Param("orderId") orderId: string,
+    @Param("attachmentId") attachmentId: string,
+    @Body() body: unknown
+  ) {
+    return this.service.update(
+      companyId,
+      orderId,
+      attachmentId,
+      parseWithSchema(updateAttachmentSchema, body)
     );
   }
 

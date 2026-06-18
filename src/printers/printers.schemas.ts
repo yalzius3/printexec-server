@@ -234,6 +234,7 @@ export const createPrinterSchema = z
     custom_reference: createPrinterReferenceSchema.optional(),
     serial_number: serialNumberSchema.optional(),
     purchase_date: dateSchema,
+    power_watts: z.coerce.number().nullable().optional(),
     location: z.string().trim().min(1).optional(),
     notes: z.string().optional(),
     // Operator-set starting meter for hours already worked before this printer
@@ -276,6 +277,7 @@ export const updatePrinterSchema = z
     custom_reference: createPrinterReferenceSchema.optional(),
     serial_number: serialNumberSchema.nullable().optional(),
     purchase_date: baseDateSchema.nullable().optional(),
+    power_watts: z.coerce.number().nullable().optional(),
     location: z.string().trim().min(1).nullable().optional(),
     notes: z.string().nullable().optional()
   })

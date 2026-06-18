@@ -30,6 +30,7 @@ type AssetRow = {
   asset_type: "filament_spool" | "nozzle" | "resin_tank";
   filament_ref_id: string | null;
   initial_grams: string | null;
+  purchase_price: string | null;
   purchase_date: string | null;
   production_date: string | null;
   nozzle_diameter_mm: string | null;
@@ -275,7 +276,7 @@ export class AssetsService {
       location: string | null;
       marker: string | null;
     }>(
-      `SELECT ai.asset_id, ai.filament_ref_id, ai.initial_grams, ai.location, ai.marker,
+      `SELECT ai.asset_id, ai.filament_ref_id, ai.initial_grams, ai.purchase_price, ai.location, ai.marker,
               COALESCE(ast.remaining_grams, ai.initial_grams) AS remaining_grams,
               COALESCE(ast.reserved_grams, 0)                 AS reserved_grams,
               COALESCE(ast.status, 'available')               AS status,
@@ -405,19 +406,21 @@ export class AssetsService {
             asset_type,
             filament_ref_id,
             initial_grams,
+            purchase_price,
             purchase_date,
             production_date,
             location,
             marker,
             notes
           )
-          VALUES ($1, 'filament_spool', $2, $3, $4, $5, $6, $7, $8)
+          VALUES ($1, 'filament_spool', $2, $3, $4, $5, $6, $7, $8, $9)
           RETURNING asset_id
         `,
         [
           companyId,
           filamentRefId,
           input.initial_grams,
+          input.purchase_price ?? null,
           input.purchase_date ?? null,
           input.production_date ?? null,
           input.location ?? null,
@@ -618,6 +621,7 @@ export class AssetsService {
     const allowedColumnsByType = {
       filament_spool: [
         "initial_grams",
+        "purchase_price",
         "purchase_date",
         "production_date",
         "location",
@@ -823,6 +827,7 @@ export class AssetsService {
         ai.asset_type,
         ai.filament_ref_id,
         ai.initial_grams,
+        ai.purchase_price,
         ai.purchase_date,
         ai.production_date,
         ai.nozzle_diameter_mm,

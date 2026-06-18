@@ -110,6 +110,7 @@ export const createSpoolSchema = z
     filament_ref_id: uuidSchema.optional(),
     custom_reference: customFilamentReferenceSchema,
     initial_grams: boundedNumber(1, 100000),
+    purchase_price: z.coerce.number().nullable().optional(),
     purchase_date: dateSchema,
     production_date: dateSchema,
     location: locationSchema,
@@ -181,6 +182,7 @@ export const createResinTankSchema = z
 export const updateAssetSchema = z
   .object({
     initial_grams: boundedNumber(1, 100000).optional(),
+    purchase_price: z.coerce.number().nullable().optional(),
     purchase_date: dateSchema,
     production_date: dateSchema,
     nozzle_diameter_mm: boundedNumber(0.1, 2).optional(),

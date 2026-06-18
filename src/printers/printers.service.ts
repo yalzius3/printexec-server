@@ -328,6 +328,7 @@ export class PrintersService {
             model,
             serial_number,
             purchase_date,
+            power_watts,
             print_technology,
             build_volume_x_mm,
             build_volume_y_mm,
@@ -354,7 +355,7 @@ export class PrintersService {
           VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
             $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-            $25, $26, $27, $28
+            $25, $26, $27, $28, $29
           )
           RETURNING printer_id
         `,
@@ -365,6 +366,7 @@ export class PrintersService {
           printerReference.model,
           input.serial_number ?? null,
           input.purchase_date ?? null,
+          input.power_watts ?? null,
           printerReference.print_technology,
           printerReference.build_volume_x_mm,
           printerReference.build_volume_y_mm,
@@ -441,6 +443,7 @@ export class PrintersService {
     const instanceUpdates: Record<string, unknown> = {
       serial_number: input.serial_number,
       purchase_date: input.purchase_date,
+      power_watts: input.power_watts,
       location: input.location,
       notes: input.notes
     };
@@ -738,6 +741,7 @@ export class PrintersService {
         COALESCE(pr.model, pi.model) AS model,
         pi.serial_number,
         pi.purchase_date,
+        pi.power_watts,
         COALESCE(pr.print_technology, pi.print_technology) AS print_technology,
         COALESCE(pr.build_volume_x_mm, pi.build_volume_x_mm) AS build_volume_x_mm,
         COALESCE(pr.build_volume_y_mm, pi.build_volume_y_mm) AS build_volume_y_mm,

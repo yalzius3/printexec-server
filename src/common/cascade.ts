@@ -101,14 +101,28 @@ export async function recomputeOrderStatusTx(
   const summary = res.rows[0];
   if (!summary) return;
 
-  const pending = Number(summary.pending_piece_count);
-  const assigned = Number(summary.assigned_piece_count);
+  const currentOrder = await executor.query<{ status: string }>(
+    `SELECT status
+       FROM orders
+      WHERE company_id = $1 AND order_id = $2`,
+    [companyId, orderId]
+  );
+
   const scheduled = Number(summary.scheduled_piece_count);
   const printing = Number(summary.printing_piece_count);
   const done = Number(summary.done_piece_count);
   const failed = Number(summary.failed_piece_count);
   const cancelled = Number(summary.cancelled_piece_count);
   const active = Number(summary.total_piece_count) - cancelled;
+
+  if (
+    currentOrder.rows[0]?.status === "confirmed" &&
+    printing === 0 &&
+    done === 0 &&
+    failed === 0
+  ) {
+    return;
+  }
 
   let target: "draft" | "confirmed" | "in_progress" | "completed";
   if (active === 0) {
@@ -119,8 +133,6 @@ export async function recomputeOrderStatusTx(
     target = "completed";
   } else if (scheduled > 0 || done > 0 || failed > 0) {
     target = "in_progress";
-  } else if (pending === 0 && assigned === 0) {
-    target = "confirmed";
   } else {
     target = "draft";
   }
