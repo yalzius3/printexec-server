@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ForbiddenException } from "@nestjs/common";
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 
 const CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -18,6 +18,7 @@ export interface StaffMember {
   display_name: string | null;
   role: "owner" | "staff";
   permissions: Record<string, boolean>;
+  monthly_salary: string | null;
   created_at: string;
 }
 
@@ -34,7 +35,7 @@ export class StaffService {
 
   async listStaff(companyId: string): Promise<StaffMember[]> {
     const { rows } = await this.db.query<StaffMember>(
-      `SELECT id, email, display_name, role, permissions, created_at
+      `SELECT id, email, display_name, role, permissions, monthly_salary, created_at
        FROM users
        WHERE company_id = $1
        ORDER BY role DESC, created_at ASC`,
@@ -45,11 +46,33 @@ export class StaffService {
 
   async getStaffMember(companyId: string, userId: string): Promise<StaffMember> {
     const { rows } = await this.db.query<StaffMember>(
-      `SELECT id, email, display_name, role, permissions, created_at
+      `SELECT id, email, display_name, role, permissions, monthly_salary, created_at
        FROM users WHERE company_id = $1 AND id = $2`,
       [companyId, userId]
     );
     if (!rows.length) throw new NotFoundException("Staff member not found.");
+    return rows[0]!;
+  }
+
+  // Set (or clear, with null) a member's monthly salary. Nullable money field —
+  // no other member data is touched.
+  async updateSalary(
+    companyId: string,
+    targetId: string,
+    monthlySalary: number | null
+  ): Promise<StaffMember> {
+    if (monthlySalary !== null && (!Number.isFinite(monthlySalary) || monthlySalary < 0)) {
+      throw new BadRequestException("monthly_salary must be a non-negative number or null.");
+    }
+    // Ensures the member exists in this company before the write.
+    await this.getStaffMember(companyId, targetId);
+
+    const { rows } = await this.db.query<StaffMember>(
+      `UPDATE users SET monthly_salary = $1
+       WHERE id = $2 AND company_id = $3
+       RETURNING id, email, display_name, role, permissions, monthly_salary, created_at`,
+      [monthlySalary, targetId, companyId]
+    );
     return rows[0]!;
   }
 
@@ -74,7 +97,7 @@ export class StaffService {
     const { rows } = await this.db.query<StaffMember>(
       `UPDATE users SET permissions = $1
        WHERE id = $2 AND company_id = $3
-       RETURNING id, email, display_name, role, permissions, created_at`,
+       RETURNING id, email, display_name, role, permissions, monthly_salary, created_at`,
       [JSON.stringify(permissions), targetId, companyId]
     );
     return rows[0]!;

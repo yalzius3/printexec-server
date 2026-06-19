@@ -80,14 +80,65 @@ export class AuthController {
       throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
     }
 
-    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
+    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string; electricity_price_per_watt: string | null }>(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
     );
     if (!rows.length) return null;
     return rows[0];
+  }
+
+  // Owner-only: set (or clear, with null) the company's price of one watt of
+  // electricity. Mirrors the operation-mode owner guard. Returns the refreshed
+  // profile so the client can update in place.
+  @Public()
+  @Post("electricity-price")
+  async setElectricityPrice(
+    @Headers("authorization") authHeader: string,
+    @Body() body: unknown
+  ) {
+    if (!authHeader?.startsWith("Bearer ")) {
+      throw new UnauthorizedException("Missing token.");
+    }
+    const token = authHeader.slice(7);
+    const { data, error } = await this.supabase.auth.getUser(token);
+    if (error || !data.user) {
+      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
+    }
+
+    const parsed = z
+      .object({ electricity_price_per_watt: z.coerce.number().min(0).max(1000000).nullable() })
+      .safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("electricity_price_per_watt must be a non-negative number or null.");
+    }
+
+    const me = await this.db.query<{ company_id: string; role: string }>(
+      "SELECT company_id, role FROM users WHERE id = $1",
+      [data.user.id]
+    );
+    const owner = me.rows[0];
+    if (!owner) {
+      throw new NotFoundException("No company for this user.");
+    }
+    if (owner.role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the electricity price.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET electricity_price_per_watt = $1 WHERE company_id = $2",
+      [parsed.data.electricity_price_per_watt, owner.company_id]
+    );
+
+    const { rows } = await this.db.query(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt
+       FROM users u JOIN companies c ON c.company_id = u.company_id
+       WHERE u.id = $1`,
+      [data.user.id]
+    );
+    return rows[0] ?? null;
   }
 
   // Owner-only: switch the company between 'advanced' and 'simple'. Soft — it

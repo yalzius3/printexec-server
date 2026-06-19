@@ -1,7 +1,9 @@
 import {
+  BadRequestException,
   Body, Controller, Delete,
   Get, Param, Patch, Post
 } from "@nestjs/common";
+import { z } from "zod";
 import { CompanyId } from "../common/company-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
 import { StaffService } from "./staff.service";
@@ -12,6 +14,11 @@ const RequestUser = createParamDecorator(
   (_: unknown, ctx: ExecutionContext) =>
     ctx.switchToHttp().getRequest<AuthRequest>()
 );
+
+// Monthly salary: a non-negative amount, or null to clear it.
+const salarySchema = z.object({
+  monthly_salary: z.coerce.number().min(0).max(100000000).nullable()
+});
 
 @Controller("staff")
 export class StaffController {
@@ -48,6 +55,23 @@ export class StaffController {
       targetId,
       body.permissions
     );
+  }
+
+  @Patch(":userId/salary")
+  @RequirePermission(
+    "can_manage_permissions",
+    "You do not have permission to manage staff salaries."
+  )
+  updateSalary(
+    @CompanyId() companyId: string,
+    @Param("userId") targetId: string,
+    @Body() body: unknown
+  ) {
+    const parsed = salarySchema.safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("monthly_salary must be a non-negative number or null.");
+    }
+    return this.staffService.updateSalary(companyId, targetId, parsed.data.monthly_salary);
   }
 
   @Delete(":userId")
