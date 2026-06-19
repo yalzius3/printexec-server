@@ -678,23 +678,15 @@ export class OrdersService {
     }
 
     if (nextStatus === "draft") {
-      if (summary.scheduledPieces > 0 || summary.printingPieces > 0 || summary.donePieces > 0 || summary.failedPieces > 0) {
-        throw new BadRequestException(
-          "Draft is only available before pieces are scheduled or started."
-        );
-      }
+      // Reopening / moving to draft is unconditional. Drafts are a
+      // pre-production pricing stage and their pieces are hidden from Jobs, so
+      // there's no piece-state guard.
       return;
     }
 
     if (nextStatus === "confirmed") {
       if (summary.totalPieces === 0) {
         throw new BadRequestException("Add at least one piece before confirming the order.");
-      }
-
-      if (summary.pendingPieces > 0 || summary.assignedPieces > 0) {
-        throw new BadRequestException(
-          "Every piece needs complete workflow data before the order can be confirmed."
-        );
       }
 
       if (summary.printingPieces > 0 || summary.donePieces > 0 || summary.failedPieces > 0) {
