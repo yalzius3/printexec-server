@@ -189,6 +189,78 @@ export class SimpleJobsService {
     return { assigned: assignable.length, skipped };
   }
 
+  // Bulk g-code drop: attach a slicer file (+ parsed time/grams) to each
+  // already-assigned piece in one shot, flipping them to 'ready'. Pieces that
+  // are in production, or that don't yet have a printer + nozzle, are skipped
+  // and reported. status='ready' is safe here — the piece already carries the
+  // printer + nozzle, and we set the slicer file, satisfying the DB's
+  // chk_ready_requires_core_data constraint.
+  async attachSlicer(
+    companyId: string,
+    items: {
+      piece_id: string;
+      slicer_file_url: string;
+      slicer_print_time_minutes?: number | undefined;
+      slicer_filament_used_grams?: number | undefined;
+    }[]
+  ) {
+    const ids = items.map((i) => i.piece_id);
+    const rows = await this.db.query<{
+      piece_id: string;
+      piece_name: string;
+      status: string;
+      assigned_printer_id: string | null;
+      assigned_nozzle_asset_id: string | null;
+    }>(
+      `
+        SELECT piece_id, piece_name, status, assigned_printer_id, assigned_nozzle_asset_id
+        FROM order_pieces
+        WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+      `,
+      [companyId, ids]
+    );
+    const byId = new Map(rows.rows.map((r) => [r.piece_id, r]));
+
+    const updated: string[] = [];
+    const skipped: { piece_id: string; piece_name: string; reason: string }[] = [];
+    for (const item of items) {
+      const piece = byId.get(item.piece_id);
+      if (!piece) {
+        skipped.push({ piece_id: item.piece_id, piece_name: item.piece_id, reason: "not found" });
+        continue;
+      }
+      if (piece.status === "printing" || piece.status === "done") {
+        skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "already in production" });
+        continue;
+      }
+      if (!piece.assigned_printer_id || !piece.assigned_nozzle_asset_id) {
+        skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "assign a printer first" });
+        continue;
+      }
+      await this.db.query(
+        `
+          UPDATE order_pieces
+          SET slicer_file_url            = $3,
+              slicer_file_uploaded_at    = now(),
+              slicer_print_time_minutes  = COALESCE($4, slicer_print_time_minutes),
+              slicer_filament_used_grams = COALESCE($5, slicer_filament_used_grams),
+              status                     = 'ready'
+          WHERE company_id = $1 AND piece_id = $2
+        `,
+        [
+          companyId,
+          item.piece_id,
+          item.slicer_file_url,
+          item.slicer_print_time_minutes ?? null,
+          item.slicer_filament_used_grams ?? null,
+        ]
+      );
+      updated.push(item.piece_id);
+    }
+
+    return { updated: updated.length, updated_ids: updated, skipped };
+  }
+
   // Informational printer availability for the assign picker — every printer in
   // the fleet (no filtering), each with: when it next goes idle (end of the
   // block running now, else now), and how many free minutes remain in the

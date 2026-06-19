@@ -18,6 +18,21 @@ const availabilitySchema = z.object({
   deadline: z.string().max(40).optional(),
 });
 
+// Bulk-attach slicer files to already-assigned pieces (the bulk g-code drop).
+const attachSlicerSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        piece_id: z.string().uuid(),
+        slicer_file_url: z.string().min(1).max(1000),
+        slicer_print_time_minutes: z.number().int().positive().max(10_000_000).optional(),
+        slicer_filament_used_grams: z.number().nonnegative().max(10_000_000).optional(),
+      })
+    )
+    .min(1)
+    .max(500),
+});
+
 // Simple-mode Jobs surface. Additive — the Advanced /jobs endpoints are
 // untouched. Only reachable when the company is in Simple mode (the queue is
 // scoped to the active operation_mode).
@@ -43,5 +58,12 @@ export class SimpleJobsController {
   availability(@CompanyId() companyId: string, @Query() query: unknown) {
     const { horizon, deadline } = parseWithSchema(availabilitySchema, query);
     return this.simpleJobsService.printerAvailability(companyId, horizon, deadline);
+  }
+
+  @Post("attach-slicer")
+  @RequirePermission("action_orders")
+  attachSlicer(@CompanyId() companyId: string, @Body() body: unknown) {
+    const { items } = parseWithSchema(attachSlicerSchema, body);
+    return this.simpleJobsService.attachSlicer(companyId, items);
   }
 }
