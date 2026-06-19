@@ -261,6 +261,50 @@ export class SimpleJobsService {
     return { updated: updated.length, updated_ids: updated, skipped };
   }
 
+  // Bulk-unassign: for every piece on the selected printers whose status is
+  // BELOW printing (assigned / ready / scheduled), drop the printer + nozzle,
+  // clear any schedule window, release reserved spools, and return it to
+  // 'pending'. Printing/done/failed/cancelled pieces are left untouched. The
+  // slicer file is kept (matches the per-piece unassign) so the work isn't lost.
+  async bulkUnassign(companyId: string, printerIds: string[]) {
+    let unassigned = 0;
+    await this.db.transaction(async (client) => {
+      const found = await client.query<{ piece_id: string }>(
+        `
+          SELECT piece_id
+          FROM order_pieces
+          WHERE company_id = $1
+            AND assigned_printer_id = ANY($2::uuid[])
+            AND status IN ('assigned', 'ready', 'scheduled')
+        `,
+        [companyId, printerIds]
+      );
+      const pieceIds = found.rows.map((r) => r.piece_id);
+      if (pieceIds.length === 0) return;
+
+      // Releasing the reservations fires the reserved-grams recalc trigger.
+      await client.query(
+        `DELETE FROM order_piece_spools WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+        [companyId, pieceIds]
+      );
+      await client.query(
+        `
+          UPDATE order_pieces
+          SET assigned_printer_id      = NULL,
+              assigned_nozzle_asset_id = NULL,
+              scheduled_start_at       = NULL,
+              scheduled_end_at         = NULL,
+              scheduled_at             = NULL,
+              status                   = 'pending'
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+        `,
+        [companyId, pieceIds]
+      );
+      unassigned = pieceIds.length;
+    });
+    return { unassigned };
+  }
+
   // Informational printer availability for the assign picker — every printer in
   // the fleet (no filtering), each with: when it next goes idle (end of the
   // block running now, else now), and how many free minutes remain in the

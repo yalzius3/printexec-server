@@ -21,6 +21,11 @@ const availabilitySchema = z.object({
   pieces: z.string().max(20000).optional(),
 });
 
+// Bulk-unassign every below-printing piece on the selected printers.
+const bulkUnassignSchema = z.object({
+  printer_ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
 // Bulk-attach slicer files to already-assigned pieces (the bulk g-code drop).
 const attachSlicerSchema = z.object({
   items: z
@@ -69,5 +74,12 @@ export class SimpleJobsController {
   attachSlicer(@CompanyId() companyId: string, @Body() body: unknown) {
     const { items } = parseWithSchema(attachSlicerSchema, body);
     return this.simpleJobsService.attachSlicer(companyId, items);
+  }
+
+  @Post("unassign")
+  @RequirePermission("action_orders")
+  bulkUnassign(@CompanyId() companyId: string, @Body() body: unknown) {
+    const { printer_ids } = parseWithSchema(bulkUnassignSchema, body);
+    return this.simpleJobsService.bulkUnassign(companyId, printer_ids);
   }
 }
