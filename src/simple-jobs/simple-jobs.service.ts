@@ -62,7 +62,7 @@ export class SimpleJobsService {
   // physically-impossible case. Everything else (nozzle, multicolor, material)
   // is the operator's call. Incompatible pieces are skipped and reported, not
   // thrown, so the rest still assign.
-  async assign(companyId: string, pieceIds: string[], printerId: string) {
+  async assign(companyId: string, pieceIds: string[], printerId: string, nozzleId?: string) {
     const printerResult = await this.db.query<{ print_technology: string | null }>(
       `
         SELECT COALESCE(pr.print_technology, pi.print_technology) AS print_technology
@@ -79,6 +79,46 @@ export class SimpleJobsService {
       throw new BadRequestException("Printer does not exist for this company.");
     }
     const printerFamily = printer.print_technology ? techFamily(printer.print_technology) : null;
+
+    // Simple mode hides the nozzle decision, but scheduling (timeline conflict
+    // checks) and the reused Advanced wizard both NEED a nozzle on the piece —
+    // without one the schedule window opens to an empty step. So resolve a
+    // sensible default here: the printer's first available compatible nozzle
+    // (smallest diameter as a stable tiebreak). May be null for printers with
+    // no nozzle concept (e.g. resin); in that case we leave the nozzle as-is.
+    const nozzleResult = await this.db.query<{ nozzle_asset_id: string }>(
+      `
+        SELECT pnc.nozzle_asset_id
+        FROM printer_nozzle_compatibility pnc
+        JOIN asset_instances ai ON ai.asset_id = pnc.nozzle_asset_id
+        LEFT JOIN asset_stock asto ON asto.asset_id = pnc.nozzle_asset_id
+        WHERE pnc.company_id = $1 AND pnc.printer_id = $2
+        ORDER BY (COALESCE(asto.status, 'available') = 'available') DESC,
+                 ai.nozzle_diameter_mm ASC NULLS LAST
+        LIMIT 1
+      `,
+      [companyId, printerId]
+    );
+    const defaultNozzleId = nozzleResult.rows[0]?.nozzle_asset_id ?? null;
+
+    // If the operator picked a nozzle explicitly, it must be compatible with
+    // the chosen printer. Otherwise fall back to the resolved default.
+    let effectiveNozzleId = defaultNozzleId;
+    if (nozzleId) {
+      const compat = await this.db.query<{ exists: boolean }>(
+        `
+          SELECT EXISTS(
+            SELECT 1 FROM printer_nozzle_compatibility
+            WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
+          ) AS exists
+        `,
+        [companyId, printerId, nozzleId]
+      );
+      if (!compat.rows[0]?.exists) {
+        throw new BadRequestException("Selected nozzle is not compatible with the selected printer.");
+      }
+      effectiveNozzleId = nozzleId;
+    }
 
     const pieceResult = await this.db.query<{
       piece_id: string;
@@ -102,6 +142,10 @@ export class SimpleJobsService {
         skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "already in production" });
         continue;
       }
+      if (piece.status === "scheduled") {
+        skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "scheduled — unschedule it first" });
+        continue;
+      }
       if (
         piece.required_print_technology &&
         printerFamily &&
@@ -118,14 +162,27 @@ export class SimpleJobsService {
     }
 
     if (assignable.length > 0) {
+      // Mark the pieces 'assigned' (so the queue shows it and the Schedule
+      // button unlocks) and stamp the resolved default nozzle so the schedule
+      // wizard has everything it needs. COALESCE keeps any nozzle already on
+      // the piece when the printer has no compatible nozzle to offer.
       await this.db.query(
         `
           UPDATE order_pieces
-          SET assigned_printer_id = $3
+          SET assigned_printer_id = $3,
+              assigned_nozzle_asset_id = COALESCE($4::uuid, assigned_nozzle_asset_id),
+              status = CASE
+                -- Flip to 'assigned' once the piece has both a printer and a
+                -- nozzle (the wizard/scheduler need both). If no nozzle could be
+                -- resolved, leave the status as-is rather than risk an
+                -- inconsistent 'assigned' with no nozzle.
+                WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL THEN 'assigned'
+                ELSE status
+              END
           WHERE company_id = $1
             AND piece_id = ANY($2::uuid[])
         `,
-        [companyId, assignable, printerId]
+        [companyId, assignable, printerId, effectiveNozzleId]
       );
     }
 
@@ -189,6 +246,46 @@ export class SimpleJobsService {
       [companyId, windowEnd.toISOString()]
     );
 
+    // Compatible nozzles per printer, so the picker can let the operator choose
+    // one explicitly. Ordered smallest-diameter first; available stock first.
+    const nozzlesResult = await this.db.query<{
+      printer_id: string;
+      nozzle_asset_id: string;
+      nozzle_diameter_mm: number | null;
+      nozzle_material: string | null;
+      nozzle_status: string;
+    }>(
+      `
+        SELECT
+          pnc.printer_id,
+          pnc.nozzle_asset_id,
+          ai.nozzle_diameter_mm,
+          ai.nozzle_material,
+          COALESCE(asto.status, 'available') AS nozzle_status
+        FROM printer_nozzle_compatibility pnc
+        JOIN asset_instances ai ON ai.asset_id = pnc.nozzle_asset_id
+        LEFT JOIN asset_stock asto ON asto.asset_id = pnc.nozzle_asset_id
+        WHERE pnc.company_id = $1
+        ORDER BY (COALESCE(asto.status, 'available') = 'available') DESC,
+                 ai.nozzle_diameter_mm ASC NULLS LAST
+      `,
+      [companyId]
+    );
+    const nozzlesByPrinter = new Map<
+      string,
+      { nozzle_asset_id: string; nozzle_diameter_mm: number | null; nozzle_material: string | null; nozzle_status: string }[]
+    >();
+    for (const n of nozzlesResult.rows) {
+      const arr = nozzlesByPrinter.get(n.printer_id) ?? [];
+      arr.push({
+        nozzle_asset_id: n.nozzle_asset_id,
+        nozzle_diameter_mm: n.nozzle_diameter_mm,
+        nozzle_material: n.nozzle_material,
+        nozzle_status: n.nozzle_status,
+      });
+      nozzlesByPrinter.set(n.printer_id, arr);
+    }
+
     const windowMinutes = (windowEnd.getTime() - now.getTime()) / 60000;
     return {
       window_end: windowEnd.toISOString(),
@@ -201,6 +298,7 @@ export class SimpleJobsService {
           // null = idle now; otherwise when the current block ends.
           next_idle_at: r.running_until,
           free_minutes: Math.max(0, Math.round(windowMinutes - busy)),
+          nozzles: nozzlesByPrinter.get(r.printer_id) ?? [],
         };
       }),
     };
