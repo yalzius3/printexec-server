@@ -1,12 +1,12 @@
 import {
   BadRequestException,
-  Body, Controller, Delete,
+  Body, Controller, Delete, ForbiddenException,
   Get, Param, Patch, Post
 } from "@nestjs/common";
 import { z } from "zod";
 import { CompanyId } from "../common/company-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
-import { StaffService } from "./staff.service";
+import { StaffService, type StaffMember } from "./staff.service";
 import type { AuthRequest } from "../auth/supabase.guard";
 import { createParamDecorator, type ExecutionContext } from "@nestjs/common";
 
@@ -20,21 +20,33 @@ const salarySchema = z.object({
   monthly_salary: z.coerce.number().min(0).max(100000000).nullable()
 });
 
+// Salary is owner-only data — drop it from member payloads for everyone else.
+function stripSalary(member: StaffMember): StaffMember {
+  const { monthly_salary: _omit, ...rest } = member;
+  return rest as StaffMember;
+}
+
 @Controller("staff")
 export class StaffController {
   constructor(private readonly staffService: StaffService) {}
 
   @Get()
-  listStaff(@CompanyId() companyId: string) {
-    return this.staffService.listStaff(companyId);
+  async listStaff(
+    @CompanyId() companyId: string,
+    @RequestUser() req: AuthRequest
+  ) {
+    const rows = await this.staffService.listStaff(companyId);
+    return req.userRole === "owner" ? rows : rows.map(stripSalary);
   }
 
   @Get(":userId")
-  getStaffMember(
+  async getStaffMember(
     @CompanyId() companyId: string,
+    @RequestUser() req: AuthRequest,
     @Param("userId") userId: string
   ) {
-    return this.staffService.getStaffMember(companyId, userId);
+    const member = await this.staffService.getStaffMember(companyId, userId);
+    return req.userRole === "owner" ? member : stripSalary(member);
   }
 
   @Patch(":userId/permissions")
@@ -42,19 +54,20 @@ export class StaffController {
     "can_manage_permissions",
     "You do not have permission to manage staff permissions."
   )
-  updatePermissions(
+  async updatePermissions(
     @CompanyId() companyId: string,
     @RequestUser() req: AuthRequest,
     @Param("userId") targetId: string,
     @Body() body: { permissions: Record<string, boolean> }
   ) {
-    return this.staffService.updatePermissions(
+    const member = await this.staffService.updatePermissions(
       companyId,
       req.userId,
       req.userRole,
       targetId,
       body.permissions
     );
+    return req.userRole === "owner" ? member : stripSalary(member);
   }
 
   @Patch(":userId/salary")
@@ -64,9 +77,14 @@ export class StaffController {
   )
   updateSalary(
     @CompanyId() companyId: string,
+    @RequestUser() req: AuthRequest,
     @Param("userId") targetId: string,
     @Body() body: unknown
   ) {
+    // Salary is owner-only — even members who can manage permissions can't set it.
+    if (req.userRole !== "owner") {
+      throw new ForbiddenException("Only the company owner can manage salaries.");
+    }
     const parsed = salarySchema.safeParse(body);
     if (!parsed.success) {
       throw new BadRequestException("monthly_salary must be a non-negative number or null.");
