@@ -169,7 +169,9 @@ export const pieceObjectSchema = z
     print_started_at: timestampSchema.optional(),
     print_completed_at: timestampSchema.optional(),
     status: pieceStatusSchema.optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    // Per-piece cost (money). Captured directly; nothing derives it server-side.
+    cost: boundedNumber(0, 100000000).optional()
   });
 
 const pieceSuperRefine = (value: any, ctx: z.RefinementCtx) => {
@@ -355,7 +357,9 @@ export const updateOrderPieceSchema = pieceObjectSchema
     actual_filament_used_grams: boundedNumber(0.01, 100000).nullable().optional(),
     print_started_at: timestampSchema.nullable().optional(),
     print_completed_at: timestampSchema.nullable().optional(),
-    notes: z.string().nullable().optional()
+    notes: z.string().nullable().optional(),
+    // Nullable so the cost can be cleared back to "unpriced".
+    cost: boundedNumber(0, 100000000).nullable().optional()
   })
   .superRefine(pieceSuperRefine)
   .refine((value) => Object.keys(value).length > 0, {

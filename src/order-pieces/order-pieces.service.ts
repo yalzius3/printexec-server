@@ -63,6 +63,7 @@ type PieceRow = {
   scheduled_end_at: string | null;
   status: string;
   notes: string | null;
+  cost: string | null;
   created_at: string;
   last_updated_at: string;
   order_status: string;
@@ -894,13 +895,15 @@ export class OrderPiecesService {
           notes,
           required_filament_material,
           stl_file_url,
-          stl_file_uploaded_at
+          stl_file_uploaded_at,
+          cost
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
           $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
           $27, $28, $29, $30, $31, $32, $33, $34,
-          CASE WHEN $34::text IS NOT NULL THEN now() ELSE NULL END
+          CASE WHEN $34::text IS NOT NULL THEN now() ELSE NULL END,
+          $35
         )
         RETURNING piece_id
       `,
@@ -938,7 +941,8 @@ export class OrderPiecesService {
         initialStatus,
         input.notes ?? null,
         mirroredMaterial,
-        input.stl_file_url ?? null
+        input.stl_file_url ?? null,
+        input.cost ?? null
       ],
       executor
     );
@@ -1418,7 +1422,8 @@ export class OrderPiecesService {
       slicer_supports_enabled: piece.slicer_supports_enabled ?? undefined,
       slicer_support_type: piece.slicer_support_type ?? undefined,
       slicer_part_weight_grams: this.parseOptionalNumericValue(piece.slicer_part_weight_grams),
-      notes: piece.notes ?? undefined
+      notes: piece.notes ?? undefined,
+      cost: this.parseOptionalNumericValue(piece.cost)
     };
   }
 
