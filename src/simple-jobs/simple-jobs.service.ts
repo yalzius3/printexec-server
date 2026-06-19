@@ -269,7 +269,8 @@ export class SimpleJobsService {
   async printerAvailability(
     companyId: string,
     horizon: "day" | "week" | "month" | "deadline",
-    deadlineIso?: string
+    deadlineIso?: string,
+    pieceIds?: string[]
   ) {
     const now = new Date();
     const dayMs = 24 * 60 * 60 * 1000;
@@ -281,6 +282,55 @@ export class SimpleJobsService {
       windowEnd = d && !Number.isNaN(d.getTime()) && d.getTime() > now.getTime() ? d : new Date(now.getTime() + 7 * dayMs);
     } else {
       windowEnd = new Date(now.getTime() + 7 * dayMs); // week (default)
+    }
+
+    // Combined requirements across the selected pieces. The picker must only
+    // surface printers compatible with EVERY one of them.
+    let requireMulticolor = false;
+    const techFamilies = new Set<string>();
+    if (pieceIds && pieceIds.length > 0) {
+      const reqRes = await this.db.query<{
+        required_print_technology: string | null;
+        required_multicolor_capable: boolean | null;
+        requires_multicolor: boolean | null;
+      }>(
+        `
+          SELECT required_print_technology, required_multicolor_capable, requires_multicolor
+          FROM order_pieces
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+        `,
+        [companyId, pieceIds]
+      );
+      for (const r of reqRes.rows) {
+        if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
+        if (r.required_multicolor_capable || r.requires_multicolor) requireMulticolor = true;
+      }
+    }
+    // The selection spans more than one technology family (e.g. an FDM piece and
+    // a resin piece) — no single printer can run them all.
+    if (techFamilies.size > 1) {
+      return { window_end: windowEnd.toISOString(), printers: [] };
+    }
+    const requiredFamily = techFamilies.size === 1 ? [...techFamilies][0] : null;
+
+    // $1 = company, $2 = window end. Compatibility filters add params after.
+    const params: unknown[] = [companyId, windowEnd.toISOString()];
+    const filters: string[] = [
+      "pi.company_id = $1",
+      // Offline / under-maintenance printers are omitted.
+      "COALESCE(ps.is_offline, false) = false",
+      "COALESCE(ps.is_under_maintenance, false) = false",
+    ];
+    if (requiredFamily) {
+      params.push(requiredFamily);
+      filters.push(
+        `CASE WHEN COALESCE(pr.print_technology, pi.print_technology) IN ('SLA','MSLA')
+              THEN 'RESIN'
+              ELSE COALESCE(pr.print_technology, pi.print_technology) END = $${params.length}`
+      );
+    }
+    if (requireMulticolor) {
+      filters.push("COALESCE(pr.is_multicolor, pi.is_multicolor) = true");
     }
 
     const result = await this.db.query<{
@@ -305,17 +355,21 @@ export class SimpleJobsService {
             WHERE op.scheduled_end_at > now() AND op.scheduled_start_at < $2::timestamptz
           ), 0) AS busy_minutes
         FROM printer_instances pi
+        INNER JOIN printer_stock ps
+          ON ps.printer_id = pi.printer_id
+        LEFT JOIN printer_reference pr
+          ON pr.printer_ref_id = pi.printer_ref_id
         LEFT JOIN order_pieces op
           ON op.assigned_printer_id = pi.printer_id
           AND op.company_id = pi.company_id
           AND op.status IN ('scheduled', 'printing')
           AND op.scheduled_start_at IS NOT NULL
           AND op.scheduled_end_at IS NOT NULL
-        WHERE pi.company_id = $1
+        WHERE ${filters.join(" AND ")}
         GROUP BY pi.printer_id, pi.brand, pi.model
         ORDER BY pi.brand, pi.model
       `,
-      [companyId, windowEnd.toISOString()]
+      params
     );
 
     // Compatible nozzles per printer, so the picker can let the operator choose

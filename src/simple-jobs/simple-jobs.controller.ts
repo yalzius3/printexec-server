@@ -16,6 +16,9 @@ const assignSchema = z.object({
 const availabilitySchema = z.object({
   horizon: z.enum(["day", "week", "month", "deadline"]).default("week"),
   deadline: z.string().max(40).optional(),
+  // Comma-separated piece ids being assigned — used to show only the printers
+  // compatible with ALL of them (technology + multicolor; offline omitted).
+  pieces: z.string().max(20000).optional(),
 });
 
 // Bulk-attach slicer files to already-assigned pieces (the bulk g-code drop).
@@ -56,8 +59,9 @@ export class SimpleJobsController {
   @Get("printer-availability")
   @RequirePermission("view_orders")
   availability(@CompanyId() companyId: string, @Query() query: unknown) {
-    const { horizon, deadline } = parseWithSchema(availabilitySchema, query);
-    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline);
+    const { horizon, deadline, pieces } = parseWithSchema(availabilitySchema, query);
+    const pieceIds = pieces ? pieces.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline, pieceIds);
   }
 
   @Post("attach-slicer")
