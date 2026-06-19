@@ -80,8 +80,8 @@ export class AuthController {
       throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
     }
 
-    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string; electricity_price_per_watt: string | null; shop_rate: string | null }>(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt, c.shop_rate
+    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string; electricity_price_per_kwh: string | null; shop_rate: string | null }>(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
@@ -109,10 +109,10 @@ export class AuthController {
     }
 
     const parsed = z
-      .object({ electricity_price_per_watt: z.coerce.number().min(0).max(1000000).nullable() })
+      .object({ electricity_price_per_kwh: z.coerce.number().min(0).max(1000000).nullable() })
       .safeParse(body);
     if (!parsed.success) {
-      throw new BadRequestException("electricity_price_per_watt must be a non-negative number or null.");
+      throw new BadRequestException("electricity_price_per_kwh must be a non-negative number or null.");
     }
 
     const me = await this.db.query<{ company_id: string; role: string }>(
@@ -128,12 +128,12 @@ export class AuthController {
     }
 
     await this.db.query(
-      "UPDATE companies SET electricity_price_per_watt = $1 WHERE company_id = $2",
-      [parsed.data.electricity_price_per_watt, owner.company_id]
+      "UPDATE companies SET electricity_price_per_kwh = $1 WHERE company_id = $2",
+      [parsed.data.electricity_price_per_kwh, owner.company_id]
     );
 
     const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt, c.shop_rate
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
@@ -183,7 +183,7 @@ export class AuthController {
     );
 
     const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt, c.shop_rate
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
@@ -232,7 +232,7 @@ export class AuthController {
     );
 
     const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt, c.shop_rate
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
@@ -294,7 +294,7 @@ export class AuthController {
     );
     if (existing.rows.length) {
       const user = await this.db.query(
-        `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_watt, c.shop_rate
+        `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
          FROM users u JOIN companies c ON c.company_id = u.company_id
          WHERE u.id = $1`,
         [userId]
