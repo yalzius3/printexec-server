@@ -171,6 +171,15 @@ export class SimpleJobsService {
           UPDATE order_pieces
           SET assigned_printer_id = $3,
               assigned_nozzle_asset_id = COALESCE($4::uuid, assigned_nozzle_asset_id),
+              -- A fresh assignment starts with NO slicer file. Pending pieces can
+              -- still carry a stale slicer_file_url (a prior unassign keeps it),
+              -- which would make the piece look already-schedulable with last
+              -- session's g-code. Clear it so a g-code is only ever present once
+              -- it's been explicitly dropped/attached for THIS assignment.
+              slicer_file_url            = NULL,
+              slicer_file_uploaded_at    = NULL,
+              slicer_print_time_minutes  = NULL,
+              slicer_filament_used_grams = NULL,
               status = CASE
                 -- Flip to 'assigned' once the piece has both a printer and a
                 -- nozzle (the wizard/scheduler need both). If no nozzle could be
@@ -263,9 +272,10 @@ export class SimpleJobsService {
 
   // Bulk-unassign: for every piece on the selected printers whose status is
   // BELOW printing (assigned / ready / scheduled), drop the printer + nozzle,
-  // clear any schedule window, release reserved spools, and return it to
-  // 'pending'. Printing/done/failed/cancelled pieces are left untouched. The
-  // slicer file is kept (matches the per-piece unassign) so the work isn't lost.
+  // clear any schedule window + the slicer file, release reserved spools, and
+  // return it to 'pending'. Printing/done/failed/cancelled pieces are left
+  // untouched. Clearing the slicer is deliberate: a re-assigned piece must start
+  // clean rather than resurrect a previous session's g-code.
   async bulkUnassign(companyId: string, printerIds: string[]) {
     let unassigned = 0;
     await this.db.transaction(async (client) => {
@@ -290,12 +300,16 @@ export class SimpleJobsService {
       await client.query(
         `
           UPDATE order_pieces
-          SET assigned_printer_id      = NULL,
-              assigned_nozzle_asset_id = NULL,
-              scheduled_start_at       = NULL,
-              scheduled_end_at         = NULL,
-              scheduled_at             = NULL,
-              status                   = 'pending'
+          SET assigned_printer_id        = NULL,
+              assigned_nozzle_asset_id   = NULL,
+              scheduled_start_at         = NULL,
+              scheduled_end_at           = NULL,
+              scheduled_at               = NULL,
+              slicer_file_url            = NULL,
+              slicer_file_uploaded_at    = NULL,
+              slicer_print_time_minutes  = NULL,
+              slicer_filament_used_grams = NULL,
+              status                     = 'pending'
           WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
         `,
         [companyId, pieceIds]
