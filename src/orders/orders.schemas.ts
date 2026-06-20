@@ -110,7 +110,9 @@ export const updateOrderSchema = z
     deadline: dateSchema.optional(),
     established_at: dateSchema.optional(),
     status: orderStatusSchema.optional(),
-    notes: z.string().nullable().optional()
+    notes: z.string().nullable().optional(),
+    // Operator-entered labour cost for the whole order (nullable to clear).
+    labor_cost: boundedNumber(0, 100000000).nullable().optional()
   })
   .superRefine((value, ctx) => {
     if (value.established_at && value.deadline && value.established_at > value.deadline) {
