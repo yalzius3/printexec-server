@@ -80,14 +80,28 @@ export class AuthController {
       throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
     }
 
-    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string; electricity_price_per_kwh: string | null; shop_rate: string | null }>(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
+    const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [data.user.id]
     );
     if (!rows.length) return null;
-    return rows[0];
+    // Best-effort pricing — never let a not-yet-migrated pricing column block
+    // login. If the columns are missing the query throws and we just omit them.
+    const profile: Record<string, unknown> = { ...rows[0] };
+    try {
+      const pricing = await this.db.query<{ electricity_price_per_kwh: string | null; shop_rate: string | null }>(
+        `SELECT c.electricity_price_per_kwh, c.shop_rate
+         FROM companies c JOIN users u ON u.company_id = c.company_id
+         WHERE u.id = $1`,
+        [data.user.id]
+      );
+      if (pricing.rows[0]) Object.assign(profile, pricing.rows[0]);
+    } catch {
+      // pricing columns not migrated yet — profile still returns without them
+    }
+    return profile;
   }
 
   // Owner-only: set (or clear, with null) the company's price of one watt of
