@@ -309,6 +309,35 @@ export class AssetsService {
     });
   }
 
+  // Average filament price per gram for each material type, across all the
+  // company's spools: Σ(purchase_price) / Σ(initial_grams). Drives piece-cost
+  // material estimates. Only spools with both a price and grams are counted.
+  async listMaterialPricing(companyId: string) {
+    const res = await this.databaseService.query<{
+      material_type: string;
+      avg_price_per_gram: string | null;
+    }>(
+      `SELECT fr.material_type,
+              SUM(ai.purchase_price) / NULLIF(SUM(ai.initial_grams), 0) AS avg_price_per_gram
+         FROM asset_instances ai
+         JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+        WHERE ai.company_id = $1
+          AND ai.asset_type = 'filament_spool'
+          AND ai.purchase_price IS NOT NULL
+          AND ai.initial_grams IS NOT NULL
+          AND ai.initial_grams > 0
+          AND fr.material_type IS NOT NULL
+        GROUP BY fr.material_type`,
+      [companyId]
+    );
+    return res.rows
+      .filter((r) => r.avg_price_per_gram != null)
+      .map((r) => ({
+        material_type: r.material_type,
+        avg_price_per_gram: Number(r.avg_price_per_gram)
+      }));
+  }
+
   async listAssets(companyId: string, query: ListAssetsQuery) {
     const values: unknown[] = [companyId];
     const filters = ["ai.company_id = $1"];

@@ -81,6 +81,14 @@ export class AssetsController {
     return this.assetsService.listSpoolInventory(companyId);
   }
 
+  // Average filament price per gram per material — used by piece-cost estimates.
+  // Declared before :assetId so the static path isn't swallowed as an id.
+  @Get("material-pricing")
+  @RequirePermission("view_assets")
+  listMaterialPricing(@CompanyId() companyId: string) {
+    return this.assetsService.listMaterialPricing(companyId);
+  }
+
   @Get(":assetId")
   @RequirePermission("view_assets")
   getAsset(
