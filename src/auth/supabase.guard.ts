@@ -34,10 +34,12 @@ const PROFILE_TTL_MS = 180_000;
 
 @Injectable()
 export class SupabaseAuthGuard implements CanActivate {
-  // Supabase project URL + anon key — used by verifyToken to reach the JWKS for
-  // local verification. getOrThrow so a missing value fails LOUDLY at startup.
+  // Supabase project URL + a key for the verify-only client verifyToken uses to
+  // reach the JWKS. Prefer the anon key (least privilege); fall back to the
+  // service-role key, which is always configured — so a missing anon key never
+  // blocks startup. URL is required (getOrThrow).
   private readonly supabaseUrl: string;
-  private readonly supabaseAnonKey: string;
+  private readonly supabaseKey: string;
 
   // Tiny in-memory TTL cache keyed by userId. Expired entries are evicted lazily
   // on read, so there's no background timer to manage.
@@ -52,7 +54,9 @@ export class SupabaseAuthGuard implements CanActivate {
     private readonly db: DatabaseService
   ) {
     this.supabaseUrl = config.getOrThrow<string>("SUPABASE_URL");
-    this.supabaseAnonKey = config.getOrThrow<string>("SUPABASE_ANON_KEY");
+    this.supabaseKey =
+      config.get<string>("SUPABASE_ANON_KEY") ??
+      config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY");
   }
 
   async canActivate(ctx: ExecutionContext): Promise<boolean> {
@@ -72,7 +76,7 @@ export class SupabaseAuthGuard implements CanActivate {
 
     // Verify the token (local against the cached JWKS once on asymmetric keys).
     const token = authHeader.slice(7);
-    const { userId } = await verifyToken(token, this.supabaseUrl, this.supabaseAnonKey);
+    const { userId } = await verifyToken(token, this.supabaseUrl, this.supabaseKey);
 
     const profile = await this.getProfile(userId);
     if (!profile) {

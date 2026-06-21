@@ -38,17 +38,21 @@ const setupSchema = z.discriminatedUnion("role", [ownerSetupSchema, staffSetupSc
 
 @Controller("auth")
 export class AuthController {
-  // Supabase project URL + anon key — used by verifyToken to reach the JWKS for
-  // local verification. getOrThrow so a missing value fails LOUDLY at startup.
+  // Supabase project URL + a key for the verify-only client verifyToken uses to
+  // reach the JWKS. Prefer the anon key (least privilege); fall back to the
+  // service-role key, which is always configured — so a missing anon key never
+  // blocks startup. URL is required (getOrThrow).
   private readonly supabaseUrl: string;
-  private readonly supabaseAnonKey: string;
+  private readonly supabaseKey: string;
 
   constructor(
     private readonly db: DatabaseService,
     private readonly config: ConfigService
   ) {
     this.supabaseUrl = config.getOrThrow<string>("SUPABASE_URL");
-    this.supabaseAnonKey = config.getOrThrow<string>("SUPABASE_ANON_KEY");
+    this.supabaseKey =
+      config.get<string>("SUPABASE_ANON_KEY") ??
+      config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY");
   }
 
   // Issue (or refresh) the HttpOnly upload-session cookie. Runs through the
@@ -79,7 +83,7 @@ export class AuthController {
     // Verify the token directly. Runs @Public() because the users row may not
     // exist yet (pre-setup), so the global guard's profile lookup would 401.
     const token = authHeader.slice(7);
-    const { userId } = await verifyToken(token, this.supabaseUrl, this.supabaseAnonKey);
+    const { userId } = await verifyToken(token, this.supabaseUrl, this.supabaseKey);
 
     const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
@@ -249,7 +253,7 @@ export class AuthController {
     // Verify the token directly. Stays @Public() because the users row is
     // created here, so the global guard's profile lookup would 401 first.
     const token = authHeader.slice(7);
-    const { userId, email } = await verifyToken(token, this.supabaseUrl, this.supabaseAnonKey);
+    const { userId, email } = await verifyToken(token, this.supabaseUrl, this.supabaseKey);
 
     const parsed = setupSchema.safeParse(body);
     if (!parsed.success) {
