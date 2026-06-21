@@ -33,6 +33,16 @@ const colorSlotSchema = z.object({
   slot_color: z.string().trim().min(1).max(80)
 });
 
+// Raw costing-row inputs, stored verbatim (as the operator typed them) so the
+// bulk grid can reload them. Values are strings to round-trip exactly.
+const costInputsSchema = z
+  .object({
+    grams: z.array(z.string().max(24)).max(16).optional(),
+    time: z.string().max(24).optional(),
+    failure: z.string().max(24).optional()
+  })
+  .strip();
+
 // Per-color slicer demand entered at the slicer step, keyed by the slot's
 // sequence_order so it can be matched back to a color slot.
 const colorSlotGramsSchema = z.object({
@@ -173,7 +183,9 @@ export const pieceObjectSchema = z
     status: pieceStatusSchema.optional(),
     notes: z.string().optional(),
     // Per-piece cost (money). Captured directly; nothing derives it server-side.
-    cost: boundedNumber(0, 100000000).optional()
+    cost: boundedNumber(0, 100000000).optional(),
+    // Raw costing-row inputs, persisted verbatim so they reload in the grid.
+    cost_inputs: costInputsSchema.nullable().optional()
   });
 
 const pieceSuperRefine = (value: any, ctx: z.RefinementCtx) => {
@@ -361,7 +373,8 @@ export const updateOrderPieceSchema = pieceObjectSchema
     print_completed_at: timestampSchema.nullable().optional(),
     notes: z.string().nullable().optional(),
     // Nullable so the cost can be cleared back to "unpriced".
-    cost: boundedNumber(0, 100000000).nullable().optional()
+    cost: boundedNumber(0, 100000000).nullable().optional(),
+    cost_inputs: costInputsSchema.nullable().optional()
   })
   .superRefine(pieceSuperRefine)
   .refine((value) => Object.keys(value).length > 0, {
