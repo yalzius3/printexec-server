@@ -1,11 +1,13 @@
 import { Body, Controller, Get, Post, Res, UnauthorizedException, BadRequestException, ConflictException, NotFoundException, GoneException, Headers } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { createClient } from "@supabase/supabase-js";
 import type { FastifyReply } from "fastify";
 import { DatabaseService } from "../database/database.service";
 import { CompanyId } from "../common/company-id.decorator";
+import { UserId } from "../common/user-id.decorator";
+import { UserRole } from "../common/user-role.decorator";
 import { Public } from "./public.decorator";
 import { buildUploadCookieHeader, signUploadCookie } from "./upload-cookie";
+import { verifyToken } from "./verify-token";
 import { z } from "zod";
 
 // Structural shape only — required-field, format, and conflict checks are run
@@ -36,16 +38,17 @@ const setupSchema = z.discriminatedUnion("role", [ownerSetupSchema, staffSetupSc
 
 @Controller("auth")
 export class AuthController {
-  private readonly supabase;
+  // Supabase project URL + anon key — used by verifyToken to reach the JWKS for
+  // local verification. getOrThrow so a missing value fails LOUDLY at startup.
+  private readonly supabaseUrl: string;
+  private readonly supabaseAnonKey: string;
 
   constructor(
     private readonly db: DatabaseService,
     private readonly config: ConfigService
   ) {
-    this.supabase = createClient(
-      config.getOrThrow("SUPABASE_URL"),
-      config.getOrThrow("SUPABASE_SERVICE_ROLE_KEY")
-    );
+    this.supabaseUrl = config.getOrThrow<string>("SUPABASE_URL");
+    this.supabaseAnonKey = config.getOrThrow<string>("SUPABASE_ANON_KEY");
   }
 
   // Issue (or refresh) the HttpOnly upload-session cookie. Runs through the
@@ -73,18 +76,16 @@ export class AuthController {
     if (!authHeader?.startsWith("Bearer ")) {
       throw new UnauthorizedException("Missing token.");
     }
+    // Verify the token directly. Runs @Public() because the users row may not
+    // exist yet (pre-setup), so the global guard's profile lookup would 401.
     const token = authHeader.slice(7);
-    const { data, error } = await this.supabase.auth.getUser(token);
-    if (error || !data.user) {
-      console.error("[auth/me] getUser failed:", { message: error?.message, status: error?.status, name: error?.name });
-      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
-    }
+    const { userId } = await verifyToken(token, this.supabaseUrl, this.supabaseAnonKey);
 
     const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
-      [data.user.id]
+      [userId]
     );
     if (!rows.length) return null;
     // Best-effort pricing — never let a not-yet-migrated pricing column block
@@ -95,7 +96,7 @@ export class AuthController {
         `SELECT c.electricity_price_per_kwh, c.shop_rate
          FROM companies c JOIN users u ON u.company_id = c.company_id
          WHERE u.id = $1`,
-        [data.user.id]
+        [userId]
       );
       if (pricing.rows[0]) Object.assign(profile, pricing.rows[0]);
     } catch {
@@ -107,21 +108,13 @@ export class AuthController {
   // Owner-only: set (or clear, with null) the company's price of one watt of
   // electricity. Mirrors the operation-mode owner guard. Returns the refreshed
   // profile so the client can update in place.
-  @Public()
   @Post("electricity-price")
   async setElectricityPrice(
-    @Headers("authorization") authHeader: string,
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
     @Body() body: unknown
   ) {
-    if (!authHeader?.startsWith("Bearer ")) {
-      throw new UnauthorizedException("Missing token.");
-    }
-    const token = authHeader.slice(7);
-    const { data, error } = await this.supabase.auth.getUser(token);
-    if (error || !data.user) {
-      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
-    }
-
     const parsed = z
       .object({ electricity_price_per_kwh: z.coerce.number().min(0).max(1000000).nullable() })
       .safeParse(body);
@@ -129,49 +122,35 @@ export class AuthController {
       throw new BadRequestException("electricity_price_per_kwh must be a non-negative number or null.");
     }
 
-    const me = await this.db.query<{ company_id: string; role: string }>(
-      "SELECT company_id, role FROM users WHERE id = $1",
-      [data.user.id]
-    );
-    const owner = me.rows[0];
-    if (!owner) {
-      throw new NotFoundException("No company for this user.");
-    }
-    if (owner.role !== "owner") {
+    // Owner-only mutation. The guard already loaded the profile, so we gate on
+    // the request context instead of re-querying users.
+    if (role !== "owner") {
       throw new UnauthorizedException("Only the company owner can change the electricity price.");
     }
 
     await this.db.query(
       "UPDATE companies SET electricity_price_per_kwh = $1 WHERE company_id = $2",
-      [parsed.data.electricity_price_per_kwh, owner.company_id]
+      [parsed.data.electricity_price_per_kwh, companyId]
     );
 
     const { rows } = await this.db.query(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
-      [data.user.id]
+      [userId]
     );
     return rows[0] ?? null;
   }
 
   // Owner-only: set (or clear, with null) the company's hourly shop rate (labour
   // rate used by piece pricing). Mirrors the electricity-price guard.
-  @Public()
   @Post("shop-rate")
   async setShopRate(
-    @Headers("authorization") authHeader: string,
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
     @Body() body: unknown
   ) {
-    if (!authHeader?.startsWith("Bearer ")) {
-      throw new UnauthorizedException("Missing token.");
-    }
-    const token = authHeader.slice(7);
-    const { data, error } = await this.supabase.auth.getUser(token);
-    if (error || !data.user) {
-      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
-    }
-
     const parsed = z
       .object({ shop_rate: z.coerce.number().min(0).max(100000000).nullable() })
       .safeParse(body);
@@ -179,28 +158,22 @@ export class AuthController {
       throw new BadRequestException("shop_rate must be a non-negative number or null.");
     }
 
-    const me = await this.db.query<{ company_id: string; role: string }>(
-      "SELECT company_id, role FROM users WHERE id = $1",
-      [data.user.id]
-    );
-    const owner = me.rows[0];
-    if (!owner) {
-      throw new NotFoundException("No company for this user.");
-    }
-    if (owner.role !== "owner") {
+    // Owner-only mutation. The guard already loaded the profile, so we gate on
+    // the request context instead of re-querying users.
+    if (role !== "owner") {
       throw new UnauthorizedException("Only the company owner can change the shop rate.");
     }
 
     await this.db.query(
       "UPDATE companies SET shop_rate = $1 WHERE company_id = $2",
-      [parsed.data.shop_rate, owner.company_id]
+      [parsed.data.shop_rate, companyId]
     );
 
     const { rows } = await this.db.query(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
-      [data.user.id]
+      [userId]
     );
     return rows[0] ?? null;
   }
@@ -208,48 +181,34 @@ export class AuthController {
   // Owner-only: switch the company between 'advanced' and 'simple'. Soft — it
   // never blocks; the client warns when the other mode still has active work.
   // Returns the refreshed profile so the client can update in place.
-  @Public()
   @Post("operation-mode")
   async setOperationMode(
-    @Headers("authorization") authHeader: string,
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
     @Body() body: unknown
   ) {
-    if (!authHeader?.startsWith("Bearer ")) {
-      throw new UnauthorizedException("Missing token.");
-    }
-    const token = authHeader.slice(7);
-    const { data, error } = await this.supabase.auth.getUser(token);
-    if (error || !data.user) {
-      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
-    }
-
     const parsed = z.object({ mode: z.enum(["advanced", "simple"]) }).safeParse(body);
     if (!parsed.success) {
       throw new BadRequestException("mode must be 'advanced' or 'simple'.");
     }
 
-    const me = await this.db.query<{ company_id: string; role: string }>(
-      "SELECT company_id, role FROM users WHERE id = $1",
-      [data.user.id]
-    );
-    const owner = me.rows[0];
-    if (!owner) {
-      throw new NotFoundException("No company for this user.");
-    }
-    if (owner.role !== "owner") {
+    // Owner-only mutation. The guard already loaded the profile, so we gate on
+    // the request context instead of re-querying users.
+    if (role !== "owner") {
       throw new UnauthorizedException("Only the company owner can change the operation mode.");
     }
 
     await this.db.query(
       "UPDATE companies SET operation_mode = $1 WHERE company_id = $2",
-      [parsed.data.mode, owner.company_id]
+      [parsed.data.mode, companyId]
     );
 
     const { rows } = await this.db.query(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
-      [data.user.id]
+      [userId]
     );
     return rows[0] ?? null;
   }
@@ -287,15 +246,10 @@ export class AuthController {
       throw new UnauthorizedException("Missing token.");
     }
 
+    // Verify the token directly. Stays @Public() because the users row is
+    // created here, so the global guard's profile lookup would 401 first.
     const token = authHeader.slice(7);
-    const { data, error } = await this.supabase.auth.getUser(token);
-    if (error || !data.user) {
-      console.error("[auth/setup] getUser failed:", { message: error?.message, status: error?.status, name: error?.name, tokenPrefix: token.slice(0, 20), supabaseUrl: this.config.get("SUPABASE_URL") });
-      throw new UnauthorizedException(`Invalid token: ${error?.message ?? "no user"}`);
-    }
-
-    const userId = data.user.id;
-    const email = data.user.email!;
+    const { userId, email } = await verifyToken(token, this.supabaseUrl, this.supabaseAnonKey);
 
     const parsed = setupSchema.safeParse(body);
     if (!parsed.success) {
