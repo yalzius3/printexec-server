@@ -57,12 +57,27 @@ export class SimpleJobsService {
     return result.rows;
   }
 
-  // Soft bulk-assign to a printer: no nozzle, no time, no scheduling. The only
-  // hard block is a print-technology FAMILY mismatch (FDM ⇄ resin ⇄ SLS) — the
-  // physically-impossible case. Everything else (nozzle, multicolor, material)
-  // is the operator's call. Incompatible pieces are skipped and reported, not
-  // thrown, so the rest still assign.
-  async assign(companyId: string, pieceIds: string[], printerId: string, nozzleId?: string) {
+  // Soft bulk-assign to a printer: no time, no scheduling. The only hard block
+  // is a print-technology FAMILY mismatch (FDM ⇄ resin ⇄ SLS) — the
+  // physically-impossible case. Everything else (multicolor, material) is the
+  // operator's call. Incompatible pieces are skipped and reported, not thrown,
+  // so the rest still assign.
+  //
+  // Nozzle: each piece is stamped with the nozzle matching ITS OWN
+  // required diameter + material — not a single nozzle shared across the whole
+  // batch. So a bulk assign of (hardened-steel 0.4 / brass 0.5 / stainless 0.6)
+  // lands each piece on its correct nozzle, which is what makes the per-nozzle
+  // timeline read correctly afterwards. `nozzleIds` carries the operator's
+  // explicit picks (one per requirement from the bulk picker); `nozzleId` is the
+  // legacy single-pick. Either is matched per piece; anything unmatched falls
+  // back to an auto-resolved compatible nozzle, then the printer default.
+  async assign(
+    companyId: string,
+    pieceIds: string[],
+    printerId: string,
+    nozzleId?: string,
+    nozzleIds?: string[]
+  ) {
     const printerResult = await this.db.query<{ print_technology: string | null }>(
       `
         SELECT COALESCE(pr.print_technology, pi.print_technology) AS print_technology
@@ -80,54 +95,78 @@ export class SimpleJobsService {
     }
     const printerFamily = printer.print_technology ? techFamily(printer.print_technology) : null;
 
-    // Simple mode hides the nozzle decision, but scheduling (timeline conflict
-    // checks) and the reused Advanced wizard both NEED a nozzle on the piece —
-    // without one the schedule window opens to an empty step. So resolve a
-    // sensible default here: the printer's first available compatible nozzle
-    // (smallest diameter as a stable tiebreak). May be null for printers with
-    // no nozzle concept (e.g. resin); in that case we leave the nozzle as-is.
-    const nozzleResult = await this.db.query<{ nozzle_asset_id: string }>(
+    // Every nozzle compatible with this printer, with spec + stock state.
+    // Pre-sorted available-first then smallest-diameter so the first match is
+    // the sensible default / auto-pick. Used to (a) validate explicit picks and
+    // (b) resolve a per-piece nozzle below. May be empty for printers with no
+    // nozzle concept (e.g. resin) — then pieces keep whatever nozzle they have.
+    const printerNozzles = await this.db.query<{
+      nozzle_asset_id: string;
+      nozzle_diameter_mm: number | null;
+      nozzle_material: string | null;
+      nozzle_status: string;
+    }>(
       `
-        SELECT pnc.nozzle_asset_id
+        SELECT pnc.nozzle_asset_id,
+               ai.nozzle_diameter_mm,
+               ai.nozzle_material,
+               COALESCE(asto.status, 'available') AS nozzle_status
         FROM printer_nozzle_compatibility pnc
         JOIN asset_instances ai ON ai.asset_id = pnc.nozzle_asset_id
         LEFT JOIN asset_stock asto ON asto.asset_id = pnc.nozzle_asset_id
         WHERE pnc.company_id = $1 AND pnc.printer_id = $2
         ORDER BY (COALESCE(asto.status, 'available') = 'available') DESC,
                  ai.nozzle_diameter_mm ASC NULLS LAST
-        LIMIT 1
       `,
       [companyId, printerId]
     );
-    const defaultNozzleId = nozzleResult.rows[0]?.nozzle_asset_id ?? null;
+    const compatById = new Map(printerNozzles.rows.map((n) => [n.nozzle_asset_id, n]));
+    const defaultNozzleId = printerNozzles.rows[0]?.nozzle_asset_id ?? null;
 
-    // If the operator picked a nozzle explicitly, it must be compatible with
-    // the chosen printer. Otherwise fall back to the resolved default.
-    let effectiveNozzleId = defaultNozzleId;
-    if (nozzleId) {
-      const compat = await this.db.query<{ exists: boolean }>(
-        `
-          SELECT EXISTS(
-            SELECT 1 FROM printer_nozzle_compatibility
-            WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
-          ) AS exists
-        `,
-        [companyId, printerId, nozzleId]
-      );
-      if (!compat.rows[0]?.exists) {
+    // The operator's explicit picks (bulk: one per requirement). De-duped.
+    // Every pick must be compatible with the chosen printer.
+    const chosenIds = Array.from(new Set([...(nozzleIds ?? []), ...(nozzleId ? [nozzleId] : [])]));
+    for (const id of chosenIds) {
+      if (!compatById.has(id)) {
         throw new BadRequestException("Selected nozzle is not compatible with the selected printer.");
       }
-      effectiveNozzleId = nozzleId;
     }
+
+    // A nozzle satisfies a requirement when its diameter matches (when the piece
+    // states one) and its material matches (when both state one — a material-less
+    // nozzle is treated as a wildcard, mirroring the Advanced filter).
+    const nozzleMatches = (
+      n: { nozzle_diameter_mm: number | null; nozzle_material: string | null },
+      diaReq: number | null,
+      matReq: string | null
+    ): boolean => {
+      if (diaReq != null && Number(n.nozzle_diameter_mm) !== Number(diaReq)) return false;
+      if (matReq && n.nozzle_material && n.nozzle_material.toLowerCase() !== matReq.toLowerCase()) return false;
+      return true;
+    };
+    // Best nozzle for one piece: an explicit pick that fits → any compatible
+    // nozzle that fits (available-first via the query order) → printer default.
+    const resolveNozzleFor = (dia: number | null, mat: string | null): string | null => {
+      const picked = chosenIds.find((id) => {
+        const n = compatById.get(id);
+        return n ? nozzleMatches(n, dia, mat) : false;
+      });
+      if (picked) return picked;
+      const auto = printerNozzles.rows.find((n) => nozzleMatches(n, dia, mat));
+      return auto?.nozzle_asset_id ?? defaultNozzleId;
+    };
 
     const pieceResult = await this.db.query<{
       piece_id: string;
       piece_name: string;
       required_print_technology: string | null;
+      required_nozzle_diameter_mm: number | null;
+      required_nozzle_material: string | null;
       status: string;
     }>(
       `
-        SELECT piece_id, piece_name, required_print_technology, status
+        SELECT piece_id, piece_name, required_print_technology,
+               required_nozzle_diameter_mm, required_nozzle_material, status
         FROM order_pieces
         WHERE company_id = $1
           AND piece_id = ANY($2::uuid[])
@@ -136,7 +175,10 @@ export class SimpleJobsService {
     );
 
     const skipped: { piece_id: string; piece_name: string; reason: string }[] = [];
-    const assignable: string[] = [];
+    // Group assignable pieces by the nozzle they resolve to so each distinct
+    // nozzle is a single UPDATE (key null = no nozzle resolved → keep existing).
+    const byNozzle = new Map<string | null, string[]>();
+    let assignedCount = 0;
     for (const piece of pieceResult.rows) {
       if (piece.status === "printing" || piece.status === "done") {
         skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "already in production" });
@@ -158,14 +200,22 @@ export class SimpleJobsService {
         });
         continue;
       }
-      assignable.push(piece.piece_id);
+      const nozzle = resolveNozzleFor(
+        piece.required_nozzle_diameter_mm,
+        piece.required_nozzle_material
+      );
+      const arr = byNozzle.get(nozzle) ?? [];
+      arr.push(piece.piece_id);
+      byNozzle.set(nozzle, arr);
+      assignedCount++;
     }
 
-    if (assignable.length > 0) {
-      // Mark the pieces 'assigned' (so the queue shows it and the Schedule
-      // button unlocks) and stamp the resolved default nozzle so the schedule
-      // wizard has everything it needs. COALESCE keeps any nozzle already on
-      // the piece when the printer has no compatible nozzle to offer.
+    // One UPDATE per resolved nozzle. Mark the pieces 'assigned' (so the queue
+    // shows it and the Schedule button unlocks) and stamp the per-piece nozzle so
+    // the schedule wizard has everything it needs. COALESCE keeps any nozzle
+    // already on the piece when none could be resolved (printer has no nozzle).
+    for (const [nozzle, ids] of byNozzle) {
+      if (ids.length === 0) continue;
       await this.db.query(
         `
           UPDATE order_pieces
@@ -191,11 +241,11 @@ export class SimpleJobsService {
           WHERE company_id = $1
             AND piece_id = ANY($2::uuid[])
         `,
-        [companyId, assignable, printerId, effectiveNozzleId]
+        [companyId, ids, printerId, nozzle]
       );
     }
 
-    return { assigned: assignable.length, skipped };
+    return { assigned: assignedCount, skipped };
   }
 
   // Bulk g-code drop: attach a slicer file (+ parsed time/grams) to each
@@ -346,14 +396,25 @@ export class SimpleJobsService {
     // surface printers compatible with EVERY one of them.
     let requireMulticolor = false;
     const techFamilies = new Set<string>();
+    // Distinct NOZZLE requirements across the selection. A single piece yields
+    // one (or zero, if it states no nozzle); a bulk selection of three pieces
+    // needing three different nozzles yields three — and the picker then asks
+    // the operator to pick a nozzle for each. Keyed by diameter+material so the
+    // same need across pieces collapses to one requirement (with a count).
+    const nozzleReq = new Map<string, { key: string; diameter_mm: number | null; material: string | null; label: string; piece_count: number }>();
+    const reqKey = (dia: number | null, mat: string | null) =>
+      `${dia != null ? Number(dia) : ""}|${(mat ?? "").trim().toLowerCase()}`;
     if (pieceIds && pieceIds.length > 0) {
       const reqRes = await this.db.query<{
         required_print_technology: string | null;
         required_multicolor_capable: boolean | null;
         requires_multicolor: boolean | null;
+        required_nozzle_diameter_mm: number | null;
+        required_nozzle_material: string | null;
       }>(
         `
-          SELECT required_print_technology, required_multicolor_capable, requires_multicolor
+          SELECT required_print_technology, required_multicolor_capable, requires_multicolor,
+                 required_nozzle_diameter_mm, required_nozzle_material
           FROM order_pieces
           WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
         `,
@@ -362,8 +423,38 @@ export class SimpleJobsService {
       for (const r of reqRes.rows) {
         if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
         if (r.required_multicolor_capable || r.requires_multicolor) requireMulticolor = true;
+        // Only pieces that actually state a nozzle need constrain the picker.
+        const dia = r.required_nozzle_diameter_mm != null ? Number(r.required_nozzle_diameter_mm) : null;
+        const mat = r.required_nozzle_material;
+        if (dia == null && !mat) continue;
+        const key = reqKey(dia, mat);
+        const existing = nozzleReq.get(key);
+        if (existing) existing.piece_count += 1;
+        else
+          nozzleReq.set(key, {
+            key,
+            diameter_mm: dia,
+            material: mat,
+            label: [dia != null ? `${dia}mm` : null, mat].filter(Boolean).join(" ") || "Any nozzle",
+            piece_count: 1,
+          });
       }
     }
+    const requirements = Array.from(nozzleReq.values()).sort(
+      (a, b) => (a.diameter_mm ?? 0) - (b.diameter_mm ?? 0) || a.label.localeCompare(b.label)
+    );
+    const requirementKeys = requirements.map((r) => r.key);
+    // Does a nozzle satisfy a requirement? Diameter must match when stated;
+    // material must match when both state one (a material-less nozzle is a
+    // wildcard) — same soft rule the Advanced filter uses.
+    const nozzleSatisfies = (
+      n: { nozzle_diameter_mm: number | null; nozzle_material: string | null },
+      req: { diameter_mm: number | null; material: string | null }
+    ): boolean => {
+      if (req.diameter_mm != null && Number(n.nozzle_diameter_mm) !== Number(req.diameter_mm)) return false;
+      if (req.material && n.nozzle_material && n.nozzle_material.toLowerCase() !== req.material.toLowerCase()) return false;
+      return true;
+    };
     // The selection spans more than one technology family (e.g. an FDM piece and
     // a resin piece) — no single printer can run them all.
     if (techFamilies.size > 1) {
@@ -455,10 +546,16 @@ export class SimpleJobsService {
       `,
       [companyId]
     );
-    const nozzlesByPrinter = new Map<
-      string,
-      { nozzle_asset_id: string; nozzle_diameter_mm: number | null; nozzle_material: string | null; nozzle_status: string }[]
-    >();
+    type NozzleOut = {
+      nozzle_asset_id: string;
+      nozzle_diameter_mm: number | null;
+      nozzle_material: string | null;
+      nozzle_status: string;
+      // Requirement keys this nozzle satisfies (empty when there are no nozzle
+      // requirements — single un-constrained piece, or none selected).
+      satisfies: string[];
+    };
+    const nozzlesByPrinter = new Map<string, NozzleOut[]>();
     for (const n of nozzlesResult.rows) {
       const arr = nozzlesByPrinter.get(n.printer_id) ?? [];
       arr.push({
@@ -466,25 +563,51 @@ export class SimpleJobsService {
         nozzle_diameter_mm: n.nozzle_diameter_mm,
         nozzle_material: n.nozzle_material,
         nozzle_status: n.nozzle_status,
+        satisfies: requirements.filter((req) => nozzleSatisfies(n, req)).map((req) => req.key),
       });
       nozzlesByPrinter.set(n.printer_id, arr);
     }
 
     const windowMinutes = (windowEnd.getTime() - now.getTime()) / 60000;
+    const printers = result.rows.map((r) => {
+      const busy = Number(r.busy_minutes) || 0;
+      const nozzles = nozzlesByPrinter.get(r.printer_id) ?? [];
+      // Which requirements this printer can satisfy (has ≥1 compatible nozzle),
+      // and the subset whose matching nozzle is actually AVAILABLE right now.
+      const satisfiedKeys = new Set<string>();
+      const availableKeys = new Set<string>();
+      for (const n of nozzles) {
+        for (const k of n.satisfies) {
+          satisfiedKeys.add(k);
+          if (n.nozzle_status === "available") availableKeys.add(k);
+        }
+      }
+      return {
+        printer_id: r.printer_id,
+        brand: r.brand,
+        model: r.model,
+        // null = idle now; otherwise when the current block ends.
+        next_idle_at: r.running_until,
+        free_minutes: Math.max(0, Math.round(windowMinutes - busy)),
+        nozzles,
+        satisfied_keys: [...satisfiedKeys],
+        // Compatible with every needed nozzle; "available" further requires the
+        // matching nozzle be in stock. Both feed the picker — covers_all is the
+        // soft default surface, available is the gold-star.
+        covers_all: requirementKeys.every((k) => satisfiedKeys.has(k)),
+        covers_all_available: requirementKeys.every((k) => availableKeys.has(k)),
+      };
+    });
+    // Surface the fullest-coverage printers first (covered+available → covered →
+    // partial), preserving the SQL brand/model order within each tier. Soft, not
+    // a hard filter — the picker can still reveal partial-coverage printers.
+    const tier = (p: { covers_all: boolean; covers_all_available: boolean }) =>
+      p.covers_all_available ? 0 : p.covers_all ? 1 : 2;
+    printers.sort((a, b) => tier(a) - tier(b));
     return {
       window_end: windowEnd.toISOString(),
-      printers: result.rows.map((r) => {
-        const busy = Number(r.busy_minutes) || 0;
-        return {
-          printer_id: r.printer_id,
-          brand: r.brand,
-          model: r.model,
-          // null = idle now; otherwise when the current block ends.
-          next_idle_at: r.running_until,
-          free_minutes: Math.max(0, Math.round(windowMinutes - busy)),
-          nozzles: nozzlesByPrinter.get(r.printer_id) ?? [],
-        };
-      }),
+      requirements,
+      printers,
     };
   }
 }

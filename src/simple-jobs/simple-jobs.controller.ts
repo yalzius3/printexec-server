@@ -11,6 +11,10 @@ const assignSchema = z.object({
   // Optional: the operator picked a specific nozzle. When omitted the service
   // resolves a sensible default for the printer.
   nozzle_asset_id: z.string().uuid().optional(),
+  // Optional: the bulk picker's explicit picks — one nozzle per distinct
+  // requirement across the batch. The service matches each piece to whichever
+  // of these fits its own nozzle need (falling back to auto-resolution).
+  nozzle_asset_ids: z.array(z.string().uuid()).max(50).optional(),
 });
 
 const availabilitySchema = z.object({
@@ -57,8 +61,8 @@ export class SimpleJobsController {
   @Post("assign")
   @RequirePermission("action_orders")
   assign(@CompanyId() companyId: string, @Body() body: unknown) {
-    const { piece_ids, printer_id, nozzle_asset_id } = parseWithSchema(assignSchema, body);
-    return this.simpleJobsService.assign(companyId, piece_ids, printer_id, nozzle_asset_id);
+    const { piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids } = parseWithSchema(assignSchema, body);
+    return this.simpleJobsService.assign(companyId, piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids);
   }
 
   @Get("printer-availability")
