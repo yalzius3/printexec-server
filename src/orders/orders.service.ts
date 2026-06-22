@@ -30,7 +30,7 @@ type OrderPieceStatusSummary = {
 type OrderRow = {
   order_id: string;
   company_id: string;
-  customer_id: string;
+  customer_id: string | null;
   order_number: string;
   title: string;
   description: string | null;
@@ -42,7 +42,7 @@ type OrderRow = {
   labor_cost: string | null;
   created_at: string;
   last_updated_at: string;
-  customer_type: string;
+  customer_type: string | null;
   customer_name: string | null;
   customer_deleted_at: string | null;
   piece_count: string;
@@ -124,7 +124,10 @@ export class OrdersService {
 
   async createOrder(companyId: string, input: CreateOrderInput) {
     return this.databaseService.transaction(async (client) => {
-      await this.assertCustomerExists(companyId, input.customer_id, client);
+      // A customer is optional at creation; when present it must exist.
+      if (input.customer_id) {
+        await this.assertCustomerExists(companyId, input.customer_id, client);
+      }
       const establishedAt = input.established_at ?? new Date().toISOString().slice(0, 10);
       const orderNumber = input.order_number ?? await this.generateOrderNumber(companyId, establishedAt, client);
       await this.assertUniqueOrderNumber(companyId, orderNumber, undefined, client);
@@ -152,7 +155,7 @@ export class OrdersService {
         `,
         [
           companyId,
-          input.customer_id,
+          input.customer_id ?? null,
           orderNumber,
           input.title,
           input.description ?? null,
@@ -171,27 +174,31 @@ export class OrdersService {
         throw new BadRequestException("Order insert failed.");
       }
 
-      await this.databaseService.query(
-        `
-          UPDATE customers
-          SET
-            total_orders = total_orders + 1,
-            first_order_at = COALESCE(first_order_at, now()),
-            last_order_at = now()
-          WHERE customer_id = $1
-            AND company_id = $2
-        `,
-        [input.customer_id, companyId],
-        client
-      );
+      // Customer stats + timeline only apply when an order is placed against a
+      // customer. A customer-less order records these when one is assigned later.
+      if (input.customer_id) {
+        await this.databaseService.query(
+          `
+            UPDATE customers
+            SET
+              total_orders = total_orders + 1,
+              first_order_at = COALESCE(first_order_at, now()),
+              last_order_at = now()
+            WHERE customer_id = $1
+              AND company_id = $2
+          `,
+          [input.customer_id, companyId],
+          client
+        );
 
         // Log interaction for the customer timeline
-      await this.databaseService.query(
-        `INSERT INTO customer_interactions (company_id, customer_id, interaction_type, description)
-         VALUES ($1, $2, 'ADDITION', $3)`,
-        [companyId, input.customer_id, `Placed new order #${orderNumber}: ${input.title}`],
-        client
-      );
+        await this.databaseService.query(
+          `INSERT INTO customer_interactions (company_id, customer_id, interaction_type, description)
+           VALUES ($1, $2, 'ADDITION', $3)`,
+          [companyId, input.customer_id, `Placed new order #${orderNumber}: ${input.title}`],
+          client
+        );
+      }
 
       await recordOrderHistory(client, companyId, {
         entityType: "order",
@@ -215,6 +222,16 @@ export class OrdersService {
     if (input.order_number) {
       await this.assertUniqueOrderNumber(companyId, input.order_number, orderId);
     }
+
+    // Assigning a customer (e.g. confirming an order created without one). The
+    // customer must exist; the stats/timeline side-effects below run only on the
+    // first assignment, mirroring createOrder so a deferred customer is counted.
+    const assignsCustomer =
+      input.customer_id !== undefined && input.customer_id !== currentOrder.customer_id;
+    if (assignsCustomer) {
+      await this.assertCustomerExists(companyId, input.customer_id as string);
+    }
+    const isFirstCustomerAssignment = assignsCustomer && !currentOrder.customer_id;
 
     const nextDeadline = input.deadline ?? currentOrder.deadline;
     const nextEstablishedAt = input.established_at ?? currentOrder.established_at;
@@ -321,6 +338,29 @@ export class OrdersService {
               AND order_id = $${values.length + 2}
           `,
           [...values, companyId, orderId],
+          client
+        );
+      }
+
+      if (isFirstCustomerAssignment) {
+        await this.databaseService.query(
+          `
+            UPDATE customers
+            SET
+              total_orders = total_orders + 1,
+              first_order_at = COALESCE(first_order_at, now()),
+              last_order_at = now()
+            WHERE customer_id = $1
+              AND company_id = $2
+          `,
+          [input.customer_id, companyId],
+          client
+        );
+
+        await this.databaseService.query(
+          `INSERT INTO customer_interactions (company_id, customer_id, interaction_type, description)
+           VALUES ($1, $2, 'ADDITION', $3)`,
+          [companyId, input.customer_id, `Placed new order #${currentOrder.order_number}: ${currentOrder.title}`],
           client
         );
       }
@@ -503,7 +543,7 @@ export class OrdersService {
         -- priced yet, so the UI can show "—" rather than a misleading 0.
         SUM(op.cost) AS order_total
       FROM orders o
-      INNER JOIN customers c
+      LEFT JOIN customers c
         ON c.customer_id = o.customer_id
       LEFT JOIN order_pieces op
         ON op.order_id = o.order_id
@@ -559,13 +599,15 @@ export class OrdersService {
           AND company_id = $2
       `, [orderId, companyId]);
 
-      // 4. Update customer order count
-      await client.query(`
-        UPDATE customers
-        SET total_orders = GREATEST(0, total_orders - 1)
-        WHERE customer_id = $1
-          AND company_id = $2
-      `, [order.customer_id, companyId]);
+      // 4. Update customer order count (only when the order had a customer)
+      if (order.customer_id) {
+        await client.query(`
+          UPDATE customers
+          SET total_orders = GREATEST(0, total_orders - 1)
+          WHERE customer_id = $1
+            AND company_id = $2
+        `, [order.customer_id, companyId]);
+      }
 
       for (const piece of pieces.rows) {
         await recordOrderHistory(client, companyId, {

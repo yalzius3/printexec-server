@@ -45,7 +45,7 @@ export class SimpleJobsService {
         FROM order_pieces op
         INNER JOIN orders o
           ON o.order_id = op.order_id
-        INNER JOIN customers c
+        LEFT JOIN customers c
           ON c.customer_id = o.customer_id
         LEFT JOIN printer_instances pi
           ON pi.printer_id = op.assigned_printer_id

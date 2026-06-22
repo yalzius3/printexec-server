@@ -77,7 +77,9 @@ export const listOrdersQuerySchema = z.object({
 
 export const createOrderSchema = z
   .object({
-    customer_id: uuidSchema,
+    // Optional: an order may be created with no customer attached and have one
+    // assigned later (at confirmation).
+    customer_id: uuidSchema.optional(),
     order_number: z
       .string()
       .trim()
@@ -106,6 +108,9 @@ export const createOrderSchema = z
 
 export const updateOrderSchema = z
   .object({
+    // Assigning a customer to an order that was created without one (and, after
+    // the first assignment, changing it). Optional so other PATCHes are unaffected.
+    customer_id: uuidSchema.optional(),
     order_number: z
       .string()
       .trim()
