@@ -428,73 +428,91 @@ export class AssetsService {
           ? resolvedReference
           : resolvedReference.filament_ref_id;
 
-      const createdAsset = await this.databaseService.query<{ asset_id: string }>(
-        `
-          INSERT INTO asset_instances (
-            company_id,
-            asset_type,
-            filament_ref_id,
-            initial_grams,
-            purchase_price,
-            purchase_date,
-            production_date,
-            location,
-            marker,
-            notes
-          )
-          VALUES ($1, 'filament_spool', $2, $3, $4, $5, $6, $7, $8, $9)
-          RETURNING asset_id
-        `,
-        [
+      // Multiplier: create N identical spool instances from one submission. The
+      // filament reference is resolved once above and shared by all of them, so a
+      // custom reference isn't duplicated per spool.
+      const quantity = input.quantity ?? 1;
+      const createdAssetIds: string[] = [];
+
+      for (let i = 0; i < quantity; i++) {
+        const createdAsset = await this.databaseService.query<{ asset_id: string }>(
+          `
+            INSERT INTO asset_instances (
+              company_id,
+              asset_type,
+              filament_ref_id,
+              initial_grams,
+              purchase_price,
+              purchase_date,
+              production_date,
+              location,
+              marker,
+              notes
+            )
+            VALUES ($1, 'filament_spool', $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING asset_id
+          `,
+          [
+            companyId,
+            filamentRefId,
+            input.initial_grams,
+            input.purchase_price ?? null,
+            input.purchase_date ?? null,
+            input.production_date ?? null,
+            input.location ?? null,
+            input.marker ?? null,
+            input.notes ?? null
+          ],
+          client
+        );
+
+        const createdAssetRow = createdAsset.rows[0];
+
+        if (!createdAssetRow) {
+          throw new BadRequestException("Spool insert failed.");
+        }
+
+        await this.databaseService.query(
+          `
+            INSERT INTO asset_stock (
+              asset_id,
+              company_id,
+              status,
+              remaining_grams,
+              remaining_volume_ml,
+              currently_used_in_piece_id,
+              in_use_since,
+              installed_on_asset_id,
+              next_free_at
+            )
+            VALUES ($1, $2, 'available', $3, NULL, NULL, NULL, NULL, NULL)
+          `,
+          [createdAssetRow.asset_id, companyId, input.initial_grams],
+          client
+        );
+
+        await this.logAssetEvent(
           companyId,
-          filamentRefId,
-          input.initial_grams,
-          input.purchase_price ?? null,
-          input.purchase_date ?? null,
-          input.production_date ?? null,
-          input.location ?? null,
-          input.marker ?? null,
-          input.notes ?? null
-        ],
-        client
-      );
+          createdAssetRow.asset_id,
+          "filament_spool",
+          "addition",
+          "New Filament Spool",
+          quantity > 1
+            ? `New spool added to inventory (${i + 1} of ${quantity})`
+            : "New spool added to inventory",
+          client
+        );
 
-      const createdAssetRow = createdAsset.rows[0];
-
-      if (!createdAssetRow) {
-        throw new BadRequestException("Spool insert failed.");
+        createdAssetIds.push(createdAssetRow.asset_id);
       }
 
-      await this.databaseService.query(
-        `
-          INSERT INTO asset_stock (
-            asset_id,
-            company_id,
-            status,
-            remaining_grams,
-            remaining_volume_ml,
-            currently_used_in_piece_id,
-            in_use_since,
-            installed_on_asset_id,
-            next_free_at
-          )
-          VALUES ($1, $2, 'available', $3, NULL, NULL, NULL, NULL, NULL)
-        `,
-        [createdAssetRow.asset_id, companyId, input.initial_grams],
-        client
+      const createdAssets = await Promise.all(
+        createdAssetIds.map((id) => this.getAssetById(companyId, id, client))
       );
 
-      await this.logAssetEvent(
-        companyId,
-        createdAssetRow.asset_id,
-        "filament_spool",
-        "addition",
-        "New Filament Spool",
-        "New spool added to inventory",
-        client
-      );
-
-      return this.getAssetById(companyId, createdAssetRow.asset_id, client);
+      // Stay backwards-compatible: a single spool returns the asset object, while
+      // a multiplier batch returns the array of created spools.
+      return quantity > 1 ? createdAssets : createdAssets[0];
     });
   }
 

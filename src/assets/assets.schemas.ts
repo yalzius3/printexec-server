@@ -115,6 +115,10 @@ export const createSpoolSchema = z
     production_date: dateSchema,
     location: locationSchema,
     marker: markerSchema,
+    // Multiplier: create this many identical spool instances from one form
+    // submission (e.g. a box of 4). Defaults to 1. Each spool becomes its own
+    // physical inventory row; they share the resolved filament reference.
+    quantity: z.coerce.number().int().min(1).max(100).optional(),
     notes: z.string().optional()
   })
   .superRefine((value, ctx) => {
