@@ -36,6 +36,7 @@ export class SimpleJobsService {
           op.required_print_technology,
           op.required_filament_material,
           op.required_color,
+          op.cost,
           op.slicer_filament_used_grams::double precision AS slicer_filament_used_grams,
           CASE
             WHEN c.customer_type = 'b2b' THEN c.business_name

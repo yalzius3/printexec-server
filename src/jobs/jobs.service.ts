@@ -118,6 +118,9 @@ interface JobRow {
   created_at: string;
   last_updated_at: string;
   customer_name: string | null;
+  // Per-piece price (NUMERIC → string). Optional: beds and some internal
+  // JobRow builders don't carry it. Null when the piece isn't priced yet.
+  cost?: string | null;
 }
 
 interface PrinterCandidateRow {
@@ -518,6 +521,7 @@ export class JobsService {
         op.slicer_print_time_minutes,
         op.slicer_filament_used_grams,
         op.slicer_file_url,
+        op.cost,
         ${stlProjection},
         op.scheduled_at,
         op.scheduled_start_at,

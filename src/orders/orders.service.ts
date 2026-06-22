@@ -48,6 +48,7 @@ type OrderRow = {
   piece_count: string;
   scheduled_piece_count: string;
   printable_piece_count: string;
+  order_total: string | null;
 };
 
 @Injectable()
@@ -497,7 +498,10 @@ export class OrdersService {
         END AS customer_name,
         COUNT(op.piece_id) AS piece_count,
         COUNT(op.piece_id) FILTER (WHERE op.status = 'scheduled') AS scheduled_piece_count,
-        COUNT(op.piece_id) FILTER (WHERE op.status IN ('ready', 'scheduled', 'printing')) AS printable_piece_count
+        COUNT(op.piece_id) FILTER (WHERE op.status IN ('ready', 'scheduled', 'printing')) AS printable_piece_count,
+        -- Order total = sum of saved per-piece prices. NULL when no piece is
+        -- priced yet, so the UI can show "—" rather than a misleading 0.
+        SUM(op.cost) AS order_total
       FROM orders o
       INNER JOIN customers c
         ON c.customer_id = o.customer_id
