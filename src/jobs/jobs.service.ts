@@ -1888,6 +1888,41 @@ export class JobsService {
     `;
   }
 
+  // Physical spool(s) each block reserves, keyed by the block's id (piece_id, or
+  // bed_id for bed blocks). Pieces map directly through order_piece_spools; a
+  // bed's reservation is anchored on its child pieces, rolled up under the
+  // bed_id. Shared by the per-printer, global, and (now) all timeline views so
+  // every lane can pivot by literal inventory spool, not just material family.
+  private async spoolIdsByBlock(
+    companyId: string,
+    pieceIds: string[],
+    bedIds: string[]
+  ): Promise<Map<string, string[]>> {
+    const spoolsByBlock = new Map<string, string[]>();
+    if (pieceIds.length > 0) {
+      const r = await this.databaseService.query<{ piece_id: string; spool_asset_ids: string[] }>(
+        `SELECT piece_id, array_agg(DISTINCT spool_asset_id) AS spool_asset_ids
+           FROM order_piece_spools
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+          GROUP BY piece_id`,
+        [companyId, pieceIds]
+      );
+      for (const row of r.rows) spoolsByBlock.set(row.piece_id, row.spool_asset_ids);
+    }
+    if (bedIds.length > 0) {
+      const r = await this.databaseService.query<{ bed_id: string; spool_asset_ids: string[] }>(
+        `SELECT op.bed_id, array_agg(DISTINCT ops.spool_asset_id) AS spool_asset_ids
+           FROM order_piece_spools ops
+           JOIN order_pieces op ON op.piece_id = ops.piece_id
+          WHERE ops.company_id = $1 AND op.bed_id = ANY($2::uuid[])
+          GROUP BY op.bed_id`,
+        [companyId, bedIds]
+      );
+      for (const row of r.rows) spoolsByBlock.set(row.bed_id, row.spool_asset_ids);
+    }
+    return spoolsByBlock;
+  }
+
   async printerTimeline(companyId: string, printerId: string, query: TimelineQuery) {
     const hasStl = await this.hasStlColumn();
     const hasBeds = await this.hasBedsTable();
@@ -1971,9 +2006,19 @@ export class JobsService {
       bedFloating = bf.rows;
     }
 
+    // Tag each scheduled block with the spool(s) it reserves, so the schedule
+    // step can show a lane per involved spool (not just the job being scheduled).
+    const spoolsByBlock = await this.spoolIdsByBlock(
+      companyId,
+      scheduledRes.rows.map((r) => r.piece_id),
+      bedScheduled.map((b) => b.piece_id)
+    );
+    const withSpools = <T extends JobRow & { is_bed?: boolean }>(rows: T[]) =>
+      rows.map((b) => ({ ...b, spool_asset_ids: spoolsByBlock.get(b.piece_id) ?? [] }));
+
     return {
       printer: printerRes.rows[0]!,
-      scheduled: [...scheduledRes.rows, ...bedScheduled],
+      scheduled: [...withSpools(scheduledRes.rows), ...withSpools(bedScheduled)],
       floating: [...floatingRes.rows, ...bedFloating],
     };
   }
@@ -2712,33 +2757,12 @@ export class JobsService {
     }
 
     // Which physical spool(s) each block reserves — so the timeline can pivot
-    // by literal inventory spool, not just material family. Pieces map directly
-    // through order_piece_spools; a bed's reservation is anchored on its child
-    // pieces, so we roll those up under the bed_id (the bed block's piece_id).
-    const pieceIds = scheduledRes.rows.map((r) => r.piece_id);
-    const bedIds = bedBlocks.map((b) => b.piece_id);
-    const spoolsByBlock = new Map<string, string[]>();
-    if (pieceIds.length > 0) {
-      const r = await this.databaseService.query<{ piece_id: string; spool_asset_ids: string[] }>(
-        `SELECT piece_id, array_agg(DISTINCT spool_asset_id) AS spool_asset_ids
-           FROM order_piece_spools
-          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
-          GROUP BY piece_id`,
-        [companyId, pieceIds]
-      );
-      for (const row of r.rows) spoolsByBlock.set(row.piece_id, row.spool_asset_ids);
-    }
-    if (bedIds.length > 0) {
-      const r = await this.databaseService.query<{ bed_id: string; spool_asset_ids: string[] }>(
-        `SELECT op.bed_id, array_agg(DISTINCT ops.spool_asset_id) AS spool_asset_ids
-           FROM order_piece_spools ops
-           JOIN order_pieces op ON op.piece_id = ops.piece_id
-          WHERE ops.company_id = $1 AND op.bed_id = ANY($2::uuid[])
-          GROUP BY op.bed_id`,
-        [companyId, bedIds]
-      );
-      for (const row of r.rows) spoolsByBlock.set(row.bed_id, row.spool_asset_ids);
-    }
+    // by literal inventory spool, not just material family.
+    const spoolsByBlock = await this.spoolIdsByBlock(
+      companyId,
+      scheduledRes.rows.map((r) => r.piece_id),
+      bedBlocks.map((b) => b.piece_id)
+    );
     const withSpools = (rows: Array<JobRow & { is_bed?: boolean }>) =>
       rows.map((b) => ({ ...b, spool_asset_ids: spoolsByBlock.get(b.piece_id) ?? [] }));
 
