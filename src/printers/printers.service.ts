@@ -445,6 +445,7 @@ export class PrintersService {
       purchase_date: input.purchase_date,
       power_watts: input.power_watts,
       location: input.location,
+      marker: input.marker,
       notes: input.notes
     };
 
@@ -763,6 +764,7 @@ export class PrintersService {
         COALESCE(pr.has_filament_sensor, pi.has_filament_sensor) AS has_filament_sensor,
         COALESCE(pr.network_capability, pi.network_capability) AS network_capability,
         pi.location,
+        pi.marker,
         pi.notes,
         pi.created_at,
         -- ── Live "DB mirror" / execution fields ──────────────────────────

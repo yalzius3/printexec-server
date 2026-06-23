@@ -279,7 +279,10 @@ export const updatePrinterSchema = z
     purchase_date: baseDateSchema.nullable().optional(),
     power_watts: z.coerce.number().nullable().optional(),
     location: z.string().trim().min(1).nullable().optional(),
-    notes: z.string().nullable().optional()
+    notes: z.string().nullable().optional(),
+    // Optional short freeform marker to physically distinguish otherwise-identical
+    // printers. Nullable so the editor can CLEAR it (client sends null for empty).
+    marker: z.string().trim().min(1).max(16).nullable().optional()
   })
   .superRefine((value, ctx) => {
     if (value.printer_ref_id && value.custom_reference) {
