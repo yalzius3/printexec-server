@@ -312,7 +312,7 @@ export class AssetsService {
   // Average filament price per gram for each material type:
   //   Σ(purchase_price) / Σ(initial_grams)
   // counting ONLY spools that have a positive price (so free/0-priced spools
-  // don't drag the average down) and that were purchased within the last year.
+  // don't drag the average down). All priced spools count, regardless of age.
   async listMaterialPricing(companyId: string) {
     const res = await this.databaseService.query<{
       material_type: string;
@@ -327,7 +327,6 @@ export class AssetsService {
           AND ai.purchase_price > 0
           AND ai.initial_grams > 0
           AND fr.material_type IS NOT NULL
-          AND COALESCE(ai.purchase_date, ai.created_at) >= (now() - interval '1 year')
         GROUP BY fr.material_type`,
       [companyId]
     );
