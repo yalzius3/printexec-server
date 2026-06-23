@@ -40,6 +40,7 @@ type OrderRow = {
   status: string;
   notes: string | null;
   labor_cost: string | null;
+  profit_pct: string | null;
   created_at: string;
   last_updated_at: string;
   customer_type: string | null;
@@ -527,6 +528,7 @@ export class OrdersService {
         o.status,
         o.notes,
         o.labor_cost,
+        o.profit_pct,
         o.created_at,
         o.last_updated_at,
         c.customer_type,

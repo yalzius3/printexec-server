@@ -127,7 +127,9 @@ export const updateOrderSchema = z
     status: orderStatusSchema.optional(),
     notes: z.string().nullable().optional(),
     // Operator-entered labour cost for the whole order (nullable to clear).
-    labor_cost: boundedNumber(0, 100000000).nullable().optional()
+    labor_cost: boundedNumber(0, 100000000).nullable().optional(),
+    // Operator-entered profit margin (%) for the order (nullable to clear).
+    profit_pct: boundedNumber(0, 1000000).nullable().optional()
   })
   .superRefine((value, ctx) => {
     if (value.established_at && value.deadline && value.established_at > value.deadline) {
