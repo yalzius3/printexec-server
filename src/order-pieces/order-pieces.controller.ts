@@ -16,6 +16,7 @@ import {
   duplicateOrderPieceSchema,
   listOrderPiecesQuerySchema,
   replacePieceSpoolsSchema,
+  transitionPieceFulfilmentSchema,
   updateOrderPieceSchema
 } from "../orders/orders.schemas";
 import { OrderPiecesService } from "./order-pieces.service";
@@ -126,5 +127,17 @@ export class OrderPiecesController {
     @Param("pieceId") pieceId: string
   ) {
     return this.orderPiecesService.unschedulePiece(companyId, pieceId);
+  }
+
+  // Advance a done piece through its shipping/fulfilment lifecycle.
+  @Post(":pieceId/fulfilment")
+  @RequirePermission("action_orders")
+  transitionFulfilment(
+    @CompanyId() companyId: string,
+    @Param("pieceId") pieceId: string,
+    @Body() body: unknown
+  ) {
+    const { status } = parseWithSchema(transitionPieceFulfilmentSchema, body);
+    return this.orderPiecesService.transitionPieceFulfilment(companyId, pieceId, status);
   }
 }

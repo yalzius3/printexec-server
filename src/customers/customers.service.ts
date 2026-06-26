@@ -267,7 +267,7 @@ export class CustomersService {
             JOIN orders o ON o.order_id = op.order_id
            WHERE o.customer_id = $1
              AND o.company_id = $2
-             AND o.status NOT IN ('cancelled', 'completed')
+             AND o.status NOT IN ('cancelled', 'completed', 'ready_for_shipping', 'out_for_shipping', 'returned', 'fulfilled')
              AND op.status NOT IN ('printing', 'done', 'cancelled', 'failed')
         `,
         [customerId, companyId]
@@ -285,7 +285,7 @@ export class CustomersService {
           SET status = 'cancelled'
           WHERE customer_id = $1
             AND company_id = $2
-            AND status NOT IN ('cancelled', 'completed')
+            AND status NOT IN ('cancelled', 'completed', 'ready_for_shipping', 'out_for_shipping', 'returned', 'fulfilled')
         `,
         [customerId, companyId]
       );

@@ -75,6 +75,19 @@ export const pieceStatusSchema = z.enum([
   "cancelled"
 ]);
 
+// Per-piece shipping lifecycle, tracked separately from production `status`
+// (the piece stays `done`). Only the three forward targets are accepted from
+// the API; `none` is the default and is never set explicitly.
+export const pieceFulfilmentTargetSchema = z.enum([
+  "ready_for_shipping",
+  "out_for_shipping",
+  "fulfilled"
+]);
+
+export const transitionPieceFulfilmentSchema = z.object({
+  status: pieceFulfilmentTargetSchema
+});
+
 export const listOrdersQuerySchema = z.object({
   customer_id: uuidSchema.optional(),
   status: orderStatusSchema.optional(),

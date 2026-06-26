@@ -62,6 +62,7 @@ type PieceRow = {
   scheduled_start_at: string | null;
   scheduled_end_at: string | null;
   status: string;
+  fulfilment_status: string;
   notes: string | null;
   cost: string | null;
   cost_inputs: { grams?: string[]; time?: string; failure?: string } | null;
@@ -157,6 +158,23 @@ const PIECE_CHANGE_LOCKED_ORDER_STATUSES = new Set<string>([
 // are intentionally excluded: their pieces are already done/cancelled, so the
 // existing per-piece lock covers them and their behaviour is unchanged.
 const PIECE_SPEC_LOCKED_ORDER_STATUSES = new Set<string>(POST_PRODUCTION_ORDER_STATUSES);
+
+// Forward-only shipping/fulfilment NFA for a DONE piece. Keyed by the piece's
+// current fulfilment_status; the value is the set of allowed next values.
+//   done(none) -> ready_for_shipping | fulfilled   (fulfilled = on-the-spot pickup)
+//   ready_for_shipping -> out_for_shipping
+//   out_for_shipping   -> fulfilled
+const PIECE_FULFILMENT_TRANSITIONS: Record<string, readonly string[]> = {
+  none: ["ready_for_shipping", "fulfilled"],
+  ready_for_shipping: ["out_for_shipping"],
+  out_for_shipping: ["fulfilled"]
+};
+
+const FULFILMENT_LABELS: Record<string, string> = {
+  ready_for_shipping: "ready for shipping",
+  out_for_shipping: "out for shipping",
+  fulfilled: "fulfilled"
+};
 
 @Injectable()
 export class OrderPiecesService {
@@ -643,6 +661,54 @@ export class OrderPiecesService {
       created: pieceIds.length,
       piece_ids: pieceIds
     };
+  }
+
+  // Advance a piece's shipping/fulfilment lifecycle (forward only). The piece's
+  // production status (`status`) is left at 'done' — this only moves the
+  // orthogonal `fulfilment_status`. The order status is then re-derived so it
+  // mirrors its pieces' shipping progress.
+  async transitionPieceFulfilment(
+    companyId: string,
+    pieceId: string,
+    target: string
+  ) {
+    const piece = await this.getPieceById(companyId, pieceId);
+
+    if (piece.status !== "done") {
+      throw new BadRequestException(
+        "Only a done piece can enter the shipping/fulfilment flow."
+      );
+    }
+
+    const current = piece.fulfilment_status ?? "none";
+    const allowed = PIECE_FULFILMENT_TRANSITIONS[current] ?? [];
+    if (!allowed.includes(target)) {
+      throw new BadRequestException(
+        `A piece that is ${FULFILMENT_LABELS[current] ?? current} cannot be marked ${FULFILMENT_LABELS[target] ?? target}.`
+      );
+    }
+
+    await this.databaseService.transaction(async (client) => {
+      await this.databaseService.query(
+        `UPDATE order_pieces
+            SET fulfilment_status = $3
+          WHERE company_id = $1 AND piece_id = $2`,
+        [companyId, pieceId, target],
+        client
+      );
+      await this.logPieceHistory(
+        client,
+        companyId,
+        pieceId,
+        piece.order_id,
+        piece.piece_name,
+        "fulfilment_changed",
+        `Piece "${piece.piece_name}" marked ${FULFILMENT_LABELS[target] ?? target}.`
+      );
+      await this.syncOrderStatus(companyId, piece.order_id, client);
+    });
+
+    return this.getPieceById(companyId, pieceId);
   }
 
   async replaceSpoolAllocations(

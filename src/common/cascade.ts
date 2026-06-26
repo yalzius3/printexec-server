@@ -84,6 +84,10 @@ export async function recomputeOrderStatusTx(
     done_piece_count: string;
     failed_piece_count: string;
     cancelled_piece_count: string;
+    done_unshipped_count: string;
+    ready_for_shipping_count: string;
+    out_for_shipping_count: string;
+    fulfilled_count: string;
   }>(
     `SELECT
         COUNT(*) AS total_piece_count,
@@ -93,7 +97,13 @@ export async function recomputeOrderStatusTx(
         COUNT(*) FILTER (WHERE status = 'printing')  AS printing_piece_count,
         COUNT(*) FILTER (WHERE status = 'done')      AS done_piece_count,
         COUNT(*) FILTER (WHERE status = 'failed')    AS failed_piece_count,
-        COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_piece_count
+        COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_piece_count,
+        -- Shipping/fulfilment breakdown of the DONE pieces (status stays 'done';
+        -- fulfilment_status is the orthogonal shipping dimension).
+        COUNT(*) FILTER (WHERE status = 'done' AND fulfilment_status = 'none')               AS done_unshipped_count,
+        COUNT(*) FILTER (WHERE status = 'done' AND fulfilment_status = 'ready_for_shipping') AS ready_for_shipping_count,
+        COUNT(*) FILTER (WHERE status = 'done' AND fulfilment_status = 'out_for_shipping')   AS out_for_shipping_count,
+        COUNT(*) FILTER (WHERE status = 'done' AND fulfilment_status = 'fulfilled')          AS fulfilled_count
        FROM order_pieces
       WHERE company_id = $1 AND order_id = $2`,
     [companyId, orderId]
@@ -114,6 +124,11 @@ export async function recomputeOrderStatusTx(
   const failed = Number(summary.failed_piece_count);
   const cancelled = Number(summary.cancelled_piece_count);
   const active = Number(summary.total_piece_count) - cancelled;
+  // Shipping breakdown of the done pieces.
+  const doneUnshipped = Number(summary.done_unshipped_count);
+  const readyForShipping = Number(summary.ready_for_shipping_count);
+  const outForShipping = Number(summary.out_for_shipping_count);
+  const fulfilled = Number(summary.fulfilled_count);
 
   if (
     currentOrder.rows[0]?.status === "confirmed" &&
@@ -124,23 +139,44 @@ export async function recomputeOrderStatusTx(
     return;
   }
 
-  let target: "draft" | "confirmed" | "in_progress" | "completed";
+  let target:
+    | "draft"
+    | "confirmed"
+    | "in_progress"
+    | "completed"
+    | "ready_for_shipping"
+    | "out_for_shipping"
+    | "fulfilled";
   if (active === 0) {
     target = "draft";
   } else if (printing > 0) {
     target = "in_progress";
   } else if (failed === 0 && done === active) {
-    target = "completed";
+    // Every active piece is produced. Mirror the order to the LEAST-advanced
+    // shipping stage among the pieces: still 'completed' until they all begin
+    // shipping, then ready -> out -> fulfilled as the laggard catches up.
+    if (doneUnshipped > 0) {
+      target = "completed";
+    } else if (readyForShipping > 0) {
+      target = "ready_for_shipping";
+    } else if (outForShipping > 0) {
+      target = "out_for_shipping";
+    } else {
+      // active > 0 and none unshipped/ready/out → all done pieces are fulfilled.
+      target = "fulfilled";
+    }
   } else if (scheduled > 0 || done > 0 || failed > 0) {
     target = "in_progress";
   } else {
     target = "draft";
   }
 
+  // 'cancelled' and 'returned' are manual, sticky order statuses — never
+  // overwritten by the piece-derived rollup.
   await executor.query(
     `UPDATE orders SET status = $3
       WHERE company_id = $1 AND order_id = $2
-        AND status != 'cancelled'
+        AND status NOT IN ('cancelled', 'returned')
         AND status != $3`,
     [companyId, orderId, target]
   );
