@@ -473,7 +473,7 @@ export class JobsService {
   ): string {
     const stlProjection = hasStl ? "op.stl_file_url" : "NULL::text AS stl_file_url";
     const orderStatusClause = excludeDraftOrders
-      ? `AND o.status IN ('confirmed','in_progress','completed')`
+      ? `AND o.status IN ('confirmed','in_progress','completed','ready_for_shipping','out_for_shipping')`
       : "";
     return `
       SELECT
@@ -484,6 +484,7 @@ export class JobsService {
         op.piece_name,
         op.description,
         op.status,
+        op.fulfilment_status,
         op.assigned_printer_id,
         CASE
           WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model
