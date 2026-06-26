@@ -30,6 +30,22 @@ const bulkUnassignSchema = z.object({
   printer_ids: z.array(z.string().uuid()).min(1).max(500),
 });
 
+// Mark a printing/done piece as a failed run: record the wasted filament per
+// reserved spool, then re-queue the piece to 'assigned' or 'pending'.
+const markFailedSchema = z.object({
+  piece_id: z.string().uuid(),
+  requeue_to: z.enum(["assigned", "pending"]),
+  spool_waste: z
+    .array(
+      z.object({
+        spool_asset_id: z.string().uuid(),
+        grams: z.number().nonnegative().max(10_000_000),
+      })
+    )
+    .max(50)
+    .default([]),
+});
+
 // Bulk-attach slicer files to already-assigned pieces (the bulk g-code drop).
 const attachSlicerSchema = z.object({
   items: z
@@ -85,5 +101,12 @@ export class SimpleJobsController {
   bulkUnassign(@CompanyId() companyId: string, @Body() body: unknown) {
     const { printer_ids } = parseWithSchema(bulkUnassignSchema, body);
     return this.simpleJobsService.bulkUnassign(companyId, printer_ids);
+  }
+
+  @Post("mark-failed")
+  @RequirePermission("action_orders")
+  markFailed(@CompanyId() companyId: string, @Body() body: unknown) {
+    const { piece_id, requeue_to, spool_waste } = parseWithSchema(markFailedSchema, body);
+    return this.simpleJobsService.markFailed(companyId, piece_id, requeue_to, spool_waste);
   }
 }
