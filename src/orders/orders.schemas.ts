@@ -55,6 +55,12 @@ export const orderStatusSchema = z.enum([
   "confirmed",
   "in_progress",
   "completed",
+  // Post-production fulfilment lifecycle. Added without any auto-transition
+  // logic yet — the allowed transitions between these are still to be defined.
+  "ready_for_shipping",
+  "out_for_shipping",
+  "returned",
+  "fulfilled",
   "cancelled"
 ]);
 

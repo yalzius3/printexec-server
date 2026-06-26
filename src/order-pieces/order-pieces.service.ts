@@ -135,6 +135,29 @@ const SLICER_FIELDS = [
 const TECH_LOCKED_STATUSES = new Set(["ready", "scheduled", "printing", "done", "failed", "cancelled"]);
 const SLICER_LOCKED_STATUSES = new Set(["scheduled", "printing", "done", "failed", "cancelled"]);
 
+// Post-production order statuses (added 2026-06-26). The order has left
+// production: like completed/cancelled they are closed to structural piece
+// changes (add / delete / duplicate), and they additionally forbid tech &
+// slicer edits regardless of the individual piece's status — "no tech edits".
+const POST_PRODUCTION_ORDER_STATUSES = [
+  "ready_for_shipping",
+  "out_for_shipping",
+  "returned",
+  "fulfilled"
+] as const;
+
+// Orders closed to structural piece changes (add / delete / duplicate).
+const PIECE_CHANGE_LOCKED_ORDER_STATUSES = new Set<string>([
+  "completed",
+  "cancelled",
+  ...POST_PRODUCTION_ORDER_STATUSES
+]);
+
+// Orders that lock tech/slicer edits at the order level. completed/cancelled
+// are intentionally excluded: their pieces are already done/cancelled, so the
+// existing per-piece lock covers them and their behaviour is unchanged.
+const PIECE_SPEC_LOCKED_ORDER_STATUSES = new Set<string>(POST_PRODUCTION_ORDER_STATUSES);
+
 @Injectable()
 export class OrderPiecesService {
   constructor(private readonly databaseService: DatabaseService) {}
@@ -1283,9 +1306,9 @@ export class OrderPiecesService {
   }
 
   private assertOrderOpenForPieceChanges(orderStatus: string) {
-    if (["completed", "cancelled"].includes(orderStatus)) {
+    if (PIECE_CHANGE_LOCKED_ORDER_STATUSES.has(orderStatus)) {
       throw new BadRequestException(
-        "Pieces cannot be added to completed or cancelled orders. Reopen the order first."
+        "Pieces cannot be changed once an order is completed, cancelled, or in a shipping/fulfilment status. Reopen the order first."
       );
     }
   }
@@ -1296,6 +1319,17 @@ export class OrderPiecesService {
   ) {
     const hasPatchedField = (fields: readonly (keyof UpdateOrderPieceInput)[]) =>
       fields.some((field) => input[field] !== undefined);
+
+    // Once the order has left production (shipping/fulfilment statuses), tech and
+    // slicer specs are frozen regardless of the piece's own status — no tech edits.
+    if (
+      PIECE_SPEC_LOCKED_ORDER_STATUSES.has(currentPiece.order_status) &&
+      hasPatchedField([...TECH_FIELDS, ...SLICER_FIELDS])
+    ) {
+      throw new ForbiddenException(
+        "Tech and slicer details cannot be edited once the order has left production."
+      );
+    }
 
     if (hasPatchedField(TECH_FIELDS) && TECH_LOCKED_STATUSES.has(currentPiece.status)) {
       throw new ForbiddenException("Tech details cannot be edited once a piece is ready for production.");
