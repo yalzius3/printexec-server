@@ -297,6 +297,7 @@ export class AssetsService {
         asset_id: r.asset_id,
         filament_ref_id: r.filament_ref_id,
         material_type: r.material_type,
+        color: r.color,
         location: r.location,
         marker: r.marker,
         label,
