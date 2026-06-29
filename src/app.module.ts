@@ -8,6 +8,7 @@ import { DatabaseModule } from "./database/database.module";
 import { HealthController } from "./health/health.controller";
 import { BedsModule } from "./beds/beds.module";
 import { JobsModule } from "./jobs/jobs.module";
+import { MaintenanceModule } from "./maintenance/maintenance.module";
 import { OrderAttachmentsModule } from "./order-attachments/order-attachments.module";
 import { OrderPiecesModule } from "./order-pieces/order-pieces.module";
 import { OrdersModule } from "./orders/orders.module";
@@ -27,6 +28,7 @@ import { PermissionGuard } from "./auth/permission.guard";
     BedsModule,
     CustomersModule,
     JobsModule,
+    MaintenanceModule,
     OrderAttachmentsModule,
     OrderPiecesModule,
     OrdersModule,
