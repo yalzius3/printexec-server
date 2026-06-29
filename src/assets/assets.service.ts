@@ -9,6 +9,7 @@ import {
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
   listFilamentReferencesQuerySchema,
+  splitSpoolSchema,
   updateAssetSchema,
   updateAssetStockSchema
 } from "./assets.schemas";
@@ -23,12 +24,16 @@ type UpdateAssetInput = z.infer<typeof updateAssetSchema>;
 type UpdateAssetStockInput = z.infer<typeof updateAssetStockSchema>;
 type ListFilamentReferencesQuery = z.infer<typeof listFilamentReferencesQuerySchema>;
 type ListAssetHistoryQuery = z.infer<typeof listAssetHistoryQuerySchema>;
+type SplitSpoolInput = z.infer<typeof splitSpoolSchema>;
 
 type AssetRow = {
   asset_id: string;
   company_id: string;
   asset_type: "filament_spool" | "nozzle" | "resin_tank";
   filament_ref_id: string | null;
+  parent_asset_id: string | null;
+  split_at: string | null;
+  child_spool_count: string | null;
   initial_grams: string | null;
   purchase_price: string | null;
   purchase_date: string | null;
@@ -285,6 +290,9 @@ export class AssetsService {
          LEFT JOIN asset_stock ast ON ast.asset_id = ai.asset_id
          LEFT JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
         WHERE ai.company_id = $1 AND ai.asset_type = 'filament_spool'
+          -- A distributed (split) parent is unusable for new assignments; only
+          -- its children carry the real, allocatable grams.
+          AND ai.split_at IS NULL
         ORDER BY fr.brand NULLS LAST, fr.material_type, fr.color, ai.created_at`,
       [companyId]
     );
@@ -314,6 +322,8 @@ export class AssetsService {
   //   Σ(purchase_price) / Σ(initial_grams)
   // counting ONLY spools that have a positive price (so free/0-priced spools
   // don't drag the average down). All priced spools count, regardless of age.
+  // Child spools (parent_asset_id IS NOT NULL) are excluded — a split keeps the
+  // original parent as the priced spool, so it must never re-count its grams.
   async listMaterialPricing(companyId: string) {
     const res = await this.databaseService.query<{
       material_type: string;
@@ -325,6 +335,7 @@ export class AssetsService {
          JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
         WHERE ai.company_id = $1
           AND ai.asset_type = 'filament_spool'
+          AND ai.parent_asset_id IS NULL
           AND ai.purchase_price > 0
           AND ai.initial_grams > 0
           AND fr.material_type IS NOT NULL
@@ -514,6 +525,141 @@ export class AssetsService {
       // Stay backwards-compatible: a single spool returns the asset object, while
       // a multiplier batch returns the array of created spools.
       return quantity > 1 ? createdAssets : createdAssets[0];
+    });
+  }
+
+  // Split one idle spool into N child spools. The parent is kept intact but
+  // marked distributed (split_at) so it's unusable for new assignments, while
+  // the children become the real, allocatable spools. Eligibility: a filament
+  // spool that isn't already split/child, isn't in use, has no reservation and
+  // no scheduled commitment, and has remaining grams to divide. The per-child
+  // grams must sum to the parent's current remaining grams.
+  async splitSpool(companyId: string, assetId: string, input: SplitSpoolInput) {
+    return this.databaseService.transaction(async (client) => {
+      const parent = await this.getAssetById(companyId, assetId, client);
+
+      if (parent.asset_type !== "filament_spool") {
+        throw new BadRequestException("Only filament spools can be split.");
+      }
+      if (parent.split_at) {
+        throw new BadRequestException("This spool has already been split.");
+      }
+      // A child spool is otherwise a normal spool — it may be split again. Any
+      // descendant keeps a non-null parent_asset_id, so it stays excluded from
+      // cost averaging and the original top parent remains the only priced spool.
+      if (parent.currently_used_in_piece_id) {
+        throw new BadRequestException("Cannot split a spool that is currently in use.");
+      }
+      if (Number(parent.reserved_grams ?? 0) > 0) {
+        throw new BadRequestException("Cannot split a spool that has reserved grams.");
+      }
+
+      const commitments = await client.query(
+        `SELECT 1 FROM order_piece_spools
+          WHERE company_id = $1 AND spool_asset_id = $2 LIMIT 1`,
+        [companyId, assetId]
+      );
+      if (commitments.rowCount) {
+        throw new BadRequestException(
+          "Cannot split a spool that is reserved for scheduled work."
+        );
+      }
+
+      const remaining = parent.remaining_grams != null ? Number(parent.remaining_grams) : null;
+      if (remaining == null || !Number.isFinite(remaining) || remaining <= 0) {
+        throw new BadRequestException("This spool has no remaining grams to split.");
+      }
+
+      const sum = input.children.reduce((acc, g) => acc + g, 0);
+      // Half-gram tolerance absorbs the rounding of an even distribution.
+      if (Math.abs(sum - remaining) > 0.5) {
+        throw new BadRequestException(
+          `Child grams must sum to the spool's current ${remaining} g (got ${Math.round(sum * 100) / 100} g).`
+        );
+      }
+
+      const parentName = this.buildAssetName(parent);
+      const total = input.children.length;
+
+      for (let i = 0; i < total; i++) {
+        const grams = input.children[i]!;
+        const createdAsset = await client.query<{ asset_id: string }>(
+          `
+            INSERT INTO asset_instances (
+              company_id, asset_type, filament_ref_id, parent_asset_id,
+              initial_grams, purchase_price, purchase_date, production_date,
+              location, notes
+            )
+            VALUES ($1, 'filament_spool', $2, $3, $4, NULL, $5, $6, $7, $8)
+            RETURNING asset_id
+          `,
+          [
+            companyId,
+            parent.filament_ref_id,
+            assetId,
+            grams,
+            parent.purchase_date,
+            parent.production_date,
+            parent.location,
+            `Split from parent spool ${assetId} (${i + 1} of ${total})`
+          ]
+        );
+
+        const childRow = createdAsset.rows[0];
+        if (!childRow) {
+          throw new BadRequestException("Child spool insert failed.");
+        }
+
+        await client.query(
+          `
+            INSERT INTO asset_stock (
+              asset_id, company_id, status, remaining_grams, remaining_volume_ml,
+              currently_used_in_piece_id, in_use_since, installed_on_asset_id, next_free_at
+            )
+            VALUES ($1, $2, 'available', $3, NULL, NULL, NULL, NULL, NULL)
+          `,
+          [childRow.asset_id, companyId, grams]
+        );
+
+        await this.logAssetEvent(
+          companyId,
+          childRow.asset_id,
+          "filament_spool",
+          "addition",
+          parentName,
+          `Child spool from split (${grams} g)`,
+          client
+        );
+      }
+
+      // Flag the parent distributed/unusable and empty its current grams — the
+      // physical filament now lives on the children. Its initial_grams +
+      // purchase_price are untouched, so it stays the spool counted in cost
+      // averaging. Mirror the depleted-spool convention (status → 'empty').
+      await client.query(
+        `UPDATE asset_instances SET split_at = now() WHERE company_id = $1 AND asset_id = $2`,
+        [companyId, assetId]
+      );
+      await client.query(
+        `UPDATE asset_stock
+            SET remaining_grams = 0,
+                reserved_grams  = 0,
+                status          = 'empty'
+          WHERE company_id = $1 AND asset_id = $2`,
+        [companyId, assetId]
+      );
+
+      await this.logAssetEvent(
+        companyId,
+        assetId,
+        "filament_spool",
+        "edit",
+        parentName,
+        `Split into ${total} child spools`,
+        client
+      );
+
+      return this.getAssetById(companyId, assetId, client);
     });
   }
 
@@ -874,6 +1020,10 @@ export class AssetsService {
         ai.company_id,
         ai.asset_type,
         ai.filament_ref_id,
+        ai.parent_asset_id,
+        ai.split_at,
+        (SELECT COUNT(*) FROM asset_instances ch
+          WHERE ch.parent_asset_id = ai.asset_id) AS child_spool_count,
         ai.initial_grams,
         ai.purchase_price,
         ai.purchase_date,

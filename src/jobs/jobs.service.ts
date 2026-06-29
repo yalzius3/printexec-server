@@ -2388,6 +2388,8 @@ export class JobsService {
          LEFT JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
         WHERE ai.company_id = $1
           AND ai.asset_type = 'filament_spool'
+          -- A distributed (split) parent is unusable; only its children are allocatable.
+          AND ai.split_at IS NULL
           AND COALESCE(ast.status, 'available') IN ('available','in_use','installed')`,
       [companyId]
     );

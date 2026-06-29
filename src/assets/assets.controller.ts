@@ -19,6 +19,7 @@ import {
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
   listFilamentReferencesQuerySchema,
+  splitSpoolSchema,
   updateAssetSchema,
   updateAssetStockSchema
 } from "./assets.schemas";
@@ -131,6 +132,21 @@ export class AssetsController {
     return this.assetsService.createResinTank(
       companyId,
       parseWithSchema(createResinTankSchema, body)
+    );
+  }
+
+  // Split an idle spool into N child spools (action; service enforces eligibility).
+  @Post(":assetId/split")
+  @RequirePermission("action_assets")
+  splitSpool(
+    @CompanyId() companyId: string,
+    @Param("assetId") assetId: string,
+    @Body() body: unknown
+  ) {
+    return this.assetsService.splitSpool(
+      companyId,
+      assetId,
+      parseWithSchema(splitSpoolSchema, body)
     );
   }
 

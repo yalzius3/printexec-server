@@ -307,3 +307,13 @@ export const listAssetHistoryQuerySchema = z.object({
   asset_type: z.enum(["filament_spool", "nozzle", "resin_tank"]).optional(),
   days: z.coerce.number().int().min(1).max(365).optional().default(30)
 });
+
+// Split an idle spool into N child spools. `children` is the per-child gram
+// allocation; its sum must equal the parent's current remaining grams (enforced
+// in the service against the live stock value, with a small rounding tolerance).
+export const splitSpoolSchema = z.object({
+  children: z
+    .array(boundedNumber(0.01, 100000))
+    .min(2, "A split must produce at least 2 child spools.")
+    .max(50, "A split can produce at most 50 child spools.")
+});

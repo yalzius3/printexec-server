@@ -115,6 +115,7 @@ export class OrdersService {
            JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
           WHERE ai.company_id = $1
             AND ai.asset_type = 'filament_spool'
+            AND ai.parent_asset_id IS NULL
             AND ai.purchase_price > 0
             AND ai.initial_grams > 0
             AND fr.material_type IS NOT NULL
