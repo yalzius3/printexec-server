@@ -49,6 +49,7 @@ type OrderRow = {
   piece_count: string;
   scheduled_piece_count: string;
   printable_piece_count: string;
+  order_cost: string | null;
   order_total: string | null;
 };
 
@@ -209,10 +210,14 @@ export class OrdersService {
             base += c;
           }
         }
-        if (!anyPriced) return { ...o, order_total: null };
+        if (!anyPriced) return { ...o, order_cost: null, order_total: null };
         const profit = o.profit_pct != null && o.profit_pct !== "" ? Number(o.profit_pct) : 0;
         const total = base * (1 + (Number.isFinite(profit) ? profit : 0) / 100);
-        return { ...o, order_total: (Math.round(total * 100) / 100).toString() };
+        return {
+          ...o,
+          order_cost: (Math.round(base * 100) / 100).toString(),
+          order_total: (Math.round(total * 100) / 100).toString(),
+        };
       });
     } catch {
       return orders; // keep the SQL fallback total on failure
@@ -664,9 +669,11 @@ export class OrdersService {
         COUNT(op.piece_id) AS piece_count,
         COUNT(op.piece_id) FILTER (WHERE op.status = 'scheduled') AS scheduled_piece_count,
         COUNT(op.piece_id) FILTER (WHERE op.status IN ('ready', 'scheduled', 'printing')) AS printable_piece_count,
-        -- Fallback order total (sum of stored per-piece costs × profit). The list
-        -- overrides this with a live recompute from each piece's cost_inputs so it
-        -- equals the order's invoice total even when stored costs are stale.
+        -- Fallback order cost/total (sum of stored per-piece costs; total adds
+        -- profit). The list overrides these with a live recompute from each
+        -- piece's cost_inputs so they equal the order's invoice figures even when
+        -- stored costs are stale.
+        SUM(op.cost) AS order_cost,
         SUM(op.cost) * (1 + COALESCE(o.profit_pct, 0) / 100) AS order_total
       FROM orders o
       LEFT JOIN customers c
