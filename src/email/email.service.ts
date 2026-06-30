@@ -26,7 +26,10 @@ import { Resend } from "resend";
 export type EmailMessage = {
   to: string;
   subject: string;
-  body: string;
+  /** Plain-text body — always sent as the fallback part. */
+  text: string;
+  /** Optional branded HTML body. When present it's the primary rendering. */
+  html?: string;
 };
 
 export type EmailSendResult = "sent" | "dry_run";
@@ -64,7 +67,7 @@ export class EmailService {
   async send(message: EmailMessage): Promise<EmailSendResult> {
     if (!this.enabled) {
       this.logger.log(
-        `[dry-run] would email (from ${this.from}) → ${message.to} — "${message.subject}"\n${message.body}`
+        `[dry-run] would email (from ${this.from}) → ${message.to} — "${message.subject}"\n${message.text}`
       );
       return "dry_run";
     }
@@ -92,7 +95,9 @@ export class EmailService {
       from: this.from, // "Name <no-reply@domain>" — Resend accepts this form
       to: [message.to],
       subject: message.subject,
-      text: message.body // html added later for branding
+      // Both parts: branded HTML when present, plain text always as fallback.
+      ...(message.html ? { html: message.html } : {}),
+      text: message.text
     });
 
     if (error) {

@@ -31,8 +31,11 @@ import {
 //   EMAIL_SWEEP_INTERVAL_MS  sweep cadence (default 2 min)
 // ════════════════════════════════════════════════════════════════
 
+// Trigger range: an order emails the customer the first time it reaches
+// "ready for shipping or above". 'completed' (production done, not yet packed)
+// deliberately does NOT notify — the customer hears from us once the order is
+// actually ready to ship and onward through fulfilment.
 const NOTIFY_STATUSES = [
-  "completed",
   "ready_for_shipping",
   "out_for_shipping",
   "fulfilled"
@@ -213,7 +216,8 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       result = await this.email.send({
         to: recipient,
         subject: message.subject,
-        body: message.body
+        text: message.text,
+        html: message.html
       });
     } catch (e) {
       // Leave the order un-recorded so it stays eligible and retries next sweep.
@@ -227,7 +231,7 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       status: result,
       recipientEmail: recipient,
       subject: message.subject,
-      body: message.body
+      body: message.text
     });
     await this.logHistory(row, recipient, result);
     return result;
