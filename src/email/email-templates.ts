@@ -38,8 +38,9 @@ export type OrderCompletionEmailData = {
     title: string;
     description: string | null;
     status: OrderCompletionStatus;
-    establishedAt: string | null;
-    deadline: string | null;
+    // pg returns DATE columns as Date objects, not strings — formatDate handles both.
+    establishedAt: string | Date | null;
+    deadline: string | Date | null;
     pieceCount: number;
     /** Best-effort order total (sum of piece costs × profit). Null when unpriced. */
     total: number | null;
@@ -74,14 +75,33 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December"
 ];
 
-/** Format a 'YYYY-MM-DD' (or ISO) date as "June 30, 2026", TZ-safe (no Date()). */
-function formatDate(value: string | null): string | null {
-  if (!value) return null;
-  const parts = value.slice(0, 10).split("-");
-  const year = Number(parts[0]);
-  const month = Number(parts[1]);
-  const day = Number(parts[2]);
-  if (!year || !month || !day || month < 1 || month > 12) return value;
+/**
+ * Format a date as "June 30, 2026". Accepts a 'YYYY-MM-DD'/ISO string OR a Date
+ * (the pg driver returns DATE columns as Date objects, not strings). TZ-safe:
+ * for a Date we read LOCAL components — pg builds a DATE at local midnight, so
+ * the calendar day is preserved regardless of the server timezone; for a string
+ * we slice the leading YYYY-MM-DD. Neither path re-parses through Date math that
+ * could shift the day.
+ */
+function formatDate(value: string | Date | null): string | null {
+  if (value == null) return null;
+  let year: number;
+  let month: number;
+  let day: number;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    year = value.getFullYear();
+    month = value.getMonth() + 1;
+    day = value.getDate();
+  } else {
+    const parts = value.slice(0, 10).split("-");
+    year = Number(parts[0]);
+    month = Number(parts[1]);
+    day = Number(parts[2]);
+  }
+  if (!year || !month || !day || month < 1 || month > 12) {
+    return value instanceof Date ? null : value;
+  }
   return `${MONTHS[month - 1]} ${day}, ${year}`;
 }
 
