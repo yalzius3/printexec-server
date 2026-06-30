@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { recordOrderHistory } from "../common/order-history";
 import {
   releasePieceSpoolsTx,
   recomputeOrderStatusTx
@@ -51,6 +52,11 @@ export interface BedRow {
   created_at: string;
   last_updated_at: string;
   piece_count: number;
+  // Aggregate shipping/fulfilment stage of the bed's DONE pieces — the LEAST
+  // advanced stage among them (none < ready_for_shipping < out_for_shipping <
+  // fulfilled), so the bed reads as "done" until every piece has shipped.
+  // 'none' when the bed has no done pieces. Mirrors a piece's fulfilment_status.
+  fulfilment_status: string;
   // Source orders / customers of this bed's constituent pieces (a bed may span
   // more than one order). Comma-joined, distinct, ordered. NULL if no pieces.
   order_references: string | null;
@@ -72,6 +78,22 @@ interface PieceForBed {
   status: string;
   bed_id: string | null;
 }
+
+// Forward-only shipping/fulfilment NFA (mirrors the per-piece NFA in
+// order-pieces.service). Keyed by the current stage; value = allowed next stages.
+//   done(none) -> ready_for_shipping | fulfilled   (fulfilled = on-the-spot pickup)
+//   ready_for_shipping -> out_for_shipping
+//   out_for_shipping   -> fulfilled
+const BED_FULFILMENT_TRANSITIONS: Record<string, readonly string[]> = {
+  none: ["ready_for_shipping", "fulfilled"],
+  ready_for_shipping: ["out_for_shipping"],
+  out_for_shipping: ["fulfilled"]
+};
+const BED_FULFILMENT_LABELS: Record<string, string> = {
+  ready_for_shipping: "ready for shipping",
+  out_for_shipping: "out for shipping",
+  fulfilled: "fulfilled"
+};
 
 @Injectable()
 export class BedsService {
@@ -337,6 +359,7 @@ export class BedsService {
         pb.print_started_at, pb.print_completed_at,
         pb.created_at, pb.last_updated_at,
         COALESCE(c.piece_count, 0)::int AS piece_count,
+        COALESCE(ful.fulfilment_status, 'none') AS fulfilment_status,
         src.order_references,
         src.customer_names
       FROM print_beds pb
@@ -345,6 +368,20 @@ export class BedsService {
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::int AS piece_count FROM order_pieces WHERE bed_id = pb.bed_id
       ) c ON TRUE
+      LEFT JOIN LATERAL (
+        -- The bed's shipping stage = the LEAST advanced fulfilment_status across
+        -- its DONE pieces. Rank none/ready/out/fulfilled 1..4, take MIN, map back.
+        -- A bed therefore only reads as "shipped" once every piece has shipped.
+        SELECT (ARRAY['none','ready_for_shipping','out_for_shipping','fulfilled'])[
+          MIN(CASE COALESCE(opf.fulfilment_status, 'none')
+                WHEN 'fulfilled' THEN 4
+                WHEN 'out_for_shipping' THEN 3
+                WHEN 'ready_for_shipping' THEN 2
+                ELSE 1 END)
+        ] AS fulfilment_status
+        FROM order_pieces opf
+        WHERE opf.bed_id = pb.bed_id AND opf.status = 'done'
+      ) ful ON TRUE
       LEFT JOIN LATERAL (
         -- Distinct source orders + customers of this bed's pieces (may span
         -- multiple orders), comma-joined for display.
@@ -961,6 +998,85 @@ export class BedsService {
     // Cancelled bed → child pieces also cancelled (they were going to be
     // part of this print; the operator must dismantle to make any change).
     await this.propagatePieceStatus(companyId, bedId, "cancelled");
+    return this.loadBed(companyId, bedId);
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/beds/:bedId/fulfilment — advance a DONE bed through its
+  // shipping/fulfilment lifecycle (forward only). A bed has no fulfilment
+  // column of its own: it walks the orthogonal `fulfilment_status` of EVERY
+  // constituent done piece in lockstep. We validate `target` against the bed's
+  // aggregate (least-advanced) stage, then move each done piece for which the
+  // target is a valid next step — laggards catch up, leaders are left alone.
+  // Affected orders are re-synced once each so their status mirrors shipping.
+  // ──────────────────────────────────────────────────────────
+  async transitionBedFulfilment(
+    companyId: string,
+    bedId: string,
+    target: string
+  ): Promise<BedRow> {
+    const bed = await this.loadBed(companyId, bedId);
+
+    if (bed.status !== "done") {
+      throw new ConflictException(
+        "Only a done bed can enter the shipping/fulfilment flow."
+      );
+    }
+
+    const current = bed.fulfilment_status ?? "none";
+    const allowed = BED_FULFILMENT_TRANSITIONS[current] ?? [];
+    if (!allowed.includes(target)) {
+      throw new BadRequestException(
+        `A bed that is ${BED_FULFILMENT_LABELS[current] ?? current} cannot be marked ${BED_FULFILMENT_LABELS[target] ?? target}.`
+      );
+    }
+
+    await this.databaseService.transaction(async (client) => {
+      const pieces = await client.query<{
+        piece_id: string;
+        order_id: string;
+        order_number: string;
+        piece_name: string;
+        fulfilment_status: string;
+      }>(
+        `SELECT op.piece_id, op.order_id, o.order_number, op.piece_name,
+                COALESCE(op.fulfilment_status, 'none') AS fulfilment_status
+           FROM order_pieces op
+           JOIN orders o ON o.order_id = op.order_id
+          WHERE op.company_id = $1 AND op.bed_id = $2 AND op.status = 'done'`,
+        [companyId, bedId]
+      );
+
+      const affectedOrders = new Set<string>();
+      for (const p of pieces.rows) {
+        // Skip pieces already at/ahead of the target — only the laggards move.
+        const pieceAllowed = BED_FULFILMENT_TRANSITIONS[p.fulfilment_status] ?? [];
+        if (!pieceAllowed.includes(target)) continue;
+
+        await client.query(
+          `UPDATE order_pieces
+              SET fulfilment_status = $3
+            WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, p.piece_id, target]
+        );
+        await recordOrderHistory(client, companyId, {
+          entityType: "piece",
+          eventType: "fulfilment_changed",
+          orderId: p.order_id,
+          orderNumber: p.order_number,
+          pieceId: p.piece_id,
+          pieceName: p.piece_name,
+          description: `Piece "${p.piece_name}" marked ${BED_FULFILMENT_LABELS[target] ?? target} (via bed "${bed.bed_name}").`
+        });
+        affectedOrders.add(p.order_id);
+      }
+
+      // Re-derive each touched order's status so it mirrors shipping progress.
+      for (const orderId of affectedOrders) {
+        await recomputeOrderStatusTx(client, companyId, orderId);
+      }
+    });
+
     return this.loadBed(companyId, bedId);
   }
 

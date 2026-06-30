@@ -20,6 +20,7 @@ import {
 import { z } from "zod";
 import type { AuthRequest } from "../auth/supabase.guard";
 import { findCandidatesSchema, reserveSpoolsSchema } from "../jobs/jobs.schemas";
+import { transitionPieceFulfilmentSchema } from "../orders/orders.schemas";
 
 const uuid = z.string().uuid();
 const assignBedSchema = z.object({
@@ -185,6 +186,19 @@ export class BedsController {
   @RequirePermission("action_orders")
   cancel(@CompanyId() companyId: string, @Param("bedId") bedId: string) {
     return this.beds.cancel(companyId, bedId);
+  }
+
+  // Advance a done bed through its shipping/fulfilment lifecycle. Walks every
+  // constituent done piece's fulfilment_status forward in lockstep.
+  @Post(":bedId/fulfilment")
+  @RequirePermission("action_orders")
+  transitionFulfilment(
+    @CompanyId() companyId: string,
+    @Param("bedId") bedId: string,
+    @Body() body: unknown
+  ) {
+    const { status } = parseWithSchema(transitionPieceFulfilmentSchema, body);
+    return this.beds.transitionBedFulfilment(companyId, bedId, status);
   }
 
   @Post(":bedId/restore")
