@@ -52,7 +52,9 @@ const attachSlicerSchema = z.object({
     .array(
       z.object({
         piece_id: z.string().uuid(),
-        slicer_file_url: z.string().min(1).max(1000),
+        // Nullable: in headers-only storage mode a text g-code is parsed
+        // locally and never uploaded, so there's no URL — only the metadata.
+        slicer_file_url: z.string().min(1).max(1000).nullable(),
         slicer_print_time_minutes: z.number().int().positive().max(10_000_000).optional(),
         slicer_filament_used_grams: z.number().nonnegative().max(10_000_000).optional(),
       })

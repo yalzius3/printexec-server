@@ -215,27 +215,10 @@ export const pieceObjectSchema = z
   });
 
 const pieceSuperRefine = (value: any, ctx: z.RefinementCtx) => {
-    const hasSlicerCoreData =
-      value.slicer_profile !== undefined ||
-      value.slicer_print_time_minutes !== undefined ||
-      value.slicer_filament_used_grams !== undefined ||
-      value.slicer_filament_used_mm !== undefined ||
-      value.slicer_support_grams !== undefined ||
-      value.slicer_layer_height_mm !== undefined ||
-      value.slicer_infill_percent !== undefined ||
-      value.slicer_wall_loops !== undefined ||
-      value.slicer_supports_enabled !== undefined ||
-      value.slicer_support_type !== undefined ||
-      value.slicer_part_weight_grams !== undefined;
-
-    if (hasSlicerCoreData && !value.slicer_file_url) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["slicer_file_url"],
-        message: "slicer_file_url is required when slicer-derived fields are provided."
-      });
-    }
-
+    // The slicer file is an optional attachment — slicer metadata (time, grams,
+    // profile, …) can be entered or parsed without ever storing the file, so we
+    // no longer require slicer_file_url alongside it. The uploaded-at timestamp,
+    // however, only makes sense when a file actually exists.
     if (value.slicer_file_uploaded_at && !value.slicer_file_url) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

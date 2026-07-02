@@ -162,33 +162,42 @@ export class UploadsController {
       throw new PayloadTooLargeException("File exceeds the upload size limit.");
     }
 
-    const contentType = CONTENT_TYPES[extension.toLowerCase()] ?? "application/octet-stream";
-    const { error } = await this.supabase.storage
-      .from(UPLOAD_BUCKET)
-      .upload(objectKey, buffer, { contentType, upsert: false });
-    if (error) {
-      // Surface the real reason (e.g. "Bucket not found", RLS, size) in logs —
-      // the generic 500 below hides it from the operator.
-      console.error(
-        `[uploads] Supabase upload failed bucket="${UPLOAD_BUCKET}" key="${objectKey}" size=${buffer.length}:`,
-        (error as { message?: string; name?: string; statusCode?: string } | null)?.message ?? error
-      );
-      throw new InternalServerErrorException("Failed to save file");
+    // Metadata-only mode (?store=meta): the client parsed the slicer header
+    // LOCALLY and sent only that small sample. We still parse it for the
+    // time/grams, but the heavy file is NOT stored — no object is written and
+    // no URL comes back; the file stays the client's responsibility.
+    const query = req.query as { parse?: string; store?: string } | undefined;
+    const metadataOnly = query?.store === "meta";
+
+    if (!metadataOnly) {
+      const contentType = CONTENT_TYPES[extension.toLowerCase()] ?? "application/octet-stream";
+      const { error } = await this.supabase.storage
+        .from(UPLOAD_BUCKET)
+        .upload(objectKey, buffer, { contentType, upsert: false });
+      if (error) {
+        // Surface the real reason (e.g. "Bucket not found", RLS, size) in logs —
+        // the generic 500 below hides it from the operator.
+        console.error(
+          `[uploads] Supabase upload failed bucket="${UPLOAD_BUCKET}" key="${objectKey}" size=${buffer.length}:`,
+          (error as { message?: string; name?: string; statusCode?: string } | null)?.message ?? error
+        );
+        throw new InternalServerErrorException("Failed to save file");
+      }
     }
 
     // When the client asks (?parse=slicer), best-effort parse the slicer file
     // from the in-memory buffer. Failure is silent — the operator can always
     // type the values.
-    const parse = (req.query as { parse?: string } | undefined)?.parse;
     let parsed: SlicerParseResult = {};
-    if (parse === "slicer") {
+    if (query?.parse === "slicer") {
       parsed = await this.parseSlicerFile(buffer, extension);
     }
 
-    // Returned URL is served by the guarded GET route below under the API prefix
-    // so it travels through the same proxy/CORS path as the rest of the app.
+    // The URL (when stored) is served by the guarded GET route below under the
+    // API prefix so it travels through the same proxy/CORS path as the rest of
+    // the app. Metadata-only uploads return no URL.
     return {
-      url: `/api/uploads/${companyId}/${filename}`,
+      ...(metadataOnly ? {} : { url: `/api/uploads/${companyId}/${filename}` }),
       originalName: data.filename,
       size: buffer.length,
       ...(parsed.slicer_print_time_minutes != null ? { slicer_print_time_minutes: parsed.slicer_print_time_minutes } : {}),

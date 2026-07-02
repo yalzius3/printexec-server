@@ -9,6 +9,7 @@
     "start:prod": "node dist/src/main.js",
     "lint": "tsc --noEmit -p tsconfig.json",
     "db:inspect": "node --env-file=.env scripts/inspect-schema.mjs",
+    "db:show-slicer-constraints": "node --env-file=.env scripts/show-slicer-constraints.mjs",
     "db:run-file": "node --env-file=.env scripts/run-sql-file.mjs",
     "db:seed-refs": "node --env-file=.env scripts/seed-reference-catalog.mjs"
   },

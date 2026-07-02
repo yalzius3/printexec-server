@@ -658,27 +658,27 @@ export class BedsService {
     input: UpdateBedFilesInput
   ): Promise<BedRow> {
     const bed = await this.loadBed(companyId, bedId);
+
+    // The slicer metadata (print time + grams) is the schedule basis and can't
+    // be cleared out from under a committed schedule. The slicer FILE, by
+    // contrast, is an optional attachment and may be changed/removed anytime.
     if (
-      input.slicer_file_url === null &&
-      (bed.status === "scheduled" || bed.status === "printing")
+      (bed.status === "scheduled" || bed.status === "printing") &&
+      (input.slicer_print_time_minutes === null || input.slicer_filament_used_grams === null)
     ) {
       throw new ConflictException(
-        `Cannot remove the slicer file while the bed is '${bed.status}'. Unschedule first.`
+        `Cannot clear the slicer time/filament while the bed is '${bed.status}'. Unschedule first.`
       );
     }
 
     const sets: string[] = [];
     const values: unknown[] = [companyId, bedId];
-    let slicerChanged = false;
-    let slicerNewValue: string | null = bed.slicer_file_url;
 
     if (input.slicer_file_url !== undefined) {
       values.push(input.slicer_file_url);
       const idx = values.length;
       sets.push(`slicer_file_url = $${idx}`);
       sets.push(`slicer_file_uploaded_at = CASE WHEN $${idx}::text IS NULL THEN NULL ELSE now() END`);
-      slicerChanged = true;
-      slicerNewValue = input.slicer_file_url;
     }
     if (input.stl_file_url !== undefined) {
       values.push(input.stl_file_url);
@@ -695,20 +695,26 @@ export class BedsService {
       sets.push(`slicer_filament_used_grams = $${values.length}`);
     }
 
-    // Removing the slicer file fully de-assigns the bed — matches the
-    // piece behaviour so the operator has one consistent rule.
-    if (slicerChanged && (bed.status === "assigned" || bed.status === "ready")) {
-      if (slicerNewValue == null) {
-        sets.push(`assigned_printer_id        = NULL`);
-        sets.push(`assigned_nozzle_asset_id   = NULL`);
-        sets.push(`slicer_print_time_minutes  = NULL`);
-        sets.push(`slicer_filament_used_grams = NULL`);
-        sets.push(`status = 'pending'`);
-      } else if (bed.assigned_printer_id && bed.assigned_nozzle_asset_id) {
-        sets.push(`status = 'ready'`);
-      } else {
-        sets.push(`status = 'assigned'`);
-      }
+    // Recompute readiness from the slicer METADATA whenever it changes. A bed in
+    // a mutable planning state (assigned/ready) flips to 'ready' once it has an
+    // assigned printer + nozzle AND both slicer time + filament grams, and falls
+    // back to 'assigned' otherwise. The slicer/STL files never affect status.
+    const metaChanged =
+      input.slicer_print_time_minutes !== undefined ||
+      input.slicer_filament_used_grams !== undefined;
+    if (metaChanged && (bed.status === "assigned" || bed.status === "ready")) {
+      const newTime =
+        input.slicer_print_time_minutes !== undefined
+          ? input.slicer_print_time_minutes
+          : bed.slicer_print_time_minutes;
+      const newGrams =
+        input.slicer_filament_used_grams !== undefined
+          ? input.slicer_filament_used_grams
+          : bed.slicer_filament_used_grams;
+      const ready =
+        Boolean(bed.assigned_printer_id) && Boolean(bed.assigned_nozzle_asset_id) &&
+        newTime != null && newGrams != null;
+      sets.push(`status = '${ready ? "ready" : "assigned"}'`);
     }
 
     if (sets.length === 0) return this.loadBed(companyId, bedId);
@@ -756,6 +762,16 @@ export class BedsService {
       );
       return { released: released.rowCount ?? 0 };
     });
+  }
+
+  /** Readiness/scheduling is gated on slicer METADATA (print time + filament
+   *  grams) plus an assigned printer + nozzle — never on the slicer file, which
+   *  is an optional attachment the system never feeds to a printer. */
+  private hasSlicerCoreData(bed: {
+    slicer_print_time_minutes: number | null;
+    slicer_filament_used_grams: number | null;
+  }): boolean {
+    return bed.slicer_print_time_minutes != null && bed.slicer_filament_used_grams != null;
   }
 
   // ──────────────────────────────────────────────────────────
@@ -811,7 +827,8 @@ export class BedsService {
               stl_file_url               = COALESCE($8, stl_file_url),
               stl_file_uploaded_at       = CASE WHEN $8 IS NOT NULL THEN now() ELSE stl_file_uploaded_at END,
               status = CASE
-                WHEN COALESCE($6, slicer_file_url) IS NOT NULL THEN 'ready'
+                WHEN $5 IS NOT NULL
+                 AND COALESCE($7, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
                 ELSE 'assigned'
               END
         WHERE company_id = $1 AND bed_id = $2`,
@@ -835,11 +852,11 @@ export class BedsService {
     const bed = await this.loadBed(companyId, bedId);
     if (bed.status !== "ready" && bed.status !== "scheduled") {
       throw new ConflictException(
-        `Cannot schedule a '${bed.status}' bed. Upload a slicer file first.`
+        `Cannot schedule a '${bed.status}' bed. Add slicer time + filament first.`
       );
     }
-    if (!bed.slicer_file_url || !bed.slicer_print_time_minutes) {
-      throw new BadRequestException("Bed needs a slicer file and a slicer time to schedule.");
+    if (bed.slicer_print_time_minutes == null || bed.slicer_filament_used_grams == null) {
+      throw new BadRequestException("Bed needs a slicer time and filament grams to schedule.");
     }
     if (!bed.assigned_printer_id) {
       throw new BadRequestException("Bed has no assigned printer.");
@@ -930,7 +947,7 @@ export class BedsService {
     if (bed.status !== "scheduled") {
       throw new ConflictException(`Only 'scheduled' beds can be unscheduled.`);
     }
-    const target = bed.slicer_file_url ? "ready" : "assigned";
+    const target = this.hasSlicerCoreData(bed) ? "ready" : "assigned";
     await this.databaseService.query(
       `UPDATE print_beds
           SET scheduled_start_at = NULL, scheduled_end_at = NULL, scheduled_at = NULL,
@@ -1129,7 +1146,7 @@ export class BedsService {
       );
     }
     const target =
-      bed.assigned_printer_id && bed.assigned_nozzle_asset_id && bed.slicer_file_url
+      bed.assigned_printer_id && bed.assigned_nozzle_asset_id && this.hasSlicerCoreData(bed)
         ? "ready"
         : bed.assigned_printer_id
         ? "assigned"
@@ -1163,7 +1180,7 @@ export class BedsService {
       );
     }
     const target =
-      bed.assigned_printer_id && bed.assigned_nozzle_asset_id && bed.slicer_file_url
+      bed.assigned_printer_id && bed.assigned_nozzle_asset_id && this.hasSlicerCoreData(bed)
         ? "ready"
         : bed.assigned_printer_id
         ? "assigned"

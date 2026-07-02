@@ -251,16 +251,18 @@ export class SimpleJobsService {
   }
 
   // Bulk g-code drop: attach a slicer file (+ parsed time/grams) to each
-  // already-assigned piece in one shot, flipping them to 'ready'. Pieces that
-  // are in production, or that don't yet have a printer + nozzle, are skipped
-  // and reported. status='ready' is safe here — the piece already carries the
-  // printer + nozzle, and we set the slicer file, satisfying the DB's
-  // chk_ready_requires_core_data constraint.
+  // already-assigned piece in one shot, flipping them to 'ready' when the
+  // metadata is present. Pieces that are in production, or that don't yet have a
+  // printer + nozzle, are skipped and reported. 'ready' requires (printer,
+  // nozzle, slicer time, filament grams) per chk_ready_requires_core_data — so
+  // a drop whose parse yielded no time/grams lands the piece at 'assigned'.
   async attachSlicer(
     companyId: string,
     items: {
       piece_id: string;
-      slicer_file_url: string;
+      // null in headers-only mode: the text g-code was parsed locally and never
+      // uploaded, so there's no stored file — just the metadata below.
+      slicer_file_url: string | null;
       slicer_print_time_minutes?: number | undefined;
       slicer_filament_used_grams?: number | undefined;
     }[]
@@ -302,10 +304,16 @@ export class SimpleJobsService {
         `
           UPDATE order_pieces
           SET slicer_file_url            = $3,
-              slicer_file_uploaded_at    = now(),
+              -- Keep the uploaded-at stamp consistent with the file's presence:
+              -- headers-only attaches (null URL) leave it null.
+              slicer_file_uploaded_at    = CASE WHEN $3::text IS NOT NULL THEN now() ELSE NULL END,
               slicer_print_time_minutes  = COALESCE($4, slicer_print_time_minutes),
               slicer_filament_used_grams = COALESCE($5, slicer_filament_used_grams),
-              status                     = 'ready'
+              status                     = CASE
+                WHEN COALESCE($4, slicer_print_time_minutes) IS NOT NULL
+                 AND COALESCE($5, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
+                ELSE 'assigned'
+              END
           WHERE company_id = $1 AND piece_id = $2
         `,
         [

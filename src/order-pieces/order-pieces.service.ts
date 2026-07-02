@@ -1424,8 +1424,6 @@ export class OrderPiecesService {
     }
 
     if (input.status === "ready") {
-      const nextSlicerFileUrl =
-        input.slicer_file_url !== undefined ? input.slicer_file_url : currentPiece.slicer_file_url;
       const nextPrintTime =
         input.slicer_print_time_minutes !== undefined
           ? input.slicer_print_time_minutes
@@ -1445,9 +1443,12 @@ export class OrderPiecesService {
           ? input.assigned_nozzle_asset_id
           : currentPiece.assigned_nozzle_asset_id;
 
-      if (!nextSlicerFileUrl || !nextPrintTime || !nextFilamentUsed) {
+      // The slicer file is NOT required — readiness is gated on the slicer
+      // metadata (print time + filament grams), which may be entered manually
+      // or parsed from a file/header.
+      if (!nextPrintTime || !nextFilamentUsed) {
         throw new BadRequestException(
-          "A piece needs slicer file, slicer print time, and slicer filament usage before it can be marked ready."
+          "A piece needs slicer print time and slicer filament usage before it can be marked ready."
         );
       }
 
@@ -1541,8 +1542,12 @@ export class OrderPiecesService {
   }
 
   private pieceHasReadyWorkflowData(piece: ReadyWorkflowData) {
+    // Readiness is a function of the slicer METADATA (print time + filament
+    // grams), not the slicer file. The file is an optional attachment — the
+    // system never feeds it to a printer — so it has no bearing on whether a
+    // piece can be scheduled. The numbers can come from a parsed file, a parsed
+    // header, or manual entry; the source is irrelevant here.
     return Boolean(
-      piece.slicer_file_url &&
       piece.slicer_print_time_minutes &&
       piece.slicer_filament_used_grams &&
       piece.assigned_printer_id &&

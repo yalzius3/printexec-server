@@ -96,8 +96,8 @@ export class AuthController {
     // login. If the columns are missing the query throws and we just omit them.
     const profile: Record<string, unknown> = { ...rows[0] };
     try {
-      const pricing = await this.db.query<{ electricity_price_per_kwh: string | null; shop_rate: string | null }>(
-        `SELECT c.electricity_price_per_kwh, c.shop_rate
+      const pricing = await this.db.query<{ electricity_price_per_kwh: string | null; shop_rate: string | null; store_full_slicer_files: boolean | null }>(
+        `SELECT c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
          FROM companies c JOIN users u ON u.company_id = c.company_id
          WHERE u.id = $1`,
         [userId]
@@ -138,7 +138,7 @@ export class AuthController {
     );
 
     const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [userId]
@@ -174,7 +174,41 @@ export class AuthController {
     );
 
     const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
+       FROM users u JOIN companies c ON c.company_id = u.company_id
+       WHERE u.id = $1`,
+      [userId]
+    );
+    return rows[0] ?? null;
+  }
+
+  // Owner-only: choose whether full slicer files are stored on our servers
+  // (true, default) or only their parsed header metadata is kept (false —
+  // "metadata only": the heavy file is never uploaded, staying the client's
+  // responsibility). Mirrors the other owner-only company-setting guards.
+  @Post("slicer-storage-mode")
+  async setSlicerStorageMode(
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z.object({ store_full: z.boolean() }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("store_full must be a boolean.");
+    }
+
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the slicer storage mode.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET store_full_slicer_files = $1 WHERE company_id = $2",
+      [parsed.data.store_full, companyId]
+    );
+
+    const { rows } = await this.db.query(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [userId]
@@ -209,7 +243,7 @@ export class AuthController {
     );
 
     const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [userId]

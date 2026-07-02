@@ -1137,11 +1137,12 @@ export class JobsService {
     ];
     if (hasStl) values.push(input.stl_file_url ?? null);
 
-    // Status decision is purely a function of the slicer file. The DB's
-    // chk_ready_requires_core_data constraint already enforces that
-    // status='ready' requires (printer, nozzle, slicer_file_url) — so we set
-    // 'ready' when COALESCE(new, existing) slicer_file_url is non-null, and
-    // 'assigned' otherwise. STL has no bearing on status.
+    // Status decision is a function of the slicer METADATA, not the file. The
+    // DB's chk_ready_requires_core_data constraint enforces that status='ready'
+    // requires (printer, nozzle, slicer print time, filament grams) — so we set
+    // 'ready' when both the print time ($5) and the COALESCE(new, existing)
+    // filament grams are present, and 'assigned' otherwise. The slicer file and
+    // STL have no bearing on status.
     const updated = await this.databaseService.query<JobRow>(
       `
         UPDATE order_pieces
@@ -1153,7 +1154,8 @@ export class JobsService {
                slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams)
                ${stlSet},
                status = CASE
-                 WHEN COALESCE($6, slicer_file_url) IS NOT NULL THEN 'ready'
+                 WHEN $5 IS NOT NULL
+                  AND COALESCE($7, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
                  ELSE 'assigned'
                END
          WHERE company_id = $1 AND piece_id = $2
@@ -1207,19 +1209,11 @@ export class JobsService {
     const hasStl = await this.hasStlColumn();
 
     // ── Guardrails on the slicer field ─────────────────────────
-    // Removing the slicer file from a piece that's already 'scheduled' or
-    // 'printing' would violate chk_scheduled_requires_core_data and surface a
-    // raw constraint name to the operator. We catch it here and explain.
-    if (
-      input.slicer_file_url === null &&
-      (piece.status === "scheduled" || piece.status === "printing")
-    ) {
-      throw new ConflictException(
-        `Cannot remove the slicer file while the piece is '${piece.status}'. Unschedule first.`
-      );
-    }
-    // 'done' / 'cancelled' / 'failed' are terminal — files can still be
-    // viewed/downloaded, but mutations are weird. Be explicit.
+    // The slicer file is an optional attachment that no longer gates the
+    // lifecycle, so it can be attached or removed in any non-terminal status
+    // — including 'scheduled'/'printing' (the schedule is driven by the slicer
+    // metadata, not the file). 'done' / 'failed' are terminal: the files stay
+    // viewable/downloadable, but we don't allow swapping them.
     if (
       input.slicer_file_url !== undefined &&
       (piece.status === "done" || piece.status === "failed")
@@ -1231,16 +1225,12 @@ export class JobsService {
 
     const sets: string[] = [];
     const values: unknown[] = [companyId, pieceId];
-    let slicerChanged = false;
-    let slicerNewValue: string | null = piece.slicer_file_url; // resolved post-update
 
     if (input.slicer_file_url !== undefined) {
       values.push(input.slicer_file_url);
       const idx = values.length;
       sets.push(`slicer_file_url = $${idx}`);
       sets.push(`slicer_file_uploaded_at = CASE WHEN $${idx}::text IS NULL THEN NULL ELSE now() END`);
-      slicerChanged = true;
-      slicerNewValue = input.slicer_file_url;
     }
     if (input.stl_file_url !== undefined) {
       let stlAvailable = hasStl;
@@ -1261,27 +1251,9 @@ export class JobsService {
       sets.push(`stl_file_uploaded_at = CASE WHEN $${idx}::text IS NULL THEN NULL ELSE now() END`);
     }
 
-    // ── Auto-status transition based on slicer presence ────────
-    // The slicer file gates the lifecycle: removing it FULLY de-assigns the
-    // piece (printer + nozzle + slicer-time wiped, status → 'pending'). This
-    // matches operator intuition — without a slicer file the assignment
-    // doesn't mean anything. Uploading a slicer file on an already-assigned
-    // piece promotes it to 'ready'. STL changes never touch any of this.
-    if (slicerChanged && (piece.status === "assigned" || piece.status === "ready")) {
-      if (slicerNewValue == null) {
-        // Slicer removed → full reset.
-        sets.push(`assigned_printer_id        = NULL`);
-        sets.push(`assigned_nozzle_asset_id   = NULL`);
-        sets.push(`slicer_print_time_minutes  = NULL`);
-        sets.push(`slicer_filament_used_grams = NULL`);
-        sets.push(`status = 'pending'`);
-      } else if (piece.assigned_printer_id && piece.assigned_nozzle_asset_id) {
-        sets.push(`status = 'ready'`);
-      } else {
-        sets.push(`status = 'assigned'`);
-      }
-    }
-
+    // The slicer + STL files are pure attachments — neither gates the piece
+    // lifecycle, so attaching or removing one never changes status. Readiness
+    // is driven by the slicer metadata (set via the assign endpoint).
     if (sets.length === 0) return this.loadJob(companyId, pieceId);
 
     await this.databaseService.query(
@@ -1289,11 +1261,6 @@ export class JobsService {
         WHERE company_id = $1 AND piece_id = $2`,
       values
     );
-    // The slicer-driven auto-status branch can move the piece between
-    // pending/assigned/ready — keep the parent order in step.
-    if (sets.some((s) => s.trimStart().startsWith("status ="))) {
-      await this.syncOrderStatus(companyId, piece.order_id);
-    }
     return this.loadJob(companyId, pieceId);
   }
 
@@ -1394,14 +1361,14 @@ export class JobsService {
         "Piece has no assigned nozzle — assign one before scheduling."
       );
     }
-    if (!piece.slicer_file_url) {
-      throw new BadRequestException(
-        "Piece has no slicer file — upload one first. (The slicer file gates scheduling, the STL doesn't.)"
-      );
-    }
     if (piece.slicer_print_time_minutes == null) {
       throw new BadRequestException(
         "Piece has no slicer print time — re-run the assignment flow."
+      );
+    }
+    if (piece.slicer_filament_used_grams == null) {
+      throw new BadRequestException(
+        "Piece has no slicer filament usage — re-run the assignment flow. (Scheduling is gated on the slicer metadata, not the file.)"
       );
     }
     // Filament is optional while editing/assigning, but MANDATORY to schedule:
@@ -1554,6 +1521,16 @@ export class JobsService {
     return this.loadJob(companyId, pieceId);
   }
 
+  /** Readiness/scheduling is gated on slicer METADATA (print time + filament
+   *  grams) plus an assigned printer + nozzle — never on the slicer file, which
+   *  is an optional attachment the system never feeds to a printer. */
+  private hasSlicerCoreData(piece: {
+    slicer_print_time_minutes: number | null;
+    slicer_filament_used_grams: number | null;
+  }): boolean {
+    return piece.slicer_print_time_minutes != null && piece.slicer_filament_used_grams != null;
+  }
+
   async unschedule(companyId: string, pieceId: string): Promise<JobRow> {
     const piece = await this.loadJob(companyId, pieceId);
     if (piece.status !== "scheduled") {
@@ -1561,11 +1538,11 @@ export class JobsService {
         `Only 'scheduled' pieces can be unscheduled (current: '${piece.status}').`
       );
     }
-    // After unschedule the piece keeps printer+nozzle+slicer (it was 'scheduled'
-    // so all three must have been present per chk_scheduled_requires_core_data),
-    // so we drop back to 'ready'. If the slicer file is somehow missing, fall
-    // back to 'assigned'.
-    const target = piece.slicer_file_url ? "ready" : "assigned";
+    // After unschedule the piece keeps printer+nozzle+slicer metadata (it was
+    // 'scheduled', so all of those were present per
+    // chk_scheduled_requires_core_data), so we drop back to 'ready'. If the
+    // metadata is somehow missing, fall back to 'assigned'.
+    const target = this.hasSlicerCoreData(piece) ? "ready" : "assigned";
     await this.databaseService.query(
       `
         UPDATE order_pieces
@@ -1691,7 +1668,7 @@ export class JobsService {
       );
     }
     const target =
-      piece.assigned_printer_id && piece.assigned_nozzle_asset_id && piece.slicer_file_url
+      piece.assigned_printer_id && piece.assigned_nozzle_asset_id && this.hasSlicerCoreData(piece)
         ? "ready"
         : piece.assigned_printer_id
           ? "assigned"
@@ -1747,10 +1724,10 @@ export class JobsService {
         );
       }
       // If the piece carries all `ready` prereqs (printer + nozzle + slicer
-      // file), promote it straight to 'ready' so the operator can schedule
-      // immediately without having to re-trigger the slicer step.
+      // metadata), promote it straight to 'ready' so the operator can schedule
+      // immediately without having to re-confirm the slicer step.
       const targetStatus =
-        piece.assigned_nozzle_asset_id && piece.slicer_file_url
+        piece.assigned_nozzle_asset_id && this.hasSlicerCoreData(piece)
           ? "ready"
           : "assigned";
       await this.databaseService.query(
