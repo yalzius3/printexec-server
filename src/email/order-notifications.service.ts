@@ -8,10 +8,13 @@ import {
 } from "./email-templates";
 
 // ════════════════════════════════════════════════════════════════
-// ORDER-COMPLETION CUSTOMER NOTIFICATIONS
+// ORDER SHIPPING/FULFILMENT CUSTOMER NOTIFICATIONS
 //
-// Sends the customer one email the first time their order reaches a "done or
-// above" status (completed / ready_for_shipping / out_for_shipping / fulfilled).
+// Sends the customer one email PER shipping stage — when their order first
+// enters ready_for_shipping, again at out_for_shipping, and again at fulfilled.
+// ('completed' — production done, not yet packed — never notifies.) A single
+// 'order_completion' type used to collapse this to one email per order total,
+// so only the first stage the sweep observed ever fired.
 //
 // WHY A SWEEP (not an inline hook in updateOrder): an order reaches these
 // statuses mainly through the piece-derived rollup recomputeOrderStatusTx —
@@ -21,27 +24,30 @@ import {
 // periodic sweep over the orders table catches every order regardless of how it
 // got there, and is naturally idempotent + restart-safe.
 //
-// Idempotency + audit live in order_emails (see migrations/..._order_emails.sql):
-// an order is eligible only while it has no settled ('sent'/'dry_run'/'skipped')
-// completion row. Transport failures are logged but NOT recorded, so the order
-// stays eligible and retries next sweep (mirrors FilePurgeService).
+// Idempotency + audit live in order_emails (see migrations/..._order_emails.sql
+// + ..._order_email_per_stage.sql): an order is eligible for its CURRENT stage
+// only while it has no settled ('sent'/'dry_run'/'skipped') row for that stage's
+// email_type ('order_<status>'). Transport failures are logged but NOT recorded,
+// so the order stays eligible and retries next sweep (mirrors FilePurgeService).
 //
 // Tunables (env):
 //   EMAIL_ENABLED            "true" to attempt real delivery; else dry-run
 //   EMAIL_SWEEP_INTERVAL_MS  sweep cadence (default 2 min)
 // ════════════════════════════════════════════════════════════════
 
-// Trigger range: an order emails the customer the first time it reaches
-// "ready for shipping or above". 'completed' (production done, not yet packed)
-// deliberately does NOT notify — the customer hears from us once the order is
-// actually ready to ship and onward through fulfilment.
+// Trigger range: the customer is emailed on entry to EACH of these stages (one
+// email per stage). 'completed' (production done, not yet packed) deliberately
+// does NOT notify — the customer hears from us once the order is actually ready
+// to ship and again at each step onward through fulfilment.
 const NOTIFY_STATUSES = [
   "ready_for_shipping",
   "out_for_shipping",
   "fulfilled"
 ] as const;
 
-const EMAIL_TYPE = "order_completion";
+// Per-stage idempotency key. email_type encodes the stage, so the unique index
+// (company_id, order_id, email_type) admits one settled row per (order, stage).
+const emailTypeFor = (status: OrderCompletionStatus): string => `order_${status}`;
 
 type EligibleRow = {
   order_id: string;
@@ -129,7 +135,7 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       if (sent + skipped + failed > 0) {
         const verb = this.email.isLiveDelivery ? "sent" : "dry-run composed";
         this.logger.log(
-          `order-emails: ${verb} ${sent} completion email(s), ` +
+          `order-emails: ${verb} ${sent} shipping-stage email(s), ` +
             `skipped ${skipped} (no recipient), ${failed} failed`
         );
       }
@@ -179,12 +185,14 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
             SELECT 1 FROM order_emails e
              WHERE e.company_id = o.company_id
                AND e.order_id = o.order_id
-               AND e.email_type = $2
+               -- per stage: only a settled row for THIS order's current stage
+               -- suppresses it; an earlier stage's row never blocks a new stage.
+               AND e.email_type = 'order_' || o.status
                AND e.status IN ('sent', 'dry_run', 'skipped')
           )
         ORDER BY o.last_updated_at ASC
         LIMIT 100`,
-      [[...NOTIFY_STATUSES], EMAIL_TYPE]
+      [[...NOTIFY_STATUSES]]
     );
     return res.rows;
   }
@@ -322,7 +330,7 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
           row.company_id,
           row.order_id,
           row.customer_id,
-          EMAIL_TYPE,
+          emailTypeFor(row.status),
           detail.recipientEmail ?? null,
           detail.subject ?? null,
           detail.body ?? null,
@@ -354,7 +362,7 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
           row.company_id,
           row.order_id,
           row.order_number,
-          `${verb} order-completion email to ${recipient} (order ${row.status}).`
+          `${verb} shipping-update email to ${recipient} (order ${row.status}).`
         ]
       );
     } catch {

@@ -88,6 +88,8 @@ const INK = "#000000";
 const PAPER = "#ffffff";
 const SUBTLE = "#57534e";
 const RAIN_AXES = ["X", "Y", "Z"];
+// Public site — the footer wordmark links here.
+const SITE_URL = "https://printexec.xyz";
 
 /**
  * Format a date as "June 30, 2026". Accepts a 'YYYY-MM-DD'/ISO string OR a Date
@@ -280,7 +282,7 @@ function buildText(data: OrderCompletionEmailData): string {
     `Thank you for choosing ${company.name}!`,
     ``,
     `— The ${company.name} team`,
-    `Fulfilled by PrintExec`
+    `Fulfilled by PrintExec · ${SITE_URL}`
   ].join("\n");
 }
 
@@ -374,18 +376,23 @@ function buildHtml(data: OrderCompletionEmailData): string {
       `<p style="margin:14px 0 0;color:${INK};">Thank you for choosing ${esc(company.name)}!</p>` +
       `</td></tr>`,
 
-    // ── Footer: PrintExec wordmark + "Fulfilled by PrintExec" ──
-    `<tr><td style="background:${INK};padding:18px 24px 14px;">` +
-      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>` +
-      `<td style="font-family:${MONO};font-weight:700;font-size:16px;letter-spacing:0.08em;color:${PAPER};">PRINTEXEC</td>` +
-      `<td align="right" style="font-family:${MONO};font-size:11px;letter-spacing:0.06em;color:#9a958a;">` +
-        `${isFulfilled ? "✓ " : ""}Fulfilled by PrintExec</td>` +
-      `</tr></table>` +
+    // ── Footer: one thin black strip — the doc's coordinate-rain as the
+    // background with the clickable PrintExec wordmark laid over it. The rain
+    // sits absolutely behind; the wordmark table is position:relative so it
+    // stacks on top (Apple Mail + web). Clients that drop inline SVG / CSS
+    // positioning just show the wordmark on a solid black bar — graceful either way.
+    `<tr><td style="background:${INK};padding:0;">` +
+      `<div style="position:relative;height:48px;overflow:hidden;">` +
+        `<div style="position:absolute;top:0;left:0;right:0;bottom:0;font-size:0;line-height:0;">` +
+          `${bottomRainSvg(seedFrom(order.orderNumber), 600, 48)}</div>` +
+        `<table role="presentation" width="100%" height="48" cellpadding="0" cellspacing="0" border="0" style="position:relative;height:48px;"><tr>` +
+        `<td valign="middle" style="padding:0 24px;font-family:${MONO};font-weight:700;font-size:16px;letter-spacing:0.08em;">` +
+          `<a href="${SITE_URL}" target="_blank" rel="noopener" style="color:${PAPER};text-decoration:none;">PRINTEXEC</a></td>` +
+        `<td valign="middle" align="right" style="padding:0 24px;font-family:${MONO};font-size:11px;letter-spacing:0.06em;color:#9a958a;">` +
+          `${isFulfilled ? "✓ " : ""}Fulfilled by PrintExec</td>` +
+        `</tr></table>` +
+      `</div>` +
       `</td></tr>`,
-
-    // ── Bottom rain strip: baked static render of the ref doc's rain SVG ──
-    `<tr><td style="background:${INK};font-size:0;line-height:0;">` +
-      `${bottomRainSvg(seedFrom(order.orderNumber), 600, 62)}</td></tr>`,
 
     `</table>`,
     `</td></tr>`,
