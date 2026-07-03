@@ -1154,7 +1154,7 @@ export class JobsService {
                slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams)
                ${stlSet},
                status = CASE
-                 WHEN $5 IS NOT NULL
+                 WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
                   AND COALESCE($7, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
                  ELSE 'assigned'
                END

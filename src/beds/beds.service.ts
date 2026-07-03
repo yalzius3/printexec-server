@@ -827,7 +827,7 @@ export class BedsService {
               stl_file_url               = COALESCE($8, stl_file_url),
               stl_file_uploaded_at       = CASE WHEN $8 IS NOT NULL THEN now() ELSE stl_file_uploaded_at END,
               status = CASE
-                WHEN $5 IS NOT NULL
+                WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
                  AND COALESCE($7, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
                 ELSE 'assigned'
               END
