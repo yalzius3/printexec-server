@@ -4,6 +4,7 @@ import { recordOrderHistory } from "../common/order-history";
 import { reevaluateBedAfterPieceRemoval } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
+import { CustomersService } from "../customers/customers.service";
 import {
   createOrderSchema,
   listOrderPiecesQuerySchema,
@@ -31,6 +32,9 @@ type OrderRow = {
   order_id: string;
   company_id: string;
   customer_id: string | null;
+  guest_name: string | null;
+  guest_email: string | null;
+  guest_phone: string | null;
   order_number: string;
   title: string;
   description: string | null;
@@ -55,7 +59,10 @@ type OrderRow = {
 
 @Injectable()
 export class OrdersService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly customersService: CustomersService
+  ) {}
 
   async listOrders(companyId: string, query: ListOrdersQuery) {
     const values: unknown[] = [companyId];
@@ -271,6 +278,9 @@ export class OrdersService {
           INSERT INTO orders (
             company_id,
             customer_id,
+            guest_name,
+            guest_email,
+            guest_phone,
             order_number,
             title,
             description,
@@ -280,12 +290,15 @@ export class OrdersService {
             status,
             notes
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
           RETURNING order_id
         `,
         [
           companyId,
           input.customer_id ?? null,
+          input.guest_name ?? null,
+          input.guest_email ?? null,
+          input.guest_phone ?? null,
           orderNumber,
           input.title,
           input.description ?? null,
@@ -348,6 +361,34 @@ export class OrdersService {
     input: UpdateOrderInput
   ) {
     const currentOrder = await this.getOrderById(companyId, orderId);
+
+    // Guest-info auto-resolution: only on the transition INTO "confirmed" for
+    // an order that has no customer_id yet (current or incoming) but does
+    // carry guest info. Runs before the assignsCustomer/isFirstCustomerAssignment
+    // logic below by mutating input.customer_id, so the resolved customer
+    // flows through that existing stats/interaction-log side effect exactly
+    // like a manually-picked customer_id would.
+    let customerAutoCreated = false;
+    const movingToConfirmed = input.status === "confirmed" && currentOrder.status !== "confirmed";
+    const noCustomerYet = !input.customer_id && !currentOrder.customer_id;
+    if (movingToConfirmed && noCustomerYet) {
+      const guestName = input.guest_name ?? currentOrder.guest_name;
+      const guestEmail = input.guest_email ?? currentOrder.guest_email;
+      const guestPhone = input.guest_phone ?? currentOrder.guest_phone;
+      if (guestName && (guestEmail || guestPhone)) {
+        const resolved = await this.customersService.resolveOrCreateFromGuest(companyId, {
+          name: guestName,
+          email: guestEmail ?? null,
+          phone: guestPhone ?? null
+        });
+        input.customer_id = resolved.customer.customer_id;
+        customerAutoCreated = resolved.created;
+      }
+      // If guest info is genuinely absent here (only possible for legacy
+      // pre-feature drafts), fall through unchanged — the existing
+      // assertOrderStatusChangeAllowed / DB CHECK constraint rejects the
+      // confirm attempt with a clear error, same as today.
+    }
 
     if (input.order_number) {
       await this.assertUniqueOrderNumber(companyId, input.order_number, orderId);
@@ -506,7 +547,8 @@ export class OrdersService {
       }
     });
 
-    return this.getOrderById(companyId, orderId);
+    const updatedOrder = await this.getOrderById(companyId, orderId);
+    return { ...updatedOrder, customer_auto_created: customerAutoCreated };
   }
 
   async listOrderPieces(
@@ -648,6 +690,9 @@ export class OrdersService {
         o.order_id,
         o.company_id,
         o.customer_id,
+        o.guest_name,
+        o.guest_email,
+        o.guest_phone,
         o.order_number,
         o.title,
         o.description,

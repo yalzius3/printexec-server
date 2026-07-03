@@ -11,7 +11,7 @@ const customerBaseSchema = z
     last_name: z.string().trim().min(1).optional(),
     business_name: z.string().trim().min(1).optional(),
     tax_id: z.string().trim().min(1).optional(),
-    email: z.string().trim().email(),
+    email: z.string().trim().email().optional(),
     phone: z.string().trim().min(1).optional(),
     secondary_phone: z.string().trim().min(1).optional(),
     address_line1: z.string().trim().min(1).optional(),
@@ -42,6 +42,14 @@ const customerBaseSchema = z
         message: "first_name is required for b2c customers."
       });
     }
+
+    if (!value.email && !value.phone) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["email"],
+        message: "Provide an email or a phone number."
+      });
+    }
   });
 
 export const listCustomersQuerySchema = z.object({
@@ -64,7 +72,7 @@ export const updateCustomerSchema = z
     last_name: z.string().trim().min(1).nullable().optional(),
     business_name: z.string().trim().min(1).nullable().optional(),
     tax_id: z.string().trim().min(1).nullable().optional(),
-    email: z.string().trim().email().optional(),
+    email: z.string().trim().email().nullable().optional(),
     phone: z.string().trim().min(1).nullable().optional(),
     secondary_phone: z.string().trim().min(1).nullable().optional(),
     address_line1: z.string().trim().min(1).nullable().optional(),

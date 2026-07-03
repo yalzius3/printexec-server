@@ -99,6 +99,12 @@ export const createOrderSchema = z
     // Optional: an order may be created with no customer attached and have one
     // assigned later (at confirmation).
     customer_id: uuidSchema.optional(),
+    // Guest capture, used only when customer_id is absent. A CHECK constraint
+    // on the orders table (chk_orders_customer_or_guest, added NOT VALID in
+    // 2026-07-03_orders_guest_info.sql) backstops this at the DB layer.
+    guest_name: z.string().trim().min(1).max(200).optional(),
+    guest_email: z.string().trim().email().optional(),
+    guest_phone: z.string().trim().min(1).max(40).optional(),
     order_number: z
       .string()
       .trim()
@@ -123,6 +129,24 @@ export const createOrderSchema = z
         message: "established_at cannot be later than deadline."
       });
     }
+
+    // Require guest info whenever no existing customer was picked.
+    if (!value.customer_id) {
+      if (!value.guest_name) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["guest_name"],
+          message: "Provide a customer name, or pick an existing customer."
+        });
+      }
+      if (!value.guest_email && !value.guest_phone) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["guest_email"],
+          message: "Provide a phone number or email for the customer."
+        });
+      }
+    }
   });
 
 export const updateOrderSchema = z
@@ -130,6 +154,14 @@ export const updateOrderSchema = z
     // Assigning a customer to an order that was created without one (and, after
     // the first assignment, changing it). Optional so other PATCHes are unaffected.
     customer_id: uuidSchema.optional(),
+    // Editable on drafts (e.g. fixing a typo before confirm). Nullable so they
+    // can be cleared once a customer_id is assigned another way. No
+    // guest-required refine here — this schema backs every PATCH (including
+    // ones unrelated to customer/status) and can't see the current row; that
+    // check lives in OrdersService.updateOrder instead.
+    guest_name: z.string().trim().min(1).max(200).nullable().optional(),
+    guest_email: z.string().trim().email().nullable().optional(),
+    guest_phone: z.string().trim().min(1).max(40).nullable().optional(),
     order_number: z
       .string()
       .trim()

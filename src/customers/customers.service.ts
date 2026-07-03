@@ -24,7 +24,7 @@ type CustomerRow = {
   last_name: string | null;
   business_name: string | null;
   tax_id: string | null;
-  email: string;
+  email: string | null;
   phone: string | null;
   secondary_phone: string | null;
   address_line1: string | null;
@@ -204,7 +204,9 @@ export class CustomersService {
     const merged = {
       customer_type: input.customer_type ?? current.customer_type,
       first_name: input.first_name ?? current.first_name,
-      business_name: input.business_name ?? current.business_name
+      business_name: input.business_name ?? current.business_name,
+      email: input.email !== undefined ? input.email : current.email,
+      phone: input.phone !== undefined ? input.phone : current.phone
     };
 
     await this.assertCustomerTypeFields(merged);
@@ -374,6 +376,8 @@ export class CustomersService {
     customer_type: "b2b" | "b2c";
     first_name?: string | null | undefined;
     business_name?: string | null | undefined;
+    email?: string | null | undefined;
+    phone?: string | null | undefined;
   }) {
     if (input.customer_type === "b2b" && !input.business_name) {
       throw new BadRequestException("business_name is required for b2b customers.");
@@ -382,6 +386,60 @@ export class CustomersService {
     if (input.customer_type === "b2c" && !input.first_name) {
       throw new BadRequestException("first_name is required for b2c customers.");
     }
+
+    if (!input.email && !input.phone) {
+      throw new BadRequestException("Customer must have an email or a phone number.");
+    }
+  }
+
+  // Guest resolution (used by OrdersService.updateOrder on confirm). Looks up
+  // an existing customer by email first, then phone — per product decision,
+  // email takes priority when a guest supplied both. Excludes soft-deleted
+  // customers; a deleted customer shouldn't silently receive a new order.
+  async findExistingByContact(
+    companyId: string,
+    email: string | null,
+    phone: string | null
+  ): Promise<CustomerRow | null> {
+    if (email) {
+      const byEmail = await this.databaseService.query<CustomerRow>(
+        `${this.customerSelectSql()} WHERE company_id = $1 AND email = $2 AND deleted_at IS NULL LIMIT 1`,
+        [companyId, email]
+      );
+      if (byEmail.rows[0]) return byEmail.rows[0];
+    }
+    if (phone) {
+      const byPhone = await this.databaseService.query<CustomerRow>(
+        `${this.customerSelectSql()} WHERE company_id = $1 AND phone = $2 AND deleted_at IS NULL LIMIT 1`,
+        [companyId, phone]
+      );
+      if (byPhone.rows[0]) return byPhone.rows[0];
+    }
+    return null;
+  }
+
+  // Resolves guest info into a real customer: matches an existing one by
+  // email/phone, or creates a minimal b2c customer from the guest name.
+  // Reuses createCustomer as-is, so the new customer gets its own "ADDITION"
+  // interaction log entry and the existing unique-email race-condition
+  // backstop for free.
+  async resolveOrCreateFromGuest(
+    companyId: string,
+    guest: { name: string; email: string | null; phone: string | null }
+  ): Promise<{ customer: CustomerRow; created: boolean }> {
+    const existing = await this.findExistingByContact(companyId, guest.email, guest.phone);
+    if (existing) {
+      return { customer: existing, created: false };
+    }
+
+    const created = await this.createCustomer(companyId, {
+      customer_type: "b2c",
+      first_name: guest.name,
+      email: guest.email ?? undefined,
+      phone: guest.phone ?? undefined,
+      is_active: true
+    });
+    return { customer: created, created: true };
   }
 
   private customerSelectSql() {
