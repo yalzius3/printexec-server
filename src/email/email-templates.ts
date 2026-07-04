@@ -301,7 +301,7 @@ function buildHtml(data: OrderCompletionEmailData): string {
     // black bgcolor + alt keep it graceful if images are blocked.
     `<tr><td bgcolor="${INK}" style="background:${INK};font-size:0;line-height:0;padding:0;">` +
       `<a href="${SITE_URL}" target="_blank" rel="noopener" style="display:block;text-decoration:none;">` +
-        `<img src="${FOOTER_IMG_URL}" alt="PrintExec — printexec.xyz" width="600" height="110" ` +
+        `<img src="${FOOTER_IMG_URL}" alt="PrintExec — printexec.xyz" width="600" height="77" ` +
           `style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none;" />` +
       `</a>` +
       `</td></tr>`,
