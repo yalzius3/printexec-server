@@ -85,6 +85,9 @@ interface JobRow {
   piece_id: string;
   order_id: string;
   order_reference: string;
+  // Human-set order title (orders.title), shown next to the number in the Jobs
+  // queue's per-order header. Empty/null for untitled orders.
+  order_title: string | null;
   order_deadline: string;
   piece_name: string;
   description: string | null;
@@ -518,6 +521,7 @@ export class JobsService {
         op.piece_id,
         op.order_id,
         o.order_number AS order_reference,
+        o.title AS order_title,
         o.deadline::text AS order_deadline,
         op.piece_name,
         op.description,
@@ -1291,9 +1295,36 @@ export class JobsService {
       sets.push(`stl_file_uploaded_at = CASE WHEN $${idx}::text IS NULL THEN NULL ELSE now() END`);
     }
 
-    // The slicer + STL files are pure attachments — neither gates the piece
-    // lifecycle, so attaching or removing one never changes status. Readiness
-    // is driven by the slicer metadata (set via the assign endpoint).
+    // Slicer metadata (parsed client-side on an inline attach) can ride along.
+    // Unlike the file, the metadata DOES gate readiness: once a piece has both a
+    // print time and filament grams it can be scheduled, so we mirror the assign
+    // endpoint and flip an assignable piece 'assigned' ⇄ 'ready' to match. Pieces
+    // outside that band (pending — no printer; scheduled/terminal) are left as-is,
+    // and the STL/slicer file fields on their own still never change status.
+    let timeExpr = "slicer_print_time_minutes";
+    let gramsExpr = "slicer_filament_used_grams";
+    if (input.slicer_print_time_minutes !== undefined) {
+      values.push(input.slicer_print_time_minutes);
+      timeExpr = `$${values.length}`;
+      sets.push(`slicer_print_time_minutes = ${timeExpr}`);
+    }
+    if (input.slicer_filament_used_grams !== undefined) {
+      values.push(input.slicer_filament_used_grams);
+      gramsExpr = `$${values.length}`;
+      sets.push(`slicer_filament_used_grams = ${gramsExpr}`);
+    }
+    const touchedSlicerMeta =
+      input.slicer_print_time_minutes !== undefined ||
+      input.slicer_filament_used_grams !== undefined;
+    if (touchedSlicerMeta && (piece.status === "assigned" || piece.status === "ready")) {
+      sets.push(
+        `status = CASE
+           WHEN COALESCE(${timeExpr}, slicer_print_time_minutes) IS NOT NULL
+            AND COALESCE(${gramsExpr}, slicer_filament_used_grams) IS NOT NULL
+           THEN 'ready' ELSE 'assigned' END`
+      );
+    }
+
     if (sets.length === 0) return this.loadJob(companyId, pieceId);
 
     await this.databaseService.query(

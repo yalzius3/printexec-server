@@ -98,9 +98,18 @@ export type AssignJobInput = z.infer<typeof assignJobSchema>;
 export const updatePieceFilesSchema = z.object({
   slicer_file_url: fileUrl.nullable().optional(),
   stl_file_url: fileUrl.nullable().optional(),
+  // Slicer metadata parsed client-side when a slicer file is attached inline.
+  // When present it drives the readiness recompute (assigned ⇄ ready) the same
+  // way the assign flow does — the metadata, not the file, gates the lifecycle.
+  slicer_print_time_minutes: z.number().int().positive().max(100_000).optional(),
+  slicer_filament_used_grams: z.number().positive().max(100_000).optional(),
 }).strict().refine(
-  (v) => v.slicer_file_url !== undefined || v.stl_file_url !== undefined,
-  { message: "Provide at least one of slicer_file_url or stl_file_url." }
+  (v) =>
+    v.slicer_file_url !== undefined ||
+    v.stl_file_url !== undefined ||
+    v.slicer_print_time_minutes !== undefined ||
+    v.slicer_filament_used_grams !== undefined,
+  { message: "Provide at least one of slicer_file_url, stl_file_url, or slicer metadata." }
 );
 export type UpdatePieceFilesInput = z.infer<typeof updatePieceFilesSchema>;
 
