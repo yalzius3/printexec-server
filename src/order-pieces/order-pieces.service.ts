@@ -711,6 +711,32 @@ export class OrderPiecesService {
     return this.getPieceById(companyId, pieceId);
   }
 
+  // Persist a client-rendered STL thumbnail URL for a piece (see
+  // stlThumbnail.ts on the client). Company-scoped; 404s an unknown piece.
+  async setPieceThumbnail(companyId: string, pieceId: string, url: string) {
+    try {
+      const res = await this.databaseService.query<{ piece_id: string }>(
+        `UPDATE order_pieces
+            SET stl_thumbnail_url = $3
+          WHERE company_id = $1 AND piece_id = $2
+        RETURNING piece_id`,
+        [companyId, pieceId, url]
+      );
+      if (res.rowCount === 0) {
+        throw new NotFoundException("Piece not found.");
+      }
+      return { ok: true };
+    } catch (err) {
+      // 42703 = undefined_column: the migration hasn't been applied yet. The
+      // thumbnail is a non-critical cache, so degrade to a no-op rather than
+      // 500 — the next viewer regenerates and retries once it's applied.
+      if ((err as { code?: string } | null)?.code === "42703") {
+        return { ok: false, pending_migration: true };
+      }
+      throw err;
+    }
+  }
+
   async replaceSpoolAllocations(
     companyId: string,
     pieceId: string,

@@ -110,6 +110,10 @@ interface JobRow {
   // STL (or 3MF mesh) — source 3D model. Tracked independently from the
   // slicer file. Nullable until the operator uploads one.
   stl_file_url: string | null;
+  // Small PNG preview rendered from the STL (generated client-side, cached in
+  // order_pieces.stl_thumbnail_url). Projected on the queue + single-row reads;
+  // NULL until the migration is applied or a thumbnail has been generated.
+  stl_thumbnail_url?: string | null;
   scheduled_at: string | null;
   scheduled_start_at: string | null;
   scheduled_end_at: string | null;
@@ -236,6 +240,29 @@ export class JobsService {
   private invalidateStlCache() {
     this.stlColumnAvailable = null;
     this.stlCheckedAt = 0;
+  }
+
+  // Same TTL-cache pattern for the optional stl_thumbnail_url column
+  // (migration 2026-07-04_piece_stl_thumbnail.sql). Until it's applied we
+  // project NULL under the alias so the queue keeps working.
+  private stlThumbColumnAvailable: boolean | null = null;
+  private stlThumbCheckedAt = 0;
+  private async hasStlThumbnailColumn(): Promise<boolean> {
+    if (
+      this.stlThumbColumnAvailable !== null &&
+      Date.now() - this.stlThumbCheckedAt < JobsService.STL_CACHE_TTL_MS
+    ) {
+      return this.stlThumbColumnAvailable;
+    }
+    const probe = await this.databaseService.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'order_pieces' AND column_name = 'stl_thumbnail_url'
+       ) AS exists`
+    );
+    this.stlThumbColumnAvailable = !!probe.rows[0]?.exists;
+    this.stlThumbCheckedAt = Date.now();
+    return this.stlThumbColumnAvailable;
   }
 
   // Same TTL-cache pattern for the bed_id column. Added in
@@ -445,8 +472,15 @@ export class JobsService {
   /** Load a piece row (or throw 404) with parent order/customer fields. */
   private async loadJob(companyId: string, pieceId: string): Promise<JobRow> {
     const hasStl = await this.hasStlColumn();
+    const hasThumb = await this.hasStlThumbnailColumn();
     const result = await this.databaseService.query<JobRow>(
-      this.jobSelectSql(hasStl, "WHERE op.company_id = $1 AND op.piece_id = $2"),
+      this.jobSelectSql(
+        hasStl,
+        "WHERE op.company_id = $1 AND op.piece_id = $2",
+        "op.created_at DESC",
+        false,
+        hasThumb
+      ),
       [companyId, pieceId]
     );
     if (result.rowCount === 0) {
@@ -469,9 +503,13 @@ export class JobsService {
     hasStl: boolean,
     whereClause: string,
     orderBy = "op.created_at DESC",
-    excludeDraftOrders = false
+    excludeDraftOrders = false,
+    hasThumb = false
   ): string {
     const stlProjection = hasStl ? "op.stl_file_url" : "NULL::text AS stl_file_url";
+    const thumbProjection = hasThumb
+      ? "op.stl_thumbnail_url"
+      : "NULL::text AS stl_thumbnail_url";
     const orderStatusClause = excludeDraftOrders
       ? `AND o.status IN ('confirmed','in_progress','completed','ready_for_shipping','out_for_shipping')`
       : "";
@@ -527,6 +565,7 @@ export class JobsService {
         op.cost,
         o.profit_pct AS order_profit_pct,
         ${stlProjection},
+        ${thumbProjection},
         op.scheduled_at,
         op.scheduled_start_at,
         op.scheduled_end_at,
@@ -591,7 +630,8 @@ export class JobsService {
     if (await this.hasBedColumn()) {
       wheres.push(`op.bed_id IS NULL`);
     }
-    const sql = this.jobSelectSql(hasStl, `WHERE ${wheres.join(" AND ")}`, "op.created_at DESC", true);
+    const hasThumb = await this.hasStlThumbnailColumn();
+    const sql = this.jobSelectSql(hasStl, `WHERE ${wheres.join(" AND ")}`, "op.created_at DESC", true, hasThumb);
     const result = await this.databaseService.query<JobRow>(sql, values);
     return result.rows;
   }

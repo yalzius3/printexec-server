@@ -27,6 +27,20 @@ const bulkDeletePiecesSchema = z.object({
   force: z.boolean().optional()
 });
 
+// The client renders the STL to a PNG, uploads it via POST /uploads, then sends
+// the resulting served URL here. Restrict to our own upload path so we never
+// persist an arbitrary external URL.
+const setPieceThumbnailSchema = z.object({
+  url: z
+    .string()
+    .trim()
+    .min(1)
+    .max(2000)
+    .refine((v) => v.startsWith("/api/uploads/") || v.startsWith("/uploads/"), {
+      message: "url must be an uploads path."
+    })
+});
+
 @Controller("order-pieces")
 export class OrderPiecesController {
   constructor(private readonly orderPiecesService: OrderPiecesService) {}
@@ -139,5 +153,19 @@ export class OrderPiecesController {
   ) {
     const { status } = parseWithSchema(transitionPieceFulfilmentSchema, body);
     return this.orderPiecesService.transitionPieceFulfilment(companyId, pieceId, status);
+  }
+
+  // Persist a client-rendered STL thumbnail (small PNG) for a piece. The client
+  // generates it in-browser from the STL and uploads the PNG first; this only
+  // stores the resulting URL so every viewer shares one cached image.
+  @Post(":pieceId/thumbnail")
+  @RequirePermission("action_orders")
+  setThumbnail(
+    @CompanyId() companyId: string,
+    @Param("pieceId") pieceId: string,
+    @Body() body: unknown
+  ) {
+    const { url } = parseWithSchema(setPieceThumbnailSchema, body);
+    return this.orderPiecesService.setPieceThumbnail(companyId, pieceId, url);
   }
 }
