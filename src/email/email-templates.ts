@@ -87,12 +87,9 @@ const SANS = "'DM Sans','Helvetica Neue',Arial,sans-serif";
 const INK = "#000000";
 const PAPER = "#ffffff";
 const SUBTLE = "#57534e";
+const RAIN_AXES = ["X", "Y", "Z"];
 // Public site — the footer wordmark links here.
 const SITE_URL = "https://printexec.xyz";
-// Hosted footer image (coordinate-rain + PrintExec wordmark), served from the
-// marketing site's static assets (website/public/email-footer.png). A PNG renders
-// in every mail client, unlike the inline SVG rain that Gmail/Outlook strip.
-const FOOTER_IMG_URL = "https://printexec.xyz/email-footer.png";
 
 /**
  * Format a date as "June 30, 2026". Accepts a 'YYYY-MM-DD'/ISO string OR a Date
@@ -146,6 +143,89 @@ function esc(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/**
+ * Static, pre-rendered ("baked") version of the capabilities-doc rain strip,
+ * using THAT document's exact buildRain algorithm — same PRNG, token formats,
+ * counts, fonts, colors and bottom fade — emitted as a static <svg> string
+ * because email clients don't run the doc's JS. Seeded by the order number.
+ *
+ * Note: inline SVG renders in Apple Mail but Gmail/Outlook strip it; the cell
+ * sits on solid black so it degrades to a plain black band in those clients.
+ */
+function bottomRainSvg(seed: number, w: number, h: number): string {
+  let s = (seed | 0) || 1;
+  const rng = () => {
+    s = (s * 1664525 + 1013904223) & 0xffffffff;
+    return (s >>> 0) / 4294967295;
+  };
+  const rc = () => ((rng() * 2000) - 1000).toFixed(2);
+  const fmt = (ax: string, v: string): string => {
+    const r = rng();
+    return r < 0.4 ? `[${ax}: ${v}]` : r < 0.7 ? `${ax}&#8594;${v}` : `${ax} ${v}`;
+  };
+
+  const parts: string[] = [`<rect x="0" y="0" width="${w}" height="${h}" fill="#000"/>`];
+  const count = Math.floor(w / 32) * 4;
+  for (let i = 0; i < count; i += 1) {
+    const ax = RAIN_AXES[Math.floor(rng() * 3)] as string;
+    const v = rc();
+    const x = rng() * (w - 90);
+    const y = rng() * (h - 14) + 12;
+    const fs = 7 + rng() * 5;
+    const al = (0.65 + rng() * 0.35).toFixed(2);
+    const cw = fs * 0.605;
+    const grouped = rng() < 0.12;
+
+    if (grouped) {
+      RAIN_AXES.forEach((bax, bi) => {
+        const lbl = fmt(bax, rc());
+        const yy = (y + bi * fs * 1.3).toFixed(2);
+        const ai = lbl.indexOf(bax);
+        parts.push(
+          `<text x="${x.toFixed(2)}" y="${yy}" font-family="'Roboto Mono',monospace" font-size="${fs.toFixed(1)}" fill="#aaa89a" opacity="${(Number(al) * 0.75).toFixed(2)}">${lbl}</text>`
+        );
+        if (ai >= 0) {
+          parts.push(
+            `<text x="${(x + ai * cw).toFixed(2)}" y="${yy}" font-family="'Roboto Mono',monospace" font-size="${fs.toFixed(1)}" fill="#fff" opacity="${al}">${bax}</text>`
+          );
+        }
+      });
+    } else {
+      const lbl = fmt(ax, v);
+      const ai = lbl.indexOf(ax);
+      parts.push(
+        `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-family="'Roboto Mono',monospace" font-size="${fs.toFixed(1)}" fill="#999080" opacity="${al}">${lbl}</text>`
+      );
+      if (ai >= 0) {
+        parts.push(
+          `<text x="${(x + ai * cw).toFixed(2)}" y="${y.toFixed(2)}" font-family="'Roboto Mono',monospace" font-size="${fs.toFixed(1)}" fill="#fff" opacity="${al}">${ax}</text>`
+        );
+      }
+    }
+  }
+  // Bottom fade (isBottom=true in the ref): solid at the top → transparent by 60%.
+  const gid = `rain-${seed}`;
+  parts.push(
+    `<defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">` +
+      `<stop offset="0" stop-color="#000" stop-opacity="1"/>` +
+      `<stop offset="0.6" stop-color="#000" stop-opacity="0"/>` +
+      `</linearGradient></defs>` +
+      `<rect x="0" y="0" width="${w}" height="${h}" fill="url(#${gid})"/>`
+  );
+
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" ` +
+    `width="100%" height="${h}" style="display:block;">${parts.join("")}</svg>`
+  );
+}
+
+/** Seed for the rain strip — sum of order-number char codes (stable per order). */
+function seedFrom(text: string): number {
+  let n = 0;
+  for (let i = 0; i < text.length; i += 1) n = (n + text.charCodeAt(i) * (i + 1)) | 0;
+  return n;
 }
 
 function buildText(data: OrderCompletionEmailData): string {
@@ -221,6 +301,7 @@ function buildHtml(data: OrderCompletionEmailData): string {
   const { company, customer, order } = data;
   const copy = STATUS_COPY[order.status];
   const greetingName = customer.contactName || customer.displayName || "there";
+  const isFulfilled = order.status === "fulfilled";
 
   // Order summary rows
   const rows: string[] = [
@@ -295,15 +376,22 @@ function buildHtml(data: OrderCompletionEmailData): string {
       `<p style="margin:14px 0 0;color:${INK};">Thank you for choosing ${esc(company.name)}!</p>` +
       `</td></tr>`,
 
-    // ── Footer: a single hosted PNG — the coordinate-rain + PrintExec wordmark,
-    // wrapped in one link to the site. A PNG renders in every client (Gmail /
-    // Outlook strip inline SVG); the whole strip is one click target, and the
-    // black bgcolor + alt keep it graceful if images are blocked.
-    `<tr><td bgcolor="${INK}" style="background:${INK};font-size:0;line-height:0;padding:0;">` +
-      `<a href="${SITE_URL}" target="_blank" rel="noopener" style="display:block;text-decoration:none;">` +
-        `<img src="${FOOTER_IMG_URL}" alt="PrintExec — printexec.xyz" width="600" height="48" ` +
-          `style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none;" />` +
-      `</a>` +
+    // ── Footer: one thin black strip — the doc's coordinate-rain as the
+    // background with the clickable PrintExec wordmark laid over it. The rain
+    // sits absolutely behind; the wordmark table is position:relative so it
+    // stacks on top (Apple Mail + web). Clients that drop inline SVG / CSS
+    // positioning just show the wordmark on a solid black bar — graceful either way.
+    `<tr><td style="background:${INK};padding:0;">` +
+      `<div style="position:relative;height:48px;overflow:hidden;">` +
+        `<div style="position:absolute;top:0;left:0;right:0;bottom:0;font-size:0;line-height:0;">` +
+          `${bottomRainSvg(seedFrom(order.orderNumber), 600, 48)}</div>` +
+        `<table role="presentation" width="100%" height="48" cellpadding="0" cellspacing="0" border="0" style="position:relative;height:48px;"><tr>` +
+        `<td valign="middle" style="padding:0 24px;font-family:${MONO};font-weight:700;font-size:16px;letter-spacing:0.08em;">` +
+          `<a href="${SITE_URL}" target="_blank" rel="noopener" style="color:${PAPER};text-decoration:none;">PRINTEXEC</a></td>` +
+        `<td valign="middle" align="right" style="padding:0 24px;font-family:${MONO};font-size:11px;letter-spacing:0.06em;color:#9a958a;">` +
+          `${isFulfilled ? "✓ " : ""}Fulfilled by PrintExec</td>` +
+        `</tr></table>` +
+      `</div>` +
       `</td></tr>`,
 
     `</table>`,
