@@ -386,6 +386,12 @@ export class AuthController {
 
       const uniqueSlug = `${slug}-${Date.now().toString(36)}`;
 
+      // tenant_code (the stable "ABC" prefix for this company's order numbers)
+      // is assigned automatically by a BEFORE INSERT trigger on companies
+      // (2026-07-04_tenant_order_numbering.sql): derived once from the name and
+      // de-duplicated to stay globally unique, so it never changes if the name
+      // later does. We deliberately do not set it here — letting the trigger own
+      // assignment is what keeps it race-safe under concurrent signups.
       const company = await this.db.query<{ company_id: string }>(
         `INSERT INTO companies (
            name, slug, email, owner_user_id,

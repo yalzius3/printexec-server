@@ -5,6 +5,8 @@ import { reevaluateBedAfterPieceRemoval } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import { CustomersService } from "../customers/customers.service";
+import { deriveTenantCodeBase, formatOrderNumber } from "../common/tenant-code";
+import { bumpOrderSequence } from "./order-number";
 import {
   createOrderSchema,
   listOrderPiecesQuerySchema,
@@ -658,11 +660,74 @@ export class OrdersService {
     }
   }
 
+  // Mint the business-facing order number: <TENANT_CODE>-<YEAR>-<SEQUENCE>,
+  // e.g. ABC-2026-00001. The sequence is unique per (tenant, year), resets each
+  // year, and is generated atomically so concurrent creations never collide.
+  // Runs on the caller's transaction (executor) so a rolled-back order also
+  // rolls back the sequence bump, leaving no gap.
   private async generateOrderNumber(
     companyId: string,
     establishedAt: string,
     executor?: SqlExecutor
-  ) {
+  ): Promise<string> {
+    // Rollout guard: if the tenant-numbering migration hasn't been applied yet,
+    // fall back to the legacy generator so order creation never breaks. The
+    // sequences table and companies.tenant_code ship in the same migration, so
+    // the table's presence implies the column exists too.
+    const ready = await this.databaseService.query<{ ready: boolean }>(
+      "SELECT to_regclass('public.order_number_sequences') IS NOT NULL AS ready",
+      [],
+      executor
+    );
+    if (!ready.rows[0]?.ready) {
+      return this.generateLegacyOrderNumber(companyId, establishedAt, executor);
+    }
+
+    // Year of the order's establishment date (defaults to the creation date).
+    const year = Number(establishedAt.slice(0, 4));
+    const tenantCode = await this.resolveTenantCode(companyId, executor);
+
+    // Bump the shared, single-source-of-truth counter so the exact atomic SQL
+    // run here is the same one the integration/concurrency tests exercise (see
+    // order-number.ts). Runs on the caller's transaction, so a rolled-back order
+    // also rolls back the counter bump — no gaps.
+    const sequence = await bumpOrderSequence(
+      (sql, values) =>
+        this.databaseService.query<{ last_value: string }>(sql, values, executor),
+      companyId,
+      year
+    );
+    return formatOrderNumber(tenantCode, year, sequence);
+  }
+
+  // Read the tenant's stable prefix. tenant_code is NOT NULL once the migration
+  // has run; the fallback only guards a half-migrated row and keeps order
+  // creation working by deriving the base code on the fly (the trigger owns
+  // persistence, so we don't write it back here).
+  private async resolveTenantCode(
+    companyId: string,
+    executor?: SqlExecutor
+  ): Promise<string> {
+    const result = await this.databaseService.query<{ tenant_code: string | null; name: string | null }>(
+      "SELECT tenant_code, name FROM companies WHERE company_id = $1",
+      [companyId],
+      executor
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new NotFoundException("Company not found.");
+    }
+    return row.tenant_code?.trim() || deriveTenantCodeBase(row.name);
+  }
+
+  // Pre-migration order numbering: ORD-<YEAR>-<NNN> via MAX()+1. Retained only
+  // as a rollout fallback; superseded by the tenant-scoped format above once
+  // 2026-07-04_tenant_order_numbering.sql is applied.
+  private async generateLegacyOrderNumber(
+    companyId: string,
+    establishedAt: string,
+    executor?: SqlExecutor
+  ): Promise<string> {
     const year = establishedAt.slice(0, 4);
     const prefix = `ORD-${year}-`;
     const result = await this.databaseService.query<{ max_suffix: string | null }>(
