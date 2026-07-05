@@ -9,6 +9,7 @@ import { EmailModule } from "./email/email.module";
 import { HealthController } from "./health/health.controller";
 import { BedsModule } from "./beds/beds.module";
 import { JobsModule } from "./jobs/jobs.module";
+import { LicensingModule } from "./licensing/licensing.module";
 import { MaintenanceModule } from "./maintenance/maintenance.module";
 import { OrderAttachmentsModule } from "./order-attachments/order-attachments.module";
 import { OrderPiecesModule } from "./order-pieces/order-pieces.module";
@@ -19,6 +20,7 @@ import { StaffModule } from "./staff/staff.module";
 import { UploadsModule } from "./uploads/uploads.module";
 import { SupabaseAuthGuard } from "./auth/supabase.guard";
 import { PermissionGuard } from "./auth/permission.guard";
+import { LicenseGuard } from "./licensing/license.guard";
 
 @Module({
   imports: [
@@ -30,6 +32,7 @@ import { PermissionGuard } from "./auth/permission.guard";
     CustomersModule,
     EmailModule,
     JobsModule,
+    LicensingModule,
     MaintenanceModule,
     OrderAttachmentsModule,
     OrderPiecesModule,
@@ -42,9 +45,10 @@ import { PermissionGuard } from "./auth/permission.guard";
   controllers: [HealthController],
   providers: [
     // Order matters: SupabaseAuthGuard must run first (sets req.permissions),
-    // then PermissionGuard reads them.
+    // then PermissionGuard reads them, then LicenseGuard (needs req.companyId).
     { provide: APP_GUARD, useClass: SupabaseAuthGuard },
-    { provide: APP_GUARD, useClass: PermissionGuard }
+    { provide: APP_GUARD, useClass: PermissionGuard },
+    { provide: APP_GUARD, useClass: LicenseGuard }
   ]
 })
 export class AppModule {}

@@ -2,6 +2,8 @@ import { Body, Controller, Get, Post, Res, UnauthorizedException, BadRequestExce
 import { ConfigService } from "@nestjs/config";
 import type { FastifyReply } from "fastify";
 import { DatabaseService } from "../database/database.service";
+import { LicenseExempt } from "../licensing/license-exempt.decorator";
+import { LicensingService } from "../licensing/licensing.service";
 import { CompanyId } from "../common/company-id.decorator";
 import { UserId } from "../common/user-id.decorator";
 import { UserRole } from "../common/user-role.decorator";
@@ -47,7 +49,8 @@ export class AuthController {
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly config: ConfigService
+    private readonly config: ConfigService,
+    private readonly licensing: LicensingService
   ) {
     this.supabaseUrl = config.getOrThrow<string>("SUPABASE_URL");
     this.supabaseKey =
@@ -60,6 +63,9 @@ export class AuthController {
   // The cookie authorizes same-origin GETs of guarded uploads that cannot carry
   // a Bearer header (<img>/<iframe>/<a download>/STL viewer fetch). The client
   // calls this on every session change (login + token refresh).
+  // @LicenseExempt: a read-only (license-lapsed) workspace must still be able
+  // to VIEW its uploads, and this POST is what makes those GETs work.
+  @LicenseExempt()
   @Post("session")
   async issueUploadSession(
     @CompanyId() companyId: string,
@@ -106,6 +112,14 @@ export class AuthController {
     } catch {
       // pricing columns not migrated yet — profile still returns without them
     }
+    // Best-effort license summary — getStatus fails open internally, so this
+    // never blocks login; it just powers the client's plan screen + banners.
+    try {
+      profile.license = await this.licensing.getStatus(rows[0]!.company_id);
+    } catch {
+      // licensing tables not migrated yet — profile still returns without it
+    }
+    profile.is_platform_admin = this.licensing.isPlatformAdminEmail(rows[0]!.email);
     return profile;
   }
 
@@ -445,6 +459,15 @@ export class AuthController {
          WHERE id = $2`,
         [companyId, userId]
       );
+
+      // Start the new company's trial. Best-effort: signup must never break
+      // on licensing (e.g. the licensing migration not applied yet) — the
+      // license resolver lazily provisions the trial row on first use anyway.
+      try {
+        await this.licensing.ensureTrial(companyId);
+      } catch {
+        // licensing tables not migrated yet — resolver will self-heal
+      }
 
       return { user_id: userId, company_id: companyId, company_name: companyName, role: "owner", permissions: ownerPerms, display_name: displayName, email };
     }

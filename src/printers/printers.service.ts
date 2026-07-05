@@ -3,6 +3,7 @@ import type { z } from "zod";
 import { revertPrinterAssignmentsTx } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
+import { LicensingService } from "../licensing/licensing.service";
 import {
   addCompatibleNozzleSchema,
   createPrinterReferenceSchema,
@@ -53,7 +54,10 @@ type PrinterReferenceRow = {
 
 @Injectable()
 export class PrintersService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly licensingService: LicensingService
+  ) {}
 
   async listPrinterReferences(query: ListPrinterReferencesQuery) {
     const values: unknown[] = [];
@@ -315,6 +319,16 @@ export class PrintersService {
 
   async createPrinter(companyId: string, input: CreatePrinterInput) {
     return this.databaseService.transaction(async (client) => {
+      // License cap gate. The transaction-scoped advisory lock serialises
+      // concurrent adds for one company so two requests can't both pass the
+      // count check while under the cap by one.
+      await this.databaseService.query(
+        "SELECT pg_advisory_xact_lock(hashtext('printer_cap:' || $1))",
+        [companyId],
+        client
+      );
+      await this.licensingService.assertCanAddPrinter(companyId, client);
+
       const printerReference = input.printer_ref_id
         ? await this.getPrinterReferenceById(input.printer_ref_id, client)
         : await this.createPrinterReference(companyId, input.custom_reference!, client);
