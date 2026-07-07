@@ -112,6 +112,17 @@ export class AuthController {
     } catch {
       // pricing columns not migrated yet — profile still returns without them
     }
+    try {
+      const branding = await this.db.query<{ logo_url: string | null; slogan: string | null; about_text: string | null }>(
+        `SELECT c.logo_url, c.slogan, c.about_text
+         FROM companies c JOIN users u ON u.company_id = c.company_id
+         WHERE u.id = $1`,
+        [userId]
+      );
+      if (branding.rows[0]) Object.assign(profile, branding.rows[0]);
+    } catch {
+      // branding columns not migrated yet — profile still returns without them
+    }
     // Best-effort license summary — getStatus fails open internally, so this
     // never blocks login; it just powers the client's plan screen + banners.
     try {
@@ -258,6 +269,79 @@ export class AuthController {
 
     const { rows } = await this.db.query(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
+       FROM users u JOIN companies c ON c.company_id = u.company_id
+       WHERE u.id = $1`,
+      [userId]
+    );
+    return rows[0] ?? null;
+  }
+
+  // Owner-only: set (or clear, with null) the company's logo URL. The file
+  // itself is uploaded first via the generic POST /uploads, then its returned
+  // URL is persisted here — mirrors the STL-thumbnail two-step pattern
+  // (upload, then attach the URL to the owning row).
+  @Post("company-logo")
+  async setCompanyLogo(
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z.object({ logo_url: z.string().max(500).nullable() }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("logo_url must be a string or null.");
+    }
+
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the company logo.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET logo_url = $1 WHERE company_id = $2",
+      [parsed.data.logo_url, companyId]
+    );
+
+    const { rows } = await this.db.query(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.logo_url, c.slogan, c.about_text
+       FROM users u JOIN companies c ON c.company_id = u.company_id
+       WHERE u.id = $1`,
+      [userId]
+    );
+    return rows[0] ?? null;
+  }
+
+  // Owner-only: set the company's slogan and about paragraph, shown on the
+  // Settings > Brand page. Mirrors the other owner-only company-setting
+  // guards. Empty strings are stored as null (cleared), matching pricing's
+  // "" → null convention.
+  @Post("company-branding")
+  async setCompanyBranding(
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z
+      .object({
+        slogan: z.string().max(200).nullable(),
+        about_text: z.string().max(2000).nullable()
+      })
+      .safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("slogan must be at most 200 characters and about_text at most 2000.");
+    }
+
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the company brand.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET slogan = $1, about_text = $2 WHERE company_id = $3",
+      [parsed.data.slogan?.trim() || null, parsed.data.about_text?.trim() || null, companyId]
+    );
+
+    const { rows } = await this.db.query(
+      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.logo_url, c.slogan, c.about_text
        FROM users u JOIN companies c ON c.company_id = u.company_id
        WHERE u.id = $1`,
       [userId]

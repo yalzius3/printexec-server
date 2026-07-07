@@ -18,6 +18,7 @@ import { CompanyId } from "../common/company-id.decorator";
 import { Public } from "../auth/public.decorator";
 import { UploadCookieGuard } from "../auth/upload-cookie.guard";
 import { ConfigService } from "@nestjs/config";
+import { DatabaseService } from "../database/database.service";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as fs from "fs";
 import * as path from "path";
@@ -75,11 +76,57 @@ const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "uploads";
 export class UploadsController {
   private readonly supabase: SupabaseClient;
 
-  constructor(private readonly config: ConfigService) {
+  constructor(
+    private readonly config: ConfigService,
+    private readonly db: DatabaseService
+  ) {
     this.supabase = createClient(
       this.config.getOrThrow<string>("SUPABASE_URL"),
       this.config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY")
     );
+  }
+
+  // Unauthenticated logo serving — registered ahead of the guarded
+  // ":companyId/:filename" route below so "logo/<id>" never falls through to
+  // it (Nest/Express match routes in declaration order). Unlike other
+  // uploads, a company logo is meant to appear on surfaces with no session at
+  // all (public order-status pages, customer emails), so it can't go through
+  // the cookie-gated route. Safe to expose without auth: the object key comes
+  // from the company's own logo_url column, never from the request, so a
+  // caller can only ever fetch the one logo that company chose to set.
+  @Public()
+  @Get("logo/:companyId")
+  async serveLogo(
+    @Param("companyId") companyId: string,
+    @Res() reply: FastifyReply
+  ) {
+    const { rows } = await this.db.query<{ logo_url: string | null }>(
+      "SELECT logo_url FROM companies WHERE company_id = $1",
+      [companyId]
+    );
+    const logoUrl = rows[0]?.logo_url;
+    if (!logoUrl) {
+      throw new NotFoundException("This company has no logo set.");
+    }
+
+    const filename = logoUrl.split("/").pop() ?? "";
+    if (!filename || filename.includes("..")) {
+      throw new NotFoundException("Logo file not found.");
+    }
+
+    const { data, error } = await this.supabase.storage
+      .from(UPLOAD_BUCKET)
+      .download(`${companyId}/${filename}`);
+    if (error || !data) {
+      throw new NotFoundException("Logo file not found.");
+    }
+    const bytes = Buffer.from(await data.arrayBuffer());
+
+    const contentType = CONTENT_TYPES[path.extname(filename).toLowerCase()] ?? "application/octet-stream";
+    reply.header("Content-Type", contentType);
+    reply.header("Content-Length", bytes.byteLength);
+    reply.header("Cache-Control", "public, max-age=300");
+    return reply.send(bytes);
   }
 
   // Guarded file serving. Replaces the former @fastify/static mount, which
