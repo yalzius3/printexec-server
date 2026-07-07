@@ -28,6 +28,10 @@ export type OrderCompletionEmailData = {
     city: string | null;
     countryCode: string | null;
     currency: string | null;
+    // Absolute, publicly reachable URL of the company's logo (the unauthenticated
+    // /api/uploads/logo/:companyId route), or null when none is set. Rendered
+    // top-right in the header; null keeps the blank header bar unchanged.
+    logoUrl: string | null;
   };
   customer: {
     displayName: string;
@@ -258,9 +262,15 @@ function buildHtml(data: OrderCompletionEmailData): string {
     `<tr><td align="center" style="padding:24px 12px;">`,
     `<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background:${PAPER};border:1px solid ${INK};">`,
 
-    // ── Header: blank bar (company logo goes top-right) + plain separator ──
+    // ── Header: company logo, top-right, over the plain 2px separator. Its
+    // height is pinned to the reserved 28px so the bar's dimensions never change;
+    // when the company has no logo we keep the original blank bar untouched.
+    // (SVG logos may not render in Gmail/Outlook — the alt text carries the name.)
     `<tr><td style="background:${PAPER};border-bottom:2px solid ${INK};padding:18px 24px;" align="right">` +
-      `<div style="height:28px;line-height:28px;">&nbsp;</div>` +
+      (company.logoUrl
+        ? `<img src="${company.logoUrl}" alt="${esc(company.name)}" height="28" ` +
+            `style="display:inline-block;height:28px;max-height:28px;width:auto;max-width:200px;border:0;outline:none;" />`
+        : `<div style="height:28px;line-height:28px;">&nbsp;</div>`) +
       `</td></tr>`,
 
     // ── Body ──

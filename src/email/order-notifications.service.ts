@@ -217,7 +217,8 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       return "skipped";
     }
 
-    const message = composeOrderCompletionEmail(this.toEmailData(row, recipient));
+    const logoUrl = await this.resolveCompanyLogoUrl(row.company_id);
+    const message = composeOrderCompletionEmail(this.toEmailData(row, recipient, logoUrl));
 
     let result: "sent" | "dry_run";
     try {
@@ -258,8 +259,47 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
     return "customer has no email on file";
   }
 
+  /**
+   * Absolute, publicly reachable URL of the company's logo for the email header,
+   * or null when none is set. Uses the unauthenticated /api/uploads/logo/:id
+   * route (email clients carry no session/cookie) on the public app origin.
+   *
+   * Best-effort + guarded: the logo_url column ships ahead of its migration, so a
+   * missing column must NOT break the sweep — on any error we just omit the logo
+   * and every other part of the email is unchanged. Kept OUT of findEligibleOrders'
+   * main query for the same reason (one failing column there would stop all mail).
+   */
+  private async resolveCompanyLogoUrl(companyId: string): Promise<string | null> {
+    try {
+      const res = await this.db.query<{ logo_url: string | null }>(
+        "SELECT logo_url FROM companies WHERE company_id = $1",
+        [companyId]
+      );
+      const stored = res.rows[0]?.logo_url;
+      if (!stored) return null;
+      // Prefer an explicit public app origin; fall back to the (first) CORS
+      // origin, then the marketing site. Trailing slashes trimmed.
+      const origin = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec.xyz")
+        .split(",")[0]!
+        .trim()
+        .replace(/\/+$/, "");
+      // Cache-bust on the stored filename so a logo change is picked up despite
+      // the stable /logo/:id path (email clients cache images hard).
+      const filename = stored.split("/").pop() ?? "";
+      const version = filename ? `?v=${encodeURIComponent(filename)}` : "";
+      return `${origin}/api/uploads/logo/${companyId}${version}`;
+    } catch {
+      // logo_url column not migrated yet — send the email without a logo.
+      return null;
+    }
+  }
+
   /** Map a DB row into the shape the template expects. */
-  private toEmailData(row: EligibleRow, recipient: string): OrderCompletionEmailData {
+  private toEmailData(
+    row: EligibleRow,
+    recipient: string,
+    logoUrl: string | null
+  ): OrderCompletionEmailData {
     const contactName = [row.first_name, row.last_name]
       .filter((p): p is string => !!p && p.trim().length > 0)
       .join(" ")
@@ -279,7 +319,8 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
         website: row.company_website,
         city: row.company_city,
         countryCode: row.company_country,
-        currency: row.company_currency
+        currency: row.company_currency,
+        logoUrl
       },
       customer: {
         displayName: (row.display_name ?? "").trim() || "Customer",
