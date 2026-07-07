@@ -267,7 +267,18 @@ export class AuthController {
 
   // Email-existence pre-check. Called from the account step BEFORE the client
   // runs supabase.auth.signUp, so the verification email never fires for an
-  // address that already has an account. Mirrors the dupe check in setup().
+  // address that can already sign in. Three outcomes:
+  //   409                                → a finished account (users row) OR a
+  //     confirmed auth user who never completed setup — either way they should
+  //     sign in, not sign up again (signing in routes them to setup if needed).
+  //   200 { status: "unconfirmed" }      → an earlier signup stalled before the
+  //     email was confirmed. Signup may proceed: supabase.auth.signUp re-sends
+  //     the confirmation email for existing unconfirmed users, and the client
+  //     uses the status to explain the resend on its verify screen.
+  //   200 { status: "new" }              → genuinely fresh address.
+  // Without the auth.users check, a half-registered user (auth user created,
+  // setup never finished) passed this check forever — the "redo the whole
+  // signup again and again" loop.
   @Public()
   @Post("check-email")
   async checkEmail(@Body() body: unknown) {
@@ -276,16 +287,38 @@ export class AuthController {
       throw new BadRequestException("Invalid request.");
     }
     const email = parsed.data.email.trim();
-    if (email) {
-      const { rows } = await this.db.query(
-        "SELECT 1 FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1",
+    if (!email) return { available: true, status: "new" };
+
+    const { rows } = await this.db.query(
+      "SELECT 1 FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1",
+      [email]
+    );
+    if (rows.length) {
+      throw new ConflictException("An account already exists with this email. Want to sign in instead?");
+    }
+
+    // Best-effort look at Supabase's auth store (DATABASE_URL points at the
+    // same Postgres). Never let a permissions/schema surprise block signups —
+    // on any failure fall through to "new" and let signUp sort it out.
+    try {
+      const auth = await this.db.query<{ confirmed: boolean }>(
+        `SELECT (email_confirmed_at IS NOT NULL) AS confirmed
+         FROM auth.users
+         WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL
+         LIMIT 1`,
         [email]
       );
-      if (rows.length) {
-        throw new ConflictException("An account already exists with this email. Want to sign in instead?");
+      if (auth.rows.length) {
+        if (auth.rows[0]!.confirmed) {
+          throw new ConflictException("An account already exists with this email. Want to sign in instead?");
+        }
+        return { available: true, status: "unconfirmed" };
       }
+    } catch (err) {
+      if (err instanceof ConflictException) throw err;
+      // auth schema unreadable — degrade to the pre-existing behaviour
     }
-    return { available: true };
+    return { available: true, status: "new" };
   }
 
   @Public()
