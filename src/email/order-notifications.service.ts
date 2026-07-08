@@ -281,8 +281,10 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       const stored = res.rows[0]?.logo_url;
       if (!stored) return null;
       // Prefer an explicit public app origin; fall back to the (first) CORS
-      // origin, then the marketing site. Trailing slashes trimmed.
-      const origin = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec.xyz")
+      // origin, then the deployed APP origin. NEVER the marketing site — it has
+      // no /api proxy, so a logo URL built on it 404s and the email header
+      // silently renders blank. Trailing slashes trimmed.
+      const origin = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec-client.pages.dev")
         .split(",")[0]!
         .trim()
         .replace(/\/+$/, "");

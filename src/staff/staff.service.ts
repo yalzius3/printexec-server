@@ -214,8 +214,9 @@ export class StaffService {
       throw new BadRequestException("This invite code has expired — create a new one.");
     }
 
-    // Same public-origin resolution as the customer-email logo URL.
-    const appUrl = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec.xyz")
+    // Same public-origin resolution as the customer-email logo URL: the invite
+    // CTA must open the APP (join flow), not the marketing site.
+    const appUrl = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec-client.pages.dev")
       .split(",")[0]!
       .trim()
       .replace(/\/+$/, "");
