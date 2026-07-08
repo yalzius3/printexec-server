@@ -133,4 +133,24 @@ export class StaffController {
   ) {
     return this.staffService.revokeInvite(companyId, token);
   }
+
+  // Email an existing invite code to the invitee (branded, no-reply transport).
+  @Post("invites/:token/email")
+  @RequirePermission(
+    "can_send_invites",
+    "You do not have permission to send invites."
+  )
+  emailInvite(
+    @CompanyId() companyId: string,
+    @Param("token") token: string,
+    @Body() body: unknown
+  ) {
+    const parsed = z
+      .object({ email: z.string().trim().email().max(200) })
+      .safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("Enter a valid email address.");
+    }
+    return this.staffService.emailInvite(companyId, token, parsed.data.email);
+  }
 }

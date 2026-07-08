@@ -363,6 +363,41 @@ export class AuthController {
   // Without the auth.users check, a half-registered user (auth user created,
   // setup never finished) passed this check forever — the "redo the whole
   // signup again and again" loop.
+  // Mirror a Supabase-confirmed email change into the app's own tables. The
+  // client calls this on the USER_UPDATED auth event: the (fresh) JWT already
+  // carries the NEW address, so the token itself is the proof — no body needed.
+  // @Public() + direct verify because the global guard reads the users row,
+  // which is exactly what's stale here.
+  @Public()
+  @Post("sync-email")
+  async syncEmail(@Headers("authorization") authHeader: string) {
+    if (!authHeader?.startsWith("Bearer ")) {
+      throw new UnauthorizedException("Missing token.");
+    }
+    const token = authHeader.slice(7);
+    const { userId, email } = await verifyToken(token, this.supabaseUrl, this.supabaseKey);
+    if (!email) return { ok: false };
+
+    await this.db.query(
+      `UPDATE users SET email = $2
+        WHERE id = $1 AND LOWER(email) IS DISTINCT FROM LOWER($2)`,
+      [userId, email]
+    );
+    // Keep the owner-contact denormalizations in step (both were captured from
+    // the owner's login email at setup). Best-effort: schema drift here must
+    // never fail the sync of the users row above.
+    try {
+      await this.db.query(
+        `UPDATE companies SET owner_email = $2, email = $2
+          WHERE owner_user_id = $1`,
+        [userId, email]
+      );
+    } catch {
+      // older schema without these columns — nothing to sync
+    }
+    return { ok: true, email };
+  }
+
   @Public()
   @Post("check-email")
   async checkEmail(@Body() body: unknown) {

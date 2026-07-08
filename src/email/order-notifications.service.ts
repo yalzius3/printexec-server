@@ -160,7 +160,10 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
           o.description, o.status, o.established_at, o.deadline, o.profit_pct,
           comp.name            AS company_name,
           comp.phone           AS company_phone,
-          comp.owner_email     AS company_email,
+          -- NEVER the owner's login email: that's a PERSONAL address captured at
+          -- signup, not a customer-facing contact. Until companies carry a
+          -- dedicated public contact email, customer emails show phone + website.
+          NULL                 AS company_email,
           comp.website         AS company_website,
           comp.city            AS company_city,
           comp.country_code    AS company_country,

@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { EmailService } from "../email/email.service";
+import { composeStaffInviteEmail } from "../email/email-templates";
 
 const CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -31,7 +33,10 @@ export interface InviteRow {
 
 @Injectable()
 export class StaffService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly email: EmailService
+  ) {}
 
   async listStaff(companyId: string): Promise<StaffMember[]> {
     const { rows } = await this.db.query<StaffMember>(
@@ -172,5 +177,63 @@ export class StaffService {
       [token, companyId]
     );
     if (!rowCount) throw new NotFoundException("Invite not found.");
+  }
+
+  /**
+   * Email an existing, still-usable invite code to the invitee. Uses the same
+   * no-reply transport (and EMAIL_ENABLED dry-run gate) as customer emails.
+   * Returns the transport outcome so the client can phrase its confirmation.
+   */
+  async emailInvite(
+    companyId: string,
+    token: string,
+    recipientEmail: string
+  ): Promise<{ status: "sent" | "dry_run" }> {
+    const { rows } = await this.db.query<{
+      token: string;
+      expires_at: string;
+      used_at: string | null;
+      created_by_name: string | null;
+      company_name: string;
+    }>(
+      `SELECT ci.token, ci.expires_at, ci.used_at,
+              u.display_name AS created_by_name,
+              c.name AS company_name
+         FROM company_invites ci
+         JOIN companies c ON c.company_id = ci.company_id
+         LEFT JOIN users u ON u.id = ci.created_by
+        WHERE ci.token = $1 AND ci.company_id = $2`,
+      [token, companyId]
+    );
+    const invite = rows[0];
+    if (!invite) throw new NotFoundException("Invite not found.");
+    if (invite.used_at) {
+      throw new BadRequestException("This invite code has already been used.");
+    }
+    if (new Date(invite.expires_at).getTime() < Date.now()) {
+      throw new BadRequestException("This invite code has expired — create a new one.");
+    }
+
+    // Same public-origin resolution as the customer-email logo URL.
+    const appUrl = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec.xyz")
+      .split(",")[0]!
+      .trim()
+      .replace(/\/+$/, "");
+
+    const message = composeStaffInviteEmail({
+      companyName: invite.company_name,
+      inviteToken: invite.token,
+      expiresAt: invite.expires_at,
+      invitedByName: invite.created_by_name,
+      appUrl
+    });
+
+    const status = await this.email.send({
+      to: recipientEmail,
+      subject: message.subject,
+      text: message.text,
+      html: message.html
+    });
+    return { status };
   }
 }

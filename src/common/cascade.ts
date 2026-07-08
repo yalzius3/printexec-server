@@ -171,6 +171,24 @@ export async function recomputeOrderStatusTx(
     target = "draft";
   }
 
+  // The shipping statuses only exist in orders_status_check after the
+  // 2026-06-26_order_shipping_statuses migration. Writing one against the OLD
+  // constraint raises 23514 — which, mid-transaction, aborts the CALLER's whole
+  // operation: the piece marking/fulfilment click itself dies with a 500 (for
+  // owner and staff alike). Clamp to 'completed' (the most advanced
+  // pre-migration status) until the constraint provably allows them; pieces
+  // keep their fulfilment_status, so the order self-corrects on the next
+  // recompute after the migration lands.
+  let effectiveTarget: string = target;
+  if (
+    (target === "ready_for_shipping" ||
+      target === "out_for_shipping" ||
+      target === "fulfilled") &&
+    !(await ordersConstraintAllowsShippingStatuses(executor))
+  ) {
+    effectiveTarget = "completed";
+  }
+
   // 'cancelled' and 'returned' are manual, sticky order statuses — never
   // overwritten by the piece-derived rollup.
   await executor.query(
@@ -178,8 +196,42 @@ export async function recomputeOrderStatusTx(
       WHERE company_id = $1 AND order_id = $2
         AND status NOT IN ('cancelled', 'returned')
         AND status != $3`,
-    [companyId, orderId, target]
+    [companyId, orderId, effectiveTarget]
   );
+}
+
+// Once the migration is observed the answer can never regress, so remember it
+// for the life of the process and skip the introspection query from then on.
+let shippingStatusesConfirmedInCheck = false;
+
+/**
+ * True when orders.status's CHECK constraint admits the shipping statuses
+ * (i.e. the 2026-06-26_order_shipping_statuses migration has been applied).
+ * Runs a cheap pg_constraint introspection until it first sees support.
+ * Fails OPTIMISTIC (true) on introspection errors — that reproduces the old
+ * behaviour rather than silently clamping forever on some exotic failure.
+ */
+async function ordersConstraintAllowsShippingStatuses(
+  executor: Queryable
+): Promise<boolean> {
+  if (shippingStatusesConfirmedInCheck) return true;
+  try {
+    const res = await executor.query<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def
+         FROM pg_constraint
+        WHERE conrelid = 'public.orders'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) ILIKE '%status%'`
+    );
+    // No status CHECK at all → nothing can be violated.
+    const allows =
+      res.rows.length === 0 ||
+      res.rows.every((r) => r.def.includes("ready_for_shipping"));
+    if (allows) shippingStatusesConfirmedInCheck = true;
+    return allows;
+  } catch {
+    return true;
+  }
 }
 
 /**

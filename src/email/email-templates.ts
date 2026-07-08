@@ -328,3 +328,127 @@ export function composeOrderCompletionEmail(data: OrderCompletionEmailData): Com
   const subject = `Your order ${order.orderNumber} is ${copy.label.toLowerCase()} — ${company.name}`;
   return { subject, text: buildText(data), html: buildHtml(data) };
 }
+
+// ════════════════════════════════════════════════════════════════
+// STAFF INVITE EMAIL
+//
+// Sent (optionally) when an owner/manager creates a team invite code and asks
+// for it to be emailed to the invitee. Same brand idiom + table/inline-style
+// discipline as the order email above; the invite CODE is the hero element
+// (mirrors the auth verify screen's code treatment).
+// ════════════════════════════════════════════════════════════════
+
+export type StaffInviteEmailData = {
+  companyName: string;
+  inviteToken: string;
+  /** ISO timestamp the code stops working. */
+  expiresAt: string | Date;
+  /** Display name of whoever created the invite (best-effort). */
+  invitedByName: string | null;
+  /** Absolute app origin the CTA links to, e.g. https://printexec-client.pages.dev */
+  appUrl: string;
+};
+
+function formatExpiry(value: string | Date): string {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return "48 hours";
+  return d.toLocaleString("en-US", {
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: "UTC"
+  }) + " UTC";
+}
+
+export function composeStaffInviteEmail(data: StaffInviteEmailData): ComposedEmail {
+  const { companyName, inviteToken, expiresAt, invitedByName, appUrl } = data;
+  const expiry = formatExpiry(expiresAt);
+  const inviter = invitedByName?.trim() || null;
+
+  const subject = `You're invited to join ${companyName} on PrintExec`;
+
+  const text = [
+    `PRINTEXEC`,
+    ``,
+    `Hi,`,
+    ``,
+    inviter
+      ? `${inviter} invited you to join ${companyName}'s workspace on PrintExec.`
+      : `You've been invited to join ${companyName}'s workspace on PrintExec.`,
+    ``,
+    `Your invite code:`,
+    ``,
+    `    ${inviteToken}`,
+    ``,
+    `To join:`,
+    `  1. Open ${appUrl}`,
+    `  2. Choose "Create account", then "Join a team"`,
+    `  3. Enter the invite code above`,
+    ``,
+    `This code works once and expires ${expiry}.`,
+    ``,
+    `This is an automated email from an unmonitored address — please don't reply.`,
+    `Fulfilled by PrintExec · ${SITE_URL}`
+  ].join("\n");
+
+  const html = [
+    `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;opacity:0;">` +
+      `Your invite code for ${esc(companyName)} on PrintExec</div>`,
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f5;margin:0;padding:0;">`,
+    `<tr><td align="center" style="padding:24px 12px;">`,
+    `<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background:${PAPER};border:1px solid ${INK};">`,
+
+    // ── Header: PRINTEXEC wordmark bar ──
+    `<tr><td style="background:${INK};padding:16px 24px;">` +
+      `<span style="font-family:${MONO};font-size:15px;font-weight:700;letter-spacing:0.2em;color:${PAPER};">PRINTEXEC</span>` +
+      `</td></tr>`,
+
+    // ── Body ──
+    `<tr><td style="padding:30px 28px 8px;font-family:${SANS};color:${INK};">` +
+      `<p style="margin:0 0 14px;font-size:15px;">Hi,</p>` +
+      `<p style="margin:0 0 20px;font-size:20px;font-weight:700;line-height:1.3;">` +
+        (inviter
+          ? `${esc(inviter)} invited you to join ${esc(companyName)}'s workspace.`
+          : `You've been invited to join ${esc(companyName)}'s workspace.`) +
+      `</p>` +
+      `</td></tr>`,
+
+    // ── The code (hero) ──
+    `<tr><td align="center" style="padding:4px 28px 6px;">` +
+      `<div style="display:inline-block;border:2px solid ${INK};padding:16px 28px;">` +
+        `<span style="font-family:${MONO};font-size:26px;font-weight:700;letter-spacing:0.3em;color:${INK};">${esc(inviteToken)}</span>` +
+      `</div>` +
+      `<div style="margin-top:10px;font-family:${MONO};font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:${SUBTLE};">Invite code · single use · expires ${esc(expiry)}</div>` +
+      `</td></tr>`,
+
+    // ── Steps ──
+    `<tr><td style="padding:22px 28px 8px;font-family:${SANS};font-size:14px;color:${INK};line-height:1.8;">` +
+      `<div style="font-family:${MONO};font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;border-bottom:1px solid ${INK};padding-bottom:8px;margin-bottom:10px;">How to join</div>` +
+      `1&nbsp;&nbsp;Open <a href="${appUrl}" target="_blank" rel="noopener" style="color:${INK};font-weight:700;">${esc(appUrl.replace(/^https?:\/\//, ""))}</a><br/>` +
+      `2&nbsp;&nbsp;Choose <b>Create account</b>, then <b>Join a team</b><br/>` +
+      `3&nbsp;&nbsp;Enter the invite code above` +
+      `</td></tr>`,
+
+    // ── No-reply note ──
+    `<tr><td style="padding:18px 28px 24px;font-family:${SANS};font-size:12.5px;color:${SUBTLE};line-height:1.6;">` +
+      `This is an automated email from an unmonitored address — please don't reply. ` +
+      `If you weren't expecting this invite, you can ignore it.` +
+      `</td></tr>`,
+
+    // ── Footer: rain strip ──
+    `<tr><td bgcolor="${INK}" style="background:${INK};font-size:0;line-height:0;padding:0;">` +
+      `<a href="${SITE_URL}" target="_blank" rel="noopener" style="display:block;text-decoration:none;">` +
+        `<img src="${FOOTER_IMG_URL}" alt="PrintExec — printexec.xyz" width="600" height="77" ` +
+          `style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none;" />` +
+      `</a>` +
+      `</td></tr>`,
+
+    `</table>`,
+    `</td></tr>`,
+    `</table>`
+  ].join("");
+
+  return { subject, text, html };
+}

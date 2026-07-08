@@ -16,8 +16,10 @@ import { CustomersService } from "./customers.service";
 export class CustomersController {
   constructor(private readonly customersService: CustomersService) { }
 
+  // Cross-module metadata: order intake attaches a customer from this list, so
+  // order staff must read it without the Customers module.
   @Get()
-  @RequirePermission("view_customers")
+  @RequirePermission(["view_customers", "view_orders"])
   listCustomers(
     @CompanyId() companyId: string,
     @Query() query: unknown

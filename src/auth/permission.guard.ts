@@ -10,9 +10,10 @@ import type { AuthRequest } from "./supabase.guard";
 
 /**
  * Runs after SupabaseAuthGuard. If a route is decorated with
- * @RequirePermission('foo'), this guard checks that:
+ * @RequirePermission('foo') / @RequirePermission(['foo','bar']), this guard
+ * checks that:
  *   - the requester is an owner (full bypass), OR
- *   - req.permissions[foo] === true
+ *   - req.permissions[k] === true for ANY listed key
  *
  * Otherwise throws 403 with the route's custom message (or a default).
  * Routes without the decorator are unaffected.
@@ -30,10 +31,10 @@ export class PermissionGuard implements CanActivate {
 
     const req = ctx.switchToHttp().getRequest<AuthRequest>();
     if (req.userRole === "owner") return true;
-    if (req.permissions?.[meta.permission] === true) return true;
+    if (meta.permissions.some((p) => req.permissions?.[p] === true)) return true;
 
     throw new ForbiddenException(
-      meta.message ?? `Missing required permission: ${meta.permission}`,
+      meta.message ?? `Missing required permission: ${meta.permissions.join(" or ")}`,
     );
   }
 }

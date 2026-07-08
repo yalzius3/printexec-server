@@ -29,8 +29,10 @@ import { AssetsService } from "./assets.service";
 export class AssetsController {
   constructor(private readonly assetsService: AssetsService) {}
 
+  // Cross-module metadata: the piece editors (orders/jobs) pick materials from
+  // this catalogue, so order staff must read it without Assets access.
   @Get("filament-references")
-  @RequirePermission("view_assets")
+  @RequirePermission(["view_assets", "view_orders"])
   listFilamentReferences(@Query() query: unknown) {
     return this.assetsService.listFilamentReferences(
       parseWithSchema(listFilamentReferencesQuerySchema, query)
@@ -77,15 +79,17 @@ export class AssetsController {
   // used by the piece editor + scheduler so the operator picks an actual spool,
   // not an abstract catalogue reference.
   @Get("spools")
-  @RequirePermission("view_assets")
+  @RequirePermission(["view_assets", "view_orders"])
   listSpoolInventory(@CompanyId() companyId: string) {
     return this.assetsService.listSpoolInventory(companyId);
   }
 
   // Average filament price per gram per material — used by piece-cost estimates.
   // Declared before :assetId so the static path isn't swallowed as an id.
+  // Cross-module metadata: quotations (orders module) are priced from this —
+  // an order staff member without Assets access must still get price data.
   @Get("material-pricing")
-  @RequirePermission("view_assets")
+  @RequirePermission(["view_assets", "view_orders"])
   listMaterialPricing(@CompanyId() companyId: string) {
     return this.assetsService.listMaterialPricing(companyId);
   }
