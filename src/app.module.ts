@@ -6,6 +6,7 @@ import { AuthModule } from "./auth/auth.module";
 import { CustomersModule } from "./customers/customers.module";
 import { DatabaseModule } from "./database/database.module";
 import { EmailModule } from "./email/email.module";
+import { FinanceModule } from "./finance/finance.module";
 import { HealthController } from "./health/health.controller";
 import { BedsModule } from "./beds/beds.module";
 import { JobsModule } from "./jobs/jobs.module";
@@ -31,6 +32,7 @@ import { LicenseGuard } from "./licensing/license.guard";
     BedsModule,
     CustomersModule,
     EmailModule,
+    FinanceModule,
     JobsModule,
     LicensingModule,
     MaintenanceModule,
