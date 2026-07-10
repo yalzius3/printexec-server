@@ -10,6 +10,7 @@ import {
   reevaluateBedAfterPieceRemoval,
   recomputeOrderStatusTx,
   markPrinterPrintingTx,
+  propagateSlicerMetaToDuplicatesTx,
   releasePrinterForPieceTx
 } from "../common/cascade";
 import type {
@@ -567,6 +568,10 @@ export class JobsService {
         op.slicer_filament_used_grams,
         op.slicer_file_url,
         op.cost,
+        -- Quote inputs (time minutes + per-slot grams) captured while costing
+        -- the piece — the client uses them as ASSUMED slicer values until a
+        -- sliced file or manual entry overrides them.
+        op.cost_inputs,
         o.profit_pct AS order_profit_pct,
         ${stlProjection},
         ${thumbProjection},
@@ -1236,6 +1241,10 @@ export class JobsService {
       );
     }
 
+    // Literal duplicates of this piece (same order/name/spec, metadata still
+    // missing) inherit the confirmed time/grams — enter it once, cover the run.
+    await propagateSlicerMetaToDuplicatesTx(this.databaseService, companyId, pieceId);
+
     return this.loadJob(companyId, pieceId);
   }
 
@@ -1331,6 +1340,51 @@ export class JobsService {
       `UPDATE order_pieces SET ${sets.join(", ")}
         WHERE company_id = $1 AND piece_id = $2`,
       values
+    );
+    // Fresh metadata flows to any still-empty duplicates of this piece.
+    if (touchedSlicerMeta) {
+      await propagateSlicerMetaToDuplicatesTx(this.databaseService, companyId, pieceId);
+    }
+    return this.loadJob(companyId, pieceId);
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/jobs/:pieceId/nozzle
+  // Swap the assigned nozzle in place — no wizard round-trip. Only nozzles
+  // from the assigned printer's compatibility table are accepted, and only
+  // while the piece hasn't been committed to the timeline yet.
+  // ──────────────────────────────────────────────────────────
+  async setNozzle(
+    companyId: string,
+    pieceId: string,
+    nozzleAssetId: string
+  ): Promise<JobRow> {
+    const piece = await this.loadJob(companyId, pieceId);
+    if (!piece.assigned_printer_id) {
+      throw new ConflictException("Assign a printer before choosing a nozzle.");
+    }
+    if (piece.status !== "assigned" && piece.status !== "ready") {
+      throw new ConflictException(
+        `The nozzle can only be changed on an 'assigned' or 'ready' piece (current: '${piece.status}'). Unschedule it first.`
+      );
+    }
+    const compat = await this.databaseService.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM printer_nozzle_compatibility
+          WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
+       ) AS exists`,
+      [companyId, piece.assigned_printer_id, nozzleAssetId]
+    );
+    if (!compat.rows[0]?.exists) {
+      throw new BadRequestException(
+        "Selected nozzle is not compatible with this piece's assigned printer."
+      );
+    }
+    await this.databaseService.query(
+      `UPDATE order_pieces
+          SET assigned_nozzle_asset_id = $3
+        WHERE company_id = $1 AND piece_id = $2`,
+      [companyId, pieceId, nozzleAssetId]
     );
     return this.loadJob(companyId, pieceId);
   }

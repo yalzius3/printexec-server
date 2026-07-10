@@ -22,6 +22,10 @@ import {
   timelineQuerySchema,
   updatePieceFilesSchema,
 } from "./jobs.schemas";
+import { z } from "zod";
+
+// Inline: the one-field nozzle swap payload.
+const setNozzleSchema = z.object({ nozzle_asset_id: z.string().uuid() });
 
 /**
  * The Jobs API surfaces are the front door for the assignment + scheduling
@@ -153,6 +157,22 @@ export class JobsController {
     @Param("pieceId") pieceId: string
   ) {
     return this.jobsService.unassign(companyId, pieceId);
+  }
+
+  // Swap the assigned nozzle in place (assigned/ready pieces only). The nozzle
+  // must come from the assigned printer's compatibility table.
+  @Post(":pieceId/nozzle")
+  @RequirePermission("action_orders")
+  setNozzle(
+    @CompanyId() companyId: string,
+    @Param("pieceId") pieceId: string,
+    @Body() body: unknown
+  ) {
+    return this.jobsService.setNozzle(
+      companyId,
+      pieceId,
+      parseWithSchema(setNozzleSchema, body).nozzle_asset_id
+    );
   }
 
   // ── Spool reservation (binds physical spool instance(s) + reserves grams) ──

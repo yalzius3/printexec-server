@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import type { z } from "zod";
 import { revertPrinterAssignmentsTx } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
@@ -906,7 +906,32 @@ export class PrintersService {
   async deletePrinter(companyId: string, printerId: string) {
     await this.getPrinterById(companyId, printerId);
 
+    // Refuse to delete a printer with an active print (piece or bed) — deleting
+    // it mid-run would orphan the in-flight print. The operator must complete or
+    // stop it first.
+    const active = await this.databaseService.query(
+      `SELECT 1 FROM order_pieces
+        WHERE company_id = $1 AND assigned_printer_id = $2 AND status = 'printing'
+       UNION ALL
+       SELECT 1 FROM print_beds
+        WHERE company_id = $1 AND assigned_printer_id = $2 AND status = 'printing'
+       LIMIT 1`,
+      [companyId, printerId]
+    );
+    if (active.rowCount) {
+      throw new ConflictException(
+        "This printer has an active print. Complete or stop it before deleting the printer."
+      );
+    }
+
     await this.databaseService.transaction(async (client) => {
+      // 0. Send every piece/bed still committed to this printer (assigned /
+      //    ready / scheduled) back to the unassigned pool and release their
+      //    filament reservations, re-deriving each touched order's status.
+      //    Without this, deleting the printer leaves those rows pointing at a
+      //    gone machine (dangling assigned_printer_id).
+      await revertPrinterAssignmentsTx(client, companyId, printerId);
+
       // 1. Delete printer nozzle compatibility
       await client.query(`
         DELETE FROM printer_nozzle_compatibility

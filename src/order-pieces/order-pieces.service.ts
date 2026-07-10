@@ -4,7 +4,8 @@ import { recordOrderHistory } from "../common/order-history";
 import {
   releasePieceSpoolsTx,
   reevaluateBedAfterPieceRemoval,
-  recomputeOrderStatusTx
+  recomputeOrderStatusTx,
+  releasePrinterForPieceTx
 } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { materialFamily, sameColor } from "../jobs/jobs.service";
@@ -544,6 +545,15 @@ export class OrderPiecesService {
       // Return any reserved filament to stock before the row disappears.
       await releasePieceSpoolsTx(client, companyId, pieceId);
 
+      // Force-deleting a 'printing' piece (Jobs "delete anything" path) must
+      // first release the printer lock it holds — otherwise printer_stock keeps
+      // is_in_use = TRUE with a dangling currently_printing_piece_id, stranding
+      // the machine and risking a CHECK-constraint 500 when the FK nulls out.
+      // No-op unless this piece actually holds the lock.
+      if (currentPiece.status === "printing" && currentPiece.assigned_printer_id) {
+        await releasePrinterForPieceTx(client, companyId, currentPiece.assigned_printer_id, pieceId);
+      }
+
       await this.databaseService.query(
         `
           DELETE FROM order_pieces
@@ -582,7 +592,7 @@ export class OrderPiecesService {
     const uniqueIds = [...new Set(pieceIds)];
 
     // Same guards the single delete applies, validated up front.
-    const pieces: Array<{ piece_id: string; order_id: string; bed_id: string | null; piece_name: string; status: string }> = [];
+    const pieces: Array<{ piece_id: string; order_id: string; bed_id: string | null; piece_name: string; status: string; assigned_printer_id: string | null }> = [];
     for (const pieceId of uniqueIds) {
       const piece = await this.getPieceById(companyId, pieceId);
       const order = await this.assertOrderExists(companyId, piece.order_id);
@@ -603,6 +613,11 @@ export class OrderPiecesService {
 
       for (const piece of pieces) {
         await releasePieceSpoolsTx(client, companyId, piece.piece_id);
+        // Release the printer lock for any piece still 'printing' before its
+        // row is deleted (see deletePiece). No-op unless it holds the lock.
+        if (piece.status === "printing" && piece.assigned_printer_id) {
+          await releasePrinterForPieceTx(client, companyId, piece.assigned_printer_id, piece.piece_id);
+        }
         await this.databaseService.query(
           `DELETE FROM order_pieces WHERE company_id = $1 AND piece_id = $2`,
           [companyId, piece.piece_id],

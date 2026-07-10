@@ -438,6 +438,88 @@ export async function revertPrinterAssignmentsTx(
 }
 
 /**
+ * Quote-assumed slicer metadata: the numbers the operator typed while COSTING
+ * the piece (cost_inputs.time minutes + per-slot grams). They are the best
+ * available estimate until a sliced file overrides them, so assignment flows
+ * seed slicer_print_time_minutes / slicer_filament_used_grams from them
+ * instead of leaving the piece stuck without schedulable metadata.
+ */
+export function quoteAssumedMeta(
+  costInputs: { grams?: string[]; time?: string; failure?: string } | null | undefined
+): { minutes: number | null; grams: number | null } {
+  if (!costInputs) return { minutes: null, grams: null };
+  const rawMinutes = Number(costInputs.time);
+  const minutes = Number.isFinite(rawMinutes) && rawMinutes > 0 ? Math.round(rawMinutes) : null;
+  const total = (costInputs.grams ?? []).reduce((sum, g) => {
+    const n = Number(g);
+    return sum + (Number.isFinite(n) && n > 0 ? n : 0);
+  }, 0);
+  const grams = total > 0 ? Math.round(total * 100) / 100 : null;
+  return { minutes, grams };
+}
+
+/**
+ * Copy slicer metadata (print time + filament grams — NOT the file) from one
+ * piece to its literal duplicates: same order, same name, same spec, still
+ * below 'ready', metadata missing. Slicing is deterministic, so two identical
+ * pieces consume identical time/filament — entering it once should cover both.
+ *
+ * Fills only what's missing (COALESCE keeps operator-entered values) and flips
+ * an 'assigned' duplicate that now has printer + nozzle + both numbers to
+ * 'ready'. Multicolor pieces are excluded: their per-slot grams must stay in
+ * sync with the piece total, which a flat copy can't guarantee.
+ *
+ * Best-effort by design — callers treat a failure (e.g. bed_id column not yet
+ * migrated) as non-critical and move on.
+ */
+export async function propagateSlicerMetaToDuplicatesTx(
+  executor: Queryable,
+  companyId: string,
+  pieceId: string
+): Promise<string[]> {
+  try {
+    const res = await executor.query<{ piece_id: string }>(
+      `
+        UPDATE order_pieces dup
+           SET slicer_print_time_minutes  = COALESCE(dup.slicer_print_time_minutes,  src.slicer_print_time_minutes),
+               slicer_filament_used_grams = COALESCE(dup.slicer_filament_used_grams, src.slicer_filament_used_grams),
+               status = CASE
+                 WHEN dup.status = 'assigned'
+                  AND dup.assigned_printer_id IS NOT NULL
+                  AND dup.assigned_nozzle_asset_id IS NOT NULL
+                  AND COALESCE(dup.slicer_print_time_minutes,  src.slicer_print_time_minutes)  IS NOT NULL
+                  AND COALESCE(dup.slicer_filament_used_grams, src.slicer_filament_used_grams) IS NOT NULL
+                 THEN 'ready'
+                 ELSE dup.status
+               END
+          FROM order_pieces src
+         WHERE src.company_id = $1 AND src.piece_id = $2
+           AND (src.slicer_print_time_minutes IS NOT NULL OR src.slicer_filament_used_grams IS NOT NULL)
+           AND dup.company_id = src.company_id
+           AND dup.order_id   = src.order_id
+           AND dup.piece_id  <> src.piece_id
+           AND dup.bed_id IS NULL
+           AND LOWER(TRIM(dup.piece_name)) = LOWER(TRIM(src.piece_name))
+           AND dup.status IN ('pending', 'assigned')
+           AND (dup.slicer_print_time_minutes IS NULL OR dup.slicer_filament_used_grams IS NULL)
+           AND dup.required_print_technology    IS NOT DISTINCT FROM src.required_print_technology
+           AND dup.required_filament_ref_id     IS NOT DISTINCT FROM src.required_filament_ref_id
+           AND dup.required_filament_material   IS NOT DISTINCT FROM src.required_filament_material
+           AND dup.required_nozzle_diameter_mm  IS NOT DISTINCT FROM src.required_nozzle_diameter_mm
+           AND dup.required_nozzle_material     IS NOT DISTINCT FROM src.required_nozzle_material
+           AND COALESCE(dup.requires_multicolor, false) = false
+           AND COALESCE(src.requires_multicolor, false) = false
+         RETURNING dup.piece_id
+      `,
+      [companyId, pieceId]
+    );
+    return res.rows.map((r) => r.piece_id);
+  } catch {
+    return []; // propagation is a convenience, never a blocker
+  }
+}
+
+/**
  * Mark a printer as actively printing. `printer_stock` enforces CHECK
  * constraints that bind `is_in_use` to its companion columns, so the flag can
  * never be flipped in isolation:

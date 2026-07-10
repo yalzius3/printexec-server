@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import type { z } from "zod";
 import { recordOrderHistory } from "../common/order-history";
-import { reevaluateBedAfterPieceRemoval } from "../common/cascade";
+import { reevaluateBedAfterPieceRemoval, releasePrinterForPieceTx } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import { CustomersService } from "../customers/customers.service";
@@ -799,15 +799,28 @@ export class OrdersService {
 
     await this.databaseService.transaction(async (client) => {
       // Snapshot pieces before cascading so they can be logged individually.
-      const pieces = await client.query<{ piece_id: string; piece_name: string; bed_id: string | null }>(
+      const pieces = await client.query<{ piece_id: string; piece_name: string; bed_id: string | null; status: string; assigned_printer_id: string | null }>(
         `
-          SELECT piece_id, piece_name, bed_id
+          SELECT piece_id, piece_name, bed_id, status, assigned_printer_id
           FROM order_pieces
           WHERE order_id = $1
             AND company_id = $2
         `,
         [orderId, companyId]
       );
+
+      // 0. Release the printer lock held by any piece that is actively printing
+      //    BEFORE its row is deleted. Otherwise printer_stock keeps is_in_use =
+      //    TRUE with a now-dangling currently_printing_piece_id/order_id, which
+      //    both strands the machine as "busy" and can trip the is_in_use CHECK
+      //    constraints (chk_project_while_in_use) when the FK nulls out — a 500
+      //    on the delete itself. releasePrinterForPieceTx is a no-op unless this
+      //    piece actually holds the lock, so it's safe to call for every printer.
+      for (const p of pieces.rows) {
+        if (p.status === "printing" && p.assigned_printer_id) {
+          await releasePrinterForPieceTx(client, companyId, p.assigned_printer_id, p.piece_id);
+        }
+      }
 
       // 1. Delete spool allocations on the order's pieces.
       await client.query(`

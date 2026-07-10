@@ -1,6 +1,11 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
-import { recomputeOrderStatusTx, releasePrinterForPieceTx } from "../common/cascade";
+import {
+  propagateSlicerMetaToDuplicatesTx,
+  quoteAssumedMeta,
+  recomputeOrderStatusTx,
+  releasePrinterForPieceTx,
+} from "../common/cascade";
 
 // Simple mode treats both resin technologies as one family — assigning an SLA
 // part to an MSLA printer (or vice-versa) is fine; only cross-family is
@@ -165,10 +170,13 @@ export class SimpleJobsService {
       required_nozzle_diameter_mm: number | null;
       required_nozzle_material: string | null;
       status: string;
+      requires_multicolor: boolean | null;
+      cost_inputs: { grams?: string[]; time?: string; failure?: string } | null;
     }>(
       `
         SELECT piece_id, piece_name, required_print_technology,
-               required_nozzle_diameter_mm, required_nozzle_material, status
+               required_nozzle_diameter_mm, required_nozzle_material, status,
+               requires_multicolor, cost_inputs
         FROM order_pieces
         WHERE company_id = $1
           AND piece_id = ANY($2::uuid[])
@@ -177,9 +185,13 @@ export class SimpleJobsService {
     );
 
     const skipped: { piece_id: string; piece_name: string; reason: string }[] = [];
-    // Group assignable pieces by the nozzle they resolve to so each distinct
-    // nozzle is a single UPDATE (key null = no nozzle resolved → keep existing).
-    const byNozzle = new Map<string | null, string[]>();
+    // Group assignable pieces by (nozzle, assumed time, assumed grams) so each
+    // distinct combination is a single UPDATE (nozzle null = none resolved →
+    // keep existing).
+    type SeedGroup = { nozzle: string | null; minutes: number | null; grams: number | null; ids: string[] };
+    const groups = new Map<string, SeedGroup>();
+    // Multicolor pieces whose quote grams can seed the per-slot demand.
+    const slotSeeds: { piece_id: string; grams: number[] }[] = [];
     let assignedCount = 0;
     for (const piece of pieceResult.rows) {
       if (piece.status === "printing" || piece.status === "done") {
@@ -206,48 +218,102 @@ export class SimpleJobsService {
         piece.required_nozzle_diameter_mm,
         piece.required_nozzle_material
       );
-      const arr = byNozzle.get(nozzle) ?? [];
-      arr.push(piece.piece_id);
-      byNozzle.set(nozzle, arr);
+      // Seed the schedulable metadata from the piece's QUOTE (the time + grams
+      // the operator entered while costing it in the Orders page). These are
+      // assumed values — a later g-code drop or manual edit overrides them —
+      // but they let a quoted piece land 'ready' in this single click instead
+      // of parking at 'assigned' until someone re-types numbers that already
+      // exist. Pieces with no quote keep the old NULL wipe.
+      const assumed = quoteAssumedMeta(piece.cost_inputs);
+      const key = `${nozzle ?? ""}|${assumed.minutes ?? ""}|${assumed.grams ?? ""}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = { nozzle, minutes: assumed.minutes, grams: assumed.grams, ids: [] };
+        groups.set(key, g);
+      }
+      g.ids.push(piece.piece_id);
+      if (piece.requires_multicolor && piece.cost_inputs?.grams?.length) {
+        const slotGrams = piece.cost_inputs.grams.map((v) => Number(v));
+        if (slotGrams.every((n) => Number.isFinite(n) && n > 0)) {
+          slotSeeds.push({ piece_id: piece.piece_id, grams: slotGrams });
+        }
+      }
       assignedCount++;
     }
 
-    // One UPDATE per resolved nozzle. Mark the pieces 'assigned' (so the queue
-    // shows it and the Schedule button unlocks) and stamp the per-piece nozzle so
-    // the schedule wizard has everything it needs. COALESCE keeps any nozzle
-    // already on the piece when none could be resolved (printer has no nozzle).
-    for (const [nozzle, ids] of byNozzle) {
-      if (ids.length === 0) continue;
+    // One UPDATE per (nozzle, seed) group. Mark the pieces 'assigned' — or
+    // straight to 'ready' when the quote supplied both numbers — and stamp the
+    // per-piece nozzle so the schedule wizard has everything it needs. COALESCE
+    // keeps any nozzle already on the piece when none could be resolved
+    // (printer has no nozzle). The slicer FILE is still cleared: a fresh
+    // assignment must never resurrect a previous session's g-code.
+    for (const g of groups.values()) {
+      if (g.ids.length === 0) continue;
       await this.db.query(
         `
           UPDATE order_pieces
           SET assigned_printer_id = $3,
               assigned_nozzle_asset_id = COALESCE($4::uuid, assigned_nozzle_asset_id),
-              -- A fresh assignment starts with NO slicer file. Pending pieces can
-              -- still carry a stale slicer_file_url (a prior unassign keeps it),
-              -- which would make the piece look already-schedulable with last
-              -- session's g-code. Clear it so a g-code is only ever present once
-              -- it's been explicitly dropped/attached for THIS assignment.
               slicer_file_url            = NULL,
               slicer_file_uploaded_at    = NULL,
-              slicer_print_time_minutes  = NULL,
-              slicer_filament_used_grams = NULL,
+              slicer_print_time_minutes  = $5,
+              slicer_filament_used_grams = $6,
               status = CASE
-                -- Flip to 'assigned' once the piece has both a printer and a
-                -- nozzle (the wizard/scheduler need both). If no nozzle could be
-                -- resolved, leave the status as-is rather than risk an
-                -- inconsistent 'assigned' with no nozzle.
+                -- 'ready' needs (printer, nozzle, time, grams) per
+                -- chk_ready_requires_core_data; 'assigned' needs printer +
+                -- nozzle. If no nozzle could be resolved, leave the status
+                -- as-is rather than risk an inconsistent 'assigned'.
+                WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL
+                 AND $5::int IS NOT NULL AND $6::numeric IS NOT NULL THEN 'ready'
                 WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL THEN 'assigned'
                 ELSE status
               END
           WHERE company_id = $1
             AND piece_id = ANY($2::uuid[])
         `,
-        [companyId, ids, printerId, nozzle]
+        [companyId, g.ids, printerId, g.nozzle, g.minutes, g.grams]
       );
     }
 
-    return { assigned: assignedCount, skipped };
+    // Multicolor: mirror the quote's per-slot grams into the color slots (only
+    // where still unset, and only when the quote has one figure per slot) so
+    // the spool planner sees the same assumed demand.
+    for (const seed of slotSeeds) {
+      const slotCount = await this.db.query<{ n: string }>(
+        `SELECT COUNT(*) AS n FROM order_piece_color_slots WHERE company_id = $1 AND piece_id = $2`,
+        [companyId, seed.piece_id]
+      );
+      if (Number(slotCount.rows[0]?.n) !== seed.grams.length) continue;
+      for (let i = 0; i < seed.grams.length; i++) {
+        await this.db.query(
+          `UPDATE order_piece_color_slots cs
+              SET slicer_grams = $3
+             FROM (
+               SELECT color_slot_id, ROW_NUMBER() OVER (ORDER BY sequence_order) AS rn
+                 FROM order_piece_color_slots
+                WHERE company_id = $1 AND piece_id = $2
+             ) ordered
+            WHERE cs.color_slot_id = ordered.color_slot_id
+              AND ordered.rn = $4
+              AND cs.slicer_grams IS NULL`,
+          [companyId, seed.piece_id, seed.grams[i], i + 1]
+        );
+      }
+    }
+
+    // The picker chains straight into scheduling for pieces that are already
+    // 'ready' (quote-seeded) — report which ones those are.
+    const readyRes = await this.db.query<{ piece_id: string }>(
+      `SELECT piece_id FROM order_pieces
+        WHERE company_id = $1 AND piece_id = ANY($2::uuid[]) AND status = 'ready'`,
+      [companyId, pieceIds]
+    );
+
+    return {
+      assigned: assignedCount,
+      skipped,
+      ready_ids: readyRes.rows.map((r) => r.piece_id),
+    };
   }
 
   // Bulk g-code drop: attach a slicer file (+ parsed time/grams) to each
@@ -327,16 +393,26 @@ export class SimpleJobsService {
       updated.push(item.piece_id);
     }
 
-    return { updated: updated.length, updated_ids: updated, skipped };
+    // Literal duplicates of the updated pieces (same order/name/spec, still
+    // missing metadata) inherit the time/grams — one drop covers the whole run.
+    const propagated = new Set<string>();
+    for (const id of updated) {
+      for (const dupId of await propagateSlicerMetaToDuplicatesTx(this.db, companyId, id)) {
+        propagated.add(dupId);
+      }
+    }
+
+    return { updated: updated.length, updated_ids: updated, skipped, propagated_ids: [...propagated] };
   }
 
-  // Bulk-unassign: for every piece on the selected printers whose status is
-  // BELOW printing (assigned / ready / scheduled), drop the printer + nozzle,
-  // clear any schedule window + the slicer file, release reserved spools, and
-  // return it to 'pending'. Printing/done/failed/cancelled pieces are left
+  // Bulk-unassign: for the targeted pieces — selected individually and/or as
+  // "everything on these printers" — whose status is BELOW printing
+  // (assigned / ready / scheduled), drop the printer + nozzle, clear any
+  // schedule window + the slicer file, release reserved spools, and return
+  // them to 'pending'. Printing/done/failed/cancelled pieces are left
   // untouched. Clearing the slicer is deliberate: a re-assigned piece must start
   // clean rather than resurrect a previous session's g-code.
-  async bulkUnassign(companyId: string, printerIds: string[]) {
+  async bulkUnassign(companyId: string, printerIds: string[], explicitPieceIds: string[] = []) {
     let unassigned = 0;
     await this.db.transaction(async (client) => {
       const found = await client.query<{ piece_id: string }>(
@@ -344,10 +420,14 @@ export class SimpleJobsService {
           SELECT piece_id
           FROM order_pieces
           WHERE company_id = $1
-            AND assigned_printer_id = ANY($2::uuid[])
+            AND assigned_printer_id IS NOT NULL
             AND status IN ('assigned', 'ready', 'scheduled')
+            AND (
+              assigned_printer_id = ANY($2::uuid[])
+              OR piece_id = ANY($3::uuid[])
+            )
         `,
-        [companyId, printerIds]
+        [companyId, printerIds, explicitPieceIds]
       );
       const pieceIds = found.rows.map((r) => r.piece_id);
       if (pieceIds.length === 0) return;
@@ -585,7 +665,8 @@ export class SimpleJobsService {
     companyId: string,
     horizon: "day" | "week" | "month" | "deadline",
     deadlineIso?: string,
-    pieceIds?: string[]
+    pieceIds?: string[],
+    bedId?: string
   ) {
     const now = new Date();
     const dayMs = 24 * 60 * 60 * 1000;
@@ -645,6 +726,39 @@ export class SimpleJobsService {
             label: [dia != null ? `${dia}mm` : null, mat].filter(Boolean).join(" ") || "Any nozzle",
             piece_count: 1,
           });
+      }
+    }
+    // Bed target: requirements come from the bed row itself (single tech,
+    // single nozzle spec spanning the whole plate).
+    if (bedId) {
+      const bedRes = await this.db.query<{
+        required_print_technology: string | null;
+        required_multicolor_capable: boolean | null;
+        required_nozzle_diameter_mm: number | null;
+        required_nozzle_material: string | null;
+      }>(
+        `
+          SELECT required_print_technology, required_multicolor_capable,
+                 required_nozzle_diameter_mm, required_nozzle_material
+          FROM print_beds
+          WHERE company_id = $1 AND bed_id = $2
+        `,
+        [companyId, bedId]
+      );
+      for (const r of bedRes.rows) {
+        if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
+        if (r.required_multicolor_capable) requireMulticolor = true;
+        const dia = r.required_nozzle_diameter_mm != null ? Number(r.required_nozzle_diameter_mm) : null;
+        const mat = r.required_nozzle_material;
+        if (dia == null && !mat) continue;
+        const key = reqKey(dia, mat);
+        nozzleReq.set(key, {
+          key,
+          diameter_mm: dia,
+          material: mat,
+          label: [dia != null ? `${dia}mm` : null, mat].filter(Boolean).join(" ") || "Any nozzle",
+          piece_count: 1,
+        });
       }
     }
     const requirements = Array.from(nozzleReq.values()).sort(
@@ -728,6 +842,46 @@ export class SimpleJobsService {
       params
     );
 
+    // Beds occupy printers too — fold their scheduled/printing blocks into the
+    // same "busy until / busy minutes" figures so a printer running a packed
+    // plate doesn't read as free. Merged in JS to keep the piece query simple.
+    const bedBusy = new Map<string, { running_until: string | null; busy_minutes: number }>();
+    try {
+      const bedBusyRes = await this.db.query<{
+        printer_id: string;
+        running_until: string | null;
+        busy_minutes: string | number;
+      }>(
+        `
+          SELECT
+            pb.assigned_printer_id AS printer_id,
+            MAX(CASE WHEN pb.scheduled_start_at <= now() AND pb.scheduled_end_at > now()
+                     THEN pb.scheduled_end_at END) AS running_until,
+            COALESCE(SUM(
+              EXTRACT(EPOCH FROM (
+                LEAST(pb.scheduled_end_at, $2::timestamptz) - GREATEST(pb.scheduled_start_at, now())
+              )) / 60.0
+            ) FILTER (
+              WHERE pb.scheduled_end_at > now() AND pb.scheduled_start_at < $2::timestamptz
+            ), 0) AS busy_minutes
+          FROM print_beds pb
+          WHERE pb.company_id = $1
+            AND pb.assigned_printer_id IS NOT NULL
+            AND pb.status IN ('scheduled', 'printing')
+            AND pb.scheduled_start_at IS NOT NULL
+            AND pb.scheduled_end_at IS NOT NULL
+          GROUP BY pb.assigned_printer_id
+        `,
+        [companyId, windowEnd.toISOString()]
+      );
+      for (const r of bedBusyRes.rows) {
+        bedBusy.set(r.printer_id, {
+          running_until: r.running_until,
+          busy_minutes: Number(r.busy_minutes) || 0,
+        });
+      }
+    } catch { /* print_beds not migrated yet — piece blocks alone are correct */ }
+
     // Compatible nozzles per printer, so the picker can let the operator choose
     // one explicitly. Ordered smallest-diameter first; available stock first.
     const nozzlesResult = await this.db.query<{
@@ -777,7 +931,13 @@ export class SimpleJobsService {
 
     const windowMinutes = (windowEnd.getTime() - now.getTime()) / 60000;
     const printers = result.rows.map((r) => {
-      const busy = Number(r.busy_minutes) || 0;
+      const fromBeds = bedBusy.get(r.printer_id);
+      const busy = (Number(r.busy_minutes) || 0) + (fromBeds?.busy_minutes ?? 0);
+      // Next idle = when the LAST currently-running block (piece or bed) ends.
+      const runningUntil = [r.running_until, fromBeds?.running_until ?? null]
+        .filter((v): v is string => !!v)
+        .sort()
+        .pop() ?? null;
       const nozzles = nozzlesByPrinter.get(r.printer_id) ?? [];
       // Which requirements this printer can satisfy (has ≥1 compatible nozzle),
       // and the subset whose matching nozzle is actually AVAILABLE right now.
@@ -793,8 +953,8 @@ export class SimpleJobsService {
         printer_id: r.printer_id,
         brand: r.brand,
         model: r.model,
-        // null = idle now; otherwise when the current block ends.
-        next_idle_at: r.running_until,
+        // null = idle now; otherwise when the current block (piece or bed) ends.
+        next_idle_at: runningUntil,
         free_minutes: Math.max(0, Math.round(windowMinutes - busy)),
         nozzles,
         satisfied_keys: [...satisfiedKeys],

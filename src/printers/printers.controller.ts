@@ -9,6 +9,7 @@ import {
   Query
 } from "@nestjs/common";
 import { CompanyId } from "../common/company-id.decorator";
+import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import {
   addCompatibleNozzleSchema,
@@ -26,6 +27,7 @@ export class PrintersController {
   constructor(private readonly printersService: PrintersService) {}
 
   @Get("references")
+  @RequirePermission(["view_assets", "view_orders"])
   listPrinterReferences(@Query() query: unknown) {
     return this.printersService.listPrinterReferences(
       parseWithSchema(listPrinterReferencesQuerySchema, query)
@@ -33,6 +35,7 @@ export class PrintersController {
   }
 
   @Post("references")
+  @RequirePermission("action_assets")
   createPrinterReference(
     @CompanyId() companyId: string,
     @Body() body: unknown
@@ -44,11 +47,13 @@ export class PrintersController {
   }
 
   @Get("nozzle-options")
+  @RequirePermission(["view_assets", "view_orders"])
   listNozzleOptions(@CompanyId() companyId: string) {
     return this.printersService.listNozzleOptions(companyId);
   }
 
   @Get()
+  @RequirePermission(["view_assets", "view_orders"])
   listPrinters(
     @CompanyId() companyId: string,
     @Query() query: unknown
@@ -60,6 +65,7 @@ export class PrintersController {
   }
 
   @Get(":printerId")
+  @RequirePermission(["view_assets", "view_orders"])
   getPrinter(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string
@@ -68,6 +74,7 @@ export class PrintersController {
   }
 
   @Post()
+  @RequirePermission("action_assets")
   createPrinter(
     @CompanyId() companyId: string,
     @Body() body: unknown
@@ -79,6 +86,7 @@ export class PrintersController {
   }
 
   @Patch(":printerId")
+  @RequirePermission("action_assets")
   updatePrinter(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string,
@@ -92,6 +100,7 @@ export class PrintersController {
   }
 
   @Patch(":printerId/stock")
+  @RequirePermission("action_assets")
   updatePrinterStock(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string,
@@ -105,6 +114,7 @@ export class PrintersController {
   }
 
   @Get(":printerId/nozzle-compatibility")
+  @RequirePermission(["view_assets", "view_orders"])
   listNozzleCompatibility(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string
@@ -113,6 +123,7 @@ export class PrintersController {
   }
 
   @Post(":printerId/nozzle-compatibility")
+  @RequirePermission("action_assets")
   addNozzleCompatibility(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string,
@@ -126,6 +137,7 @@ export class PrintersController {
   }
 
   @Delete(":printerId/nozzle-compatibility/:nozzleAssetId")
+  @RequirePermission("action_assets")
   removeNozzleCompatibility(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string,
@@ -139,6 +151,7 @@ export class PrintersController {
   }
 
   @Delete(":printerId")
+  @RequirePermission("action_assets")
   deletePrinter(
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string

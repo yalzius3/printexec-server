@@ -26,11 +26,16 @@ const uuid = z.string().uuid();
 const assignBedSchema = z.object({
   printer_id: uuid,
   nozzle_asset_id: uuid,
-  slicer_print_time_minutes: z.number().int().positive().max(100_000),
+  // Optional: when omitted the service keeps the bed's existing time, or seeds
+  // an assumed value from the constituent pieces' quote numbers.
+  slicer_print_time_minutes: z.number().int().positive().max(100_000).nullable().optional(),
   slicer_file_url: z.string().min(1).nullable().optional(),
   stl_file_url: z.string().min(1).nullable().optional(),
   slicer_filament_used_grams: z.number().positive().max(100_000).nullable().optional(),
 }).strict();
+
+// One-field nozzle swap (assigned/ready beds; printer's compat table only).
+const bedNozzleSchema = z.object({ nozzle_asset_id: uuid }).strict();
 
 const scheduleBedSchema = z.object({
   start_at: z.string().datetime({ offset: true }),
@@ -154,6 +159,20 @@ export class BedsController {
     @Body() body: unknown
   ) {
     return this.beds.assign(companyId, bedId, parseWithSchema(assignBedSchema, body));
+  }
+
+  @Post(":bedId/nozzle")
+  @RequirePermission("action_orders")
+  setNozzle(
+    @CompanyId() companyId: string,
+    @Param("bedId") bedId: string,
+    @Body() body: unknown
+  ) {
+    return this.beds.setNozzle(
+      companyId,
+      bedId,
+      parseWithSchema(bedNozzleSchema, body).nozzle_asset_id
+    );
   }
 
   @Post(":bedId/schedule")

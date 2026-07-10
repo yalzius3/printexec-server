@@ -23,12 +23,20 @@ const availabilitySchema = z.object({
   // Comma-separated piece ids being assigned — used to show only the printers
   // compatible with ALL of them (technology + multicolor; offline omitted).
   pieces: z.string().max(20000).optional(),
+  // Alternatively a bed id — requirements come from the bed row instead.
+  bed: z.string().uuid().optional(),
 });
 
-// Bulk-unassign every below-printing piece on the selected printers.
-const bulkUnassignSchema = z.object({
-  printer_ids: z.array(z.string().uuid()).min(1).max(500),
-});
+// Bulk-unassign below-printing work: individual pieces and/or whole printers
+// (every below-printing piece on them). At least one target required.
+const bulkUnassignSchema = z
+  .object({
+    printer_ids: z.array(z.string().uuid()).max(500).default([]),
+    piece_ids: z.array(z.string().uuid()).max(1000).default([]),
+  })
+  .refine((v) => v.printer_ids.length > 0 || v.piece_ids.length > 0, {
+    message: "Select at least one piece or printer to unassign.",
+  });
 
 // Mark a printing/done piece as a failed run: record the wasted filament per
 // reserved spool, then re-queue the piece to 'assigned' or 'pending'.
@@ -86,9 +94,9 @@ export class SimpleJobsController {
   @Get("printer-availability")
   @RequirePermission("view_orders")
   availability(@CompanyId() companyId: string, @Query() query: unknown) {
-    const { horizon, deadline, pieces } = parseWithSchema(availabilitySchema, query);
+    const { horizon, deadline, pieces, bed } = parseWithSchema(availabilitySchema, query);
     const pieceIds = pieces ? pieces.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
-    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline, pieceIds);
+    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline, pieceIds, bed);
   }
 
   @Post("attach-slicer")
@@ -101,8 +109,8 @@ export class SimpleJobsController {
   @Post("unassign")
   @RequirePermission("action_orders")
   bulkUnassign(@CompanyId() companyId: string, @Body() body: unknown) {
-    const { printer_ids } = parseWithSchema(bulkUnassignSchema, body);
-    return this.simpleJobsService.bulkUnassign(companyId, printer_ids);
+    const { printer_ids, piece_ids } = parseWithSchema(bulkUnassignSchema, body);
+    return this.simpleJobsService.bulkUnassign(companyId, printer_ids, piece_ids);
   }
 
   @Post("mark-failed")

@@ -7,8 +7,10 @@ import {
 import { DatabaseService } from "../database/database.service";
 import { recordOrderHistory } from "../common/order-history";
 import {
+  quoteAssumedMeta,
   releasePieceSpoolsTx,
-  recomputeOrderStatusTx
+  recomputeOrderStatusTx,
+  releasePrinterTx
 } from "../common/cascade";
 import { JobsService, materialFamily } from "../jobs/jobs.service";
 import type { FindCandidatesInput, ReserveSpoolsInput } from "../jobs/jobs.schemas";
@@ -597,6 +599,7 @@ export class BedsService {
     const res = await this.databaseService.query(
       `SELECT op.piece_id, op.piece_name, op.description, op.status,
               op.order_id, o.order_number,
+              op.cost_inputs,
               COALESCE(
                 NULLIF(cu.business_name, ''),
                 NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
@@ -786,7 +789,7 @@ export class BedsService {
     input: {
       printer_id: string;
       nozzle_asset_id: string;
-      slicer_print_time_minutes: number;
+      slicer_print_time_minutes?: number | null | undefined;
       slicer_file_url?: string | null | undefined;
       stl_file_url?: string | null | undefined;
       slicer_filament_used_grams?: number | null | undefined;
@@ -816,11 +819,38 @@ export class BedsService {
         "Selected nozzle is not compatible with the selected printer."
       );
     }
+    // Assumed metadata: when the payload doesn't state time/grams and the bed
+    // doesn't have them yet, seed from the constituent pieces' quote numbers
+    // (Σ cost_inputs.time / Σ cost_inputs.grams). A packed plate prints faster
+    // than the pieces sequentially, so the sum is a safe over-estimate the
+    // operator can trim — but it makes the bed schedulable in one step.
+    let seedMinutes: number | null = null;
+    let seedGrams: number | null = null;
+    const needsSeed =
+      (input.slicer_print_time_minutes == null && bed.slicer_print_time_minutes == null) ||
+      (input.slicer_filament_used_grams == null && bed.slicer_filament_used_grams == null);
+    if (needsSeed) {
+      const quoteRes = await this.databaseService.query<{
+        cost_inputs: { grams?: string[]; time?: string } | null;
+      }>(
+        `SELECT cost_inputs FROM order_pieces WHERE company_id = $1 AND bed_id = $2`,
+        [companyId, bedId]
+      );
+      let minutesSum = 0;
+      let gramsSum = 0;
+      for (const r of quoteRes.rows) {
+        const q = quoteAssumedMeta(r.cost_inputs);
+        if (q.minutes != null) minutesSum += q.minutes;
+        if (q.grams != null) gramsSum += q.grams;
+      }
+      seedMinutes = minutesSum > 0 ? Math.round(minutesSum) : null;
+      seedGrams = gramsSum > 0 ? Math.round(gramsSum * 100) / 100 : null;
+    }
     await this.databaseService.query(
       `UPDATE print_beds
           SET assigned_printer_id        = $3,
               assigned_nozzle_asset_id   = $4,
-              slicer_print_time_minutes  = $5,
+              slicer_print_time_minutes  = COALESCE($5, slicer_print_time_minutes),
               slicer_file_url            = COALESCE($6, slicer_file_url),
               slicer_file_uploaded_at    = CASE WHEN $6 IS NOT NULL THEN now() ELSE slicer_file_uploaded_at END,
               slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams),
@@ -835,11 +865,43 @@ export class BedsService {
       [
         companyId, bedId,
         input.printer_id, input.nozzle_asset_id,
-        input.slicer_print_time_minutes,
+        input.slicer_print_time_minutes ?? seedMinutes,
         input.slicer_file_url ?? null,
-        input.slicer_filament_used_grams ?? null,
+        input.slicer_filament_used_grams ?? seedGrams,
         input.stl_file_url ?? null,
       ]
+    );
+    return this.loadBed(companyId, bedId);
+  }
+
+  // Swap the assigned nozzle in place (assigned/ready beds only). The nozzle
+  // must come from the assigned printer's compatibility table.
+  async setNozzle(companyId: string, bedId: string, nozzleAssetId: string): Promise<BedRow> {
+    const bed = await this.loadBed(companyId, bedId);
+    if (!bed.assigned_printer_id) {
+      throw new ConflictException("Assign a printer before choosing a nozzle.");
+    }
+    if (bed.status !== "assigned" && bed.status !== "ready") {
+      throw new ConflictException(
+        `The nozzle can only be changed on an 'assigned' or 'ready' bed (current: '${bed.status}'). Unschedule it first.`
+      );
+    }
+    const compat = await this.databaseService.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM printer_nozzle_compatibility
+          WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
+       ) AS exists`,
+      [companyId, bed.assigned_printer_id, nozzleAssetId]
+    );
+    if (!compat.rows[0]?.exists) {
+      throw new BadRequestException(
+        "Selected nozzle is not compatible with this bed's assigned printer."
+      );
+    }
+    await this.databaseService.query(
+      `UPDATE print_beds SET assigned_nozzle_asset_id = $3
+        WHERE company_id = $1 AND bed_id = $2`,
+      [companyId, bedId, nozzleAssetId]
     );
     return this.loadBed(companyId, bedId);
   }
@@ -1110,8 +1172,16 @@ export class BedsService {
   // re-synced after the pieces vanish.
   // ──────────────────────────────────────────────────────────
   async deleteBed(companyId: string, bedId: string): Promise<{ deleted: true; bed_id: string }> {
-    await this.loadBed(companyId, bedId); // 404 if it doesn't exist / wrong company
+    const bed = await this.loadBed(companyId, bedId); // 404 if it doesn't exist / wrong company
     await this.databaseService.transaction(async (client) => {
+      // A bed that is actively printing holds its printer's lock (a bed's lock
+      // has a NULL currently_printing_piece_id, so it's released by printer id,
+      // not by piece). Free it before the bed + its pieces vanish, else the
+      // machine stays is_in_use with a dangling reference.
+      if (bed.status === "printing" && bed.assigned_printer_id) {
+        await releasePrinterTx(client, companyId, bed.assigned_printer_id);
+      }
+
       const pieceRes = await client.query<{ piece_id: string; order_id: string }>(
         `SELECT piece_id, order_id FROM order_pieces WHERE company_id = $1 AND bed_id = $2`,
         [companyId, bedId]
