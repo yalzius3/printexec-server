@@ -7,8 +7,10 @@ import {
   accountIdParamSchema,
   asOfQuerySchema,
   billIdParamSchema,
+  costingIdParamSchema,
   createAccountSchema,
   createBillSchema,
+  createCostingSchema,
   createExpenseSchema,
   createInvoiceSchema,
   createJournalEntrySchema,
@@ -32,6 +34,7 @@ import {
   taxRateIdParamSchema,
   updateAccountSchema,
   updateBillSchema,
+  updateCostingSchema,
   updateFinanceSettingsSchema,
   updateInvoiceSchema,
   updateTaxRateSchema,
@@ -40,12 +43,14 @@ import {
 } from "./finance.schemas";
 import { FinanceService } from "./finance.service";
 import { FinanceReportsService } from "./finance-reports.service";
+import { FinanceCostingService } from "./finance-costing.service";
 
 @Controller("finance")
 export class FinanceController {
   constructor(
     private readonly financeService: FinanceService,
-    private readonly reportsService: FinanceReportsService
+    private readonly reportsService: FinanceReportsService,
+    private readonly costingService: FinanceCostingService
   ) {}
 
   // ── Dashboard ──────────────────────────────────────────────────────────────
@@ -452,6 +457,64 @@ export class FinanceController {
     );
   }
 
+  // ── Costing variables (capital-recovery calculators) ────────────────────────
+
+  @Get("costing")
+  @RequirePermission("view_finance")
+  listCosting(@CompanyId() companyId: string) {
+    return this.costingService.list(companyId);
+  }
+
+  // Read by the Orders pricing screen too (optional recovery-margin quote hint),
+  // so order viewers can reach it without the Finance module.
+  @Get("costing/summary")
+  @RequirePermission(["view_finance", "view_orders"])
+  costingSummary(@CompanyId() companyId: string) {
+    return this.costingService.summary(companyId);
+  }
+
+  @Get("costing/assets")
+  @RequirePermission("view_finance")
+  recoverableAssets(@CompanyId() companyId: string) {
+    return this.costingService.recoverableAssets(companyId);
+  }
+
+  @Post("costing")
+  @RequirePermission("action_finance")
+  createCosting(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Body() body: unknown
+  ) {
+    return this.costingService.create(
+      companyId,
+      userId,
+      parseWithSchema(createCostingSchema, body)
+    );
+  }
+
+  @Patch("costing/:costingId")
+  @RequirePermission("action_finance")
+  updateCosting(
+    @CompanyId() companyId: string,
+    @Param() params: unknown,
+    @Body() body: unknown
+  ) {
+    const { costingId } = parseWithSchema(costingIdParamSchema, params);
+    return this.costingService.update(
+      companyId,
+      costingId,
+      parseWithSchema(updateCostingSchema, body)
+    );
+  }
+
+  @Delete("costing/:costingId")
+  @RequirePermission("action_finance")
+  deleteCosting(@CompanyId() companyId: string, @Param() params: unknown) {
+    const { costingId } = parseWithSchema(costingIdParamSchema, params);
+    return this.costingService.remove(companyId, costingId);
+  }
+
   // ── Reports ────────────────────────────────────────────────────────────────
 
   @Get("reports/trial-balance")
@@ -477,17 +540,5 @@ export class FinanceController {
   balanceSheet(@CompanyId() companyId: string, @Query() query: unknown) {
     const { as_of } = parseWithSchema(asOfQuerySchema, query);
     return this.reportsService.balanceSheet(companyId, as_of);
-  }
-
-  @Get("reports/ar-aging")
-  @RequirePermission("view_finance")
-  arAging(@CompanyId() companyId: string) {
-    return this.reportsService.arAging(companyId);
-  }
-
-  @Get("reports/ap-aging")
-  @RequirePermission("view_finance")
-  apAging(@CompanyId() companyId: string) {
-    return this.reportsService.apAging(companyId);
   }
 }

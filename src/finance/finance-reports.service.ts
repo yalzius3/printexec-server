@@ -196,58 +196,10 @@ export class FinanceReportsService {
     };
   }
 
-  // Receivables / payables aging: open documents bucketed by how far past
-  // due they are. `table` is fixed by the caller — never user input.
-  private async aging(companyId: string, table: "invoices" | "bills") {
-    const counterparty = table === "invoices" ? "counterparty_name" : "vendor_name";
-    const idColumn = table === "invoices" ? "invoice_id" : "bill_id";
-    const numberColumn = table === "invoices" ? "invoice_number" : "bill_number";
-
-    const result = await this.databaseService.query(
-      `
-        SELECT
-          ${idColumn} AS document_id,
-          ${numberColumn} AS document_number,
-          ${counterparty} AS counterparty,
-          status, issue_date::text, due_date::text, total::text,
-          balance_due::text,
-          CASE
-            WHEN due_date IS NULL OR due_date >= CURRENT_DATE THEN 'current'
-            WHEN CURRENT_DATE - due_date <= 30 THEN '1-30'
-            WHEN CURRENT_DATE - due_date <= 60 THEN '31-60'
-            WHEN CURRENT_DATE - due_date <= 90 THEN '61-90'
-            ELSE '90+'
-          END AS bucket
-        FROM ${table}
-        WHERE company_id = $1
-          AND status IN ('open', 'partial')
-        ORDER BY due_date NULLS LAST, issue_date
-      `,
-      [companyId]
-    );
-
-    const buckets: Record<string, number> = { current: 0, "1-30": 0, "31-60": 0, "61-90": 0, "90+": 0 };
-    for (const row of result.rows as Array<{ bucket: string; balance_due: string }>) {
-      buckets[row.bucket] = (buckets[row.bucket] ?? 0) + Number(row.balance_due);
-    }
-
-    return {
-      documents: result.rows,
-      buckets: Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.toFixed(2)]))
-    };
-  }
-
-  arAging(companyId: string) {
-    return this.aging(companyId, "invoices");
-  }
-
-  apAging(companyId: string) {
-    return this.aging(companyId, "bills");
-  }
 
   // Dashboard rollup: the headline numbers plus a 6-month net-income series.
   async summary(companyId: string) {
-    const [cash, ar, ap, month, series, counts] = await Promise.all([
+    const [cash, ar, ap, month, series, counts, spoolValue, printerValue] = await Promise.all([
       // Cash on hand: every asset account tagged cash/bank.
       this.databaseService.query<{ total: string }>(
         `
@@ -306,6 +258,29 @@ export class FinanceReportsService {
             (SELECT COUNT(*) FROM journal_entries WHERE company_id = $1 AND status = 'posted')::text AS journal_entries
         `,
         [companyId]
+      ),
+      // Asset valuation (informational — no ledger posting). Filament stock is
+      // priced by parent spools only (a split keeps the parent as the priced
+      // spool), so child spools never double-count.
+      this.databaseService.query<{ total: string; count: string }>(
+        `
+          SELECT COALESCE(SUM(purchase_price), 0)::text AS total, COUNT(*)::text AS count
+          FROM asset_instances
+          WHERE company_id = $1
+            AND asset_type = 'filament_spool'
+            AND parent_asset_id IS NULL
+            AND purchase_price > 0
+        `,
+        [companyId]
+      ),
+      this.databaseService.query<{ total: string; count: string }>(
+        `
+          SELECT COALESCE(SUM(purchase_price), 0)::text AS total, COUNT(*)::text AS count
+          FROM printer_instances
+          WHERE company_id = $1
+            AND purchase_price > 0
+        `,
+        [companyId]
       )
     ]);
 
@@ -320,7 +295,14 @@ export class FinanceReportsService {
       },
       monthly_series: series.rows,
       draft_invoices: Number(counts.rows[0]?.draft_invoices ?? 0),
-      posted_entries: Number(counts.rows[0]?.journal_entries ?? 0)
+      posted_entries: Number(counts.rows[0]?.journal_entries ?? 0),
+      // Informational asset valuation — the current worth of what the shop owns.
+      assets: {
+        spool_value: spoolValue.rows[0]?.total ?? "0",
+        spool_count: Number(spoolValue.rows[0]?.count ?? 0),
+        printer_value: printerValue.rows[0]?.total ?? "0",
+        printer_count: Number(printerValue.rows[0]?.count ?? 0)
+      }
     };
   }
 }

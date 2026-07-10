@@ -132,7 +132,8 @@ export const updateFinanceSettingsSchema = z
   .object({
     currency_code: z.string().trim().min(1).max(8).optional(),
     lock_date: dateSchema.nullable().optional(),
-    default_terms: z.string().trim().nullable().optional()
+    default_terms: z.string().trim().nullable().optional(),
+    default_tax_rate_id: uuidSchema.nullable().optional()
   })
   .refine((v) => Object.keys(v).length > 0, {
     message: "At least one field is required."
@@ -335,6 +336,60 @@ export const periodQuerySchema = z.object({
 export const asOfQuerySchema = z.object({
   as_of: dateSchema.optional()
 });
+
+// ── Costing variables (capital-recovery / margin calculators) ───────────────
+
+export const createCostingSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    kind: z.enum(["asset_recovery", "manual"]).default("asset_recovery"),
+    asset_id: uuidSchema.optional(),
+    asset_kind: z.enum(["printer", "spool", "other"]).optional(),
+    asset_label: z.string().trim().min(1).optional(),
+    asset_cost: z.number().finite().nonnegative().optional(),
+    payback_months: z.number().int().positive().optional(),
+    expected_volume_per_month: z.number().finite().positive().optional(),
+    // For kind = 'manual': the per-order margin entered directly.
+    manual_value: z.number().finite().nonnegative().optional(),
+    notes: z.string().trim().optional()
+  })
+  .superRefine((v, ctx) => {
+    if (v.kind === "asset_recovery") {
+      if (v.asset_cost == null || v.payback_months == null || v.expected_volume_per_month == null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["asset_cost"],
+          message: "Asset cost, payback months, and monthly volume are all required."
+        });
+      }
+    } else if (v.manual_value == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["manual_value"],
+        message: "A per-order margin amount is required."
+      });
+    }
+  });
+
+export const updateCostingSchema = z
+  .object({
+    name: z.string().trim().min(1).optional(),
+    kind: z.enum(["asset_recovery", "manual"]).optional(),
+    asset_id: uuidSchema.nullable().optional(),
+    asset_kind: z.enum(["printer", "spool", "other"]).nullable().optional(),
+    asset_label: z.string().trim().min(1).nullable().optional(),
+    asset_cost: z.number().finite().nonnegative().nullable().optional(),
+    payback_months: z.number().int().positive().nullable().optional(),
+    expected_volume_per_month: z.number().finite().positive().nullable().optional(),
+    manual_value: z.number().finite().nonnegative().optional(),
+    is_active: z.boolean().optional(),
+    notes: z.string().trim().nullable().optional()
+  })
+  .refine((v) => Object.keys(v).length > 0, {
+    message: "At least one field is required."
+  });
+
+export const costingIdParamSchema = z.object({ costingId: uuidSchema });
 
 export const ledgerQuerySchema = z.object({
   from: dateSchema.optional(),

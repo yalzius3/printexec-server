@@ -8,6 +8,7 @@ import type { PoolClient } from "pg";
 import type { z } from "zod";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService } from "../database/database.service";
+import { OrderCostingService } from "../orders/order-costing";
 import type {
   DocumentLineInput,
   createAccountSchema,
@@ -75,7 +76,13 @@ type JournalLineSpec = {
 
 @Injectable()
 export class FinanceService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    // Prices an order exactly as the Orders UI does, so an invoice generated
+    // from an order matches the quoted total and its COGS basis is the order's
+    // real cost.
+    private readonly orderCosting: OrderCostingService
+  ) {}
 
   // ── Numbering + posting primitives ────────────────────────────────────────
 
@@ -104,23 +111,40 @@ export class FinanceService {
   }
 
   // Resolve the tenant's system account for a posting role (e.g. "the" A/R).
+  // Accounts are user-deletable (see deleteAccount), so a hook the posting
+  // engine needs might be gone. Rather than fail, self-heal: re-run the
+  // idempotent default-account seed (which re-creates any missing hook by its
+  // subtype) and look again. Only a genuinely un-seeded company (migration not
+  // applied) still throws.
   private async systemAccount(
     client: PoolClient,
     companyId: string,
     subtype: string
   ): Promise<string> {
-    const result = await this.databaseService.query<{ account_id: string }>(
-      `
-        SELECT account_id
-        FROM finance_accounts
-        WHERE company_id = $1
-          AND account_subtype = $2
-        ORDER BY code
-        LIMIT 1
-      `,
-      [companyId, subtype],
-      client
-    );
+    const lookup = () =>
+      this.databaseService.query<{ account_id: string }>(
+        `
+          SELECT account_id
+          FROM finance_accounts
+          WHERE company_id = $1
+            AND account_subtype = $2
+          ORDER BY code
+          LIMIT 1
+        `,
+        [companyId, subtype],
+        client
+      );
+
+    let result = await lookup();
+    if (!result.rows[0]) {
+      await this.databaseService.query(
+        `SELECT public.finance_seed_default_accounts($1)`,
+        [companyId],
+        client
+      );
+      result = await lookup();
+    }
+
     const row = result.rows[0];
     if (!row) {
       throw new ConflictException(
@@ -382,8 +406,11 @@ export class FinanceService {
         client
       );
       if (!existing.rows[0]) throw new NotFoundException("Account not found.");
-      if (existing.rows[0].is_system && (input.code !== undefined || input.is_active === false)) {
-        throw new BadRequestException("System accounts keep their code and stay active.");
+      // System (hook) accounts can be renamed, deactivated, or deleted — only
+      // their code is frozen, because it anchors the seed's ON CONFLICT and the
+      // engine's self-heal re-creates a missing hook by (company, code).
+      if (existing.rows[0].is_system && input.code !== undefined) {
+        throw new BadRequestException("System accounts keep their code; you can still rename, deactivate, or delete them.");
       }
       if (input.parent_account_id) {
         if (input.parent_account_id === accountId) {
@@ -423,9 +450,9 @@ export class FinanceService {
         client
       );
       if (!existing.rows[0]) throw new NotFoundException("Account not found.");
-      if (existing.rows[0].is_system) {
-        throw new BadRequestException("System accounts cannot be deleted.");
-      }
+      // Ledger history is append-only: an account that has ever been posted to
+      // must stay so the audit trail keeps its references. Those get deactivated
+      // rather than deleted. This applies to system and ordinary accounts alike.
       const used = await this.databaseService.query(
         `SELECT 1 FROM journal_lines WHERE company_id = $1 AND account_id = $2 LIMIT 1`,
         [companyId, accountId],
@@ -436,11 +463,22 @@ export class FinanceService {
           "This account has ledger activity — deactivate it instead of deleting."
         );
       }
-      await this.databaseService.query(
-        `DELETE FROM finance_accounts WHERE company_id = $1 AND account_id = $2`,
-        [companyId, accountId],
-        client
-      );
+      // System (hook) accounts are deletable too; if a hook is later needed, the
+      // posting engine re-seeds it on demand (see systemAccount).
+      try {
+        await this.databaseService.query(
+          `DELETE FROM finance_accounts WHERE company_id = $1 AND account_id = $2`,
+          [companyId, accountId],
+          client
+        );
+      } catch (error) {
+        if ((error as { code?: string }).code === "23503") {
+          throw new ConflictException(
+            "This account is referenced by a draft document — remove or repoint those lines first, or deactivate it."
+          );
+        }
+        throw error;
+      }
       return { deleted: true };
     });
   }
@@ -553,7 +591,7 @@ export class FinanceService {
         INSERT INTO finance_settings (company_id)
         VALUES ($1)
         ON CONFLICT (company_id) DO UPDATE SET company_id = EXCLUDED.company_id
-        RETURNING company_id, currency_code, lock_date::text, default_terms, updated_at
+        RETURNING company_id, currency_code, lock_date::text, default_terms, default_tax_rate_id, updated_at
       `,
       [companyId]
     );
@@ -571,7 +609,7 @@ export class FinanceService {
         UPDATE finance_settings
         SET ${clause}, updated_at = NOW()
         WHERE company_id = $1
-        RETURNING company_id, currency_code, lock_date::text, default_terms, updated_at
+        RETURNING company_id, currency_code, lock_date::text, default_terms, default_tax_rate_id, updated_at
       `,
       [companyId, ...values]
     );
@@ -886,11 +924,12 @@ export class FinanceService {
         invoice_number: string;
         issue_date: string;
         counterparty_name: string | null;
+        order_id: string | null;
         total: string;
         tax_total: string;
       }>(
         `
-          SELECT status, invoice_number, issue_date::text, counterparty_name, total, tax_total
+          SELECT status, invoice_number, issue_date::text, counterparty_name, order_id, total, tax_total
           FROM invoices
           WHERE company_id = $1 AND invoice_id = $2
           FOR UPDATE
@@ -937,6 +976,22 @@ export class FinanceService {
       if (taxCents > 0) {
         const taxAccount = await this.systemAccount(client, companyId, "sales_tax_payable");
         entryLines.push({ accountId: taxAccount, debit: 0, credit: taxCents, description: "Sales tax" });
+      }
+
+      // COGS: an invoice generated from an order books the order's own cost as
+      // cost of goods sold — DR COGS / CR Inventory for the order's base (pre-
+      // profit) cost. The remainder of the sale (revenue − COGS) is the profit
+      // margin, so the P&L reads correctly. Folded into THIS entry so voiding
+      // the invoice reverses the COGS in the same reversal, and priced from the
+      // shared costing service so it's the same cost the order actually shows.
+      if (row.order_id) {
+        const cost = await this.orderCosting.computeTotals(companyId, row.order_id, client);
+        if (cost.priced && cost.baseCents > 0) {
+          const cogsAccount = await this.systemAccount(client, companyId, "cogs");
+          const inventoryAccount = await this.systemAccount(client, companyId, "inventory");
+          entryLines.push({ accountId: cogsAccount, debit: cost.baseCents, credit: 0, description: "Cost of goods sold" });
+          entryLines.push({ accountId: inventoryAccount, debit: 0, credit: cost.baseCents, description: "Inventory / production consumed" });
+        }
       }
 
       const entry = await this.postEntry(client, companyId, userId, {
@@ -1007,17 +1062,11 @@ export class FinanceService {
         title: string;
         customer_id: string | null;
         guest_name: string | null;
-        order_total: string | null;
       }>(
         `
-          SELECT
-            o.order_id, o.order_number, o.title, o.customer_id, o.guest_name,
-            (SUM(op.cost) FILTER (WHERE op.status <> 'cancelled')
-              * (1 + COALESCE(o.profit_pct, 0) / 100))::text AS order_total
+          SELECT o.order_id, o.order_number, o.title, o.customer_id, o.guest_name
           FROM orders o
-          LEFT JOIN order_pieces op ON op.order_id = o.order_id
           WHERE o.company_id = $1 AND o.order_id = $2
-          GROUP BY o.order_id
         `,
         [companyId, orderId],
         client
@@ -1036,10 +1085,37 @@ export class FinanceService {
         );
       }
 
+      // Price the order EXACTLY as the Orders UI shows it: live per-piece cost
+      // × (1 + profit%). Using the shared costing service (not a re-derivation
+      // from stale SUM(order_pieces.cost)) is what keeps the invoice subtotal
+      // equal to the total the customer was quoted. totalCents is the sell
+      // price; baseCents is the COGS booked at issue time.
+      const totals = await this.orderCosting.computeTotals(companyId, orderId, client);
+      if (!totals.priced || totals.totalCents <= 0) {
+        throw new BadRequestException(
+          "This order has no priced pieces yet, so there is nothing to invoice."
+        );
+      }
+
       const issueDate = this.today();
       const counterparty = row.customer_id
         ? await this.customerDisplayName(client, companyId, row.customer_id)
         : row.guest_name ?? "Customer";
+
+      // Pre-fill the company default tax rate; a stale/inactive default falls
+      // back to no tax (the join drops it) rather than erroring the whole flow.
+      const taxDefault = await this.databaseService.query<{ tax_rate_id: string | null }>(
+        `
+          SELECT tr.tax_rate_id
+          FROM finance_settings fs
+          LEFT JOIN tax_rates tr
+            ON tr.tax_rate_id = fs.default_tax_rate_id AND tr.company_id = fs.company_id AND tr.is_active
+          WHERE fs.company_id = $1
+        `,
+        [companyId],
+        client
+      );
+      const defaultTaxRateId = taxDefault.rows[0]?.tax_rate_id ?? undefined;
 
       const invoiceNumber = await this.nextDocNumber(client, companyId, "invoice", issueDate);
       const created = await this.databaseService.query<{ invoice_id: string }>(
@@ -1063,8 +1139,9 @@ export class FinanceService {
       );
       const invoiceId = created.rows[0]!.invoice_id;
 
-      const amount = row.order_total != null ? fromCents(cents(row.order_total)) : 0;
-      const totals = await this.writeDocumentLines(
+      // One line at the full quoted price. Subtotal therefore equals the order's
+      // displayed total exactly (before tax); tax is added on top.
+      const lineTotals = await this.writeDocumentLines(
         client,
         companyId,
         { table: "invoice_lines", fkColumn: "invoice_id", accountColumn: "revenue_account_id" },
@@ -1073,14 +1150,15 @@ export class FinanceService {
           {
             description: `Order ${row.order_number} — ${row.title}`,
             quantity: 1,
-            unit_price: amount
+            unit_price: fromCents(totals.totalCents),
+            tax_rate_id: defaultTaxRateId
           }
         ],
         ["revenue"]
       );
       await this.databaseService.query(
         `UPDATE invoices SET subtotal = $3, tax_total = $4, total = $5, updated_at = NOW() WHERE company_id = $1 AND invoice_id = $2`,
-        [companyId, invoiceId, fromCents(totals.subtotal), fromCents(totals.taxTotal), fromCents(totals.subtotal + totals.taxTotal)],
+        [companyId, invoiceId, fromCents(lineTotals.subtotal), fromCents(lineTotals.taxTotal), fromCents(lineTotals.subtotal + lineTotals.taxTotal)],
         client
       );
 
