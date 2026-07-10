@@ -117,9 +117,15 @@ export class PrintersController {
   @RequirePermission(["view_assets", "view_orders"])
   listNozzleCompatibility(
     @CompanyId() companyId: string,
-    @Param("printerId") printerId: string
+    @Param("printerId") printerId: string,
+    @Query("from") from?: string,
+    @Query("to") to?: string
   ) {
-    return this.printersService.listNozzleCompatibility(companyId, printerId);
+    // Optional window → per-nozzle busy info for that span (defaults to "now").
+    return this.printersService.listNozzleCompatibility(companyId, printerId, {
+      from: from || undefined,
+      to: to || undefined,
+    });
   }
 
   @Post(":printerId/nozzle-compatibility")

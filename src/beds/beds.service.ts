@@ -881,10 +881,43 @@ export class BedsService {
     if (!bed.assigned_printer_id) {
       throw new ConflictException("Assign a printer before choosing a nozzle.");
     }
-    if (bed.status !== "assigned" && bed.status !== "ready") {
+    // Assigned/ready swap freely. A SCHEDULED bed may also swap — the quick fix
+    // when the chosen nozzle turns out to be busy — but only onto a nozzle
+    // that's free during its committed window.
+    if (bed.status !== "assigned" && bed.status !== "ready" && bed.status !== "scheduled") {
       throw new ConflictException(
-        `The nozzle can only be changed on an 'assigned' or 'ready' bed (current: '${bed.status}'). Unschedule it first.`
+        `The nozzle can only be changed on an 'assigned', 'ready' or 'scheduled' bed (current: '${bed.status}').`
       );
+    }
+    if (bed.status === "scheduled" && bed.scheduled_start_at && bed.scheduled_end_at) {
+      const s = bed.scheduled_start_at;
+      const e = bed.scheduled_end_at;
+      const nzPiece = await this.databaseService.query<{ piece_name: string }>(
+        `SELECT piece_name FROM order_pieces
+          WHERE company_id = $1 AND assigned_nozzle_asset_id = $2
+            AND status IN ('scheduled','printing')
+            AND scheduled_start_at < $4 AND scheduled_end_at > $3
+          LIMIT 1`,
+        [companyId, nozzleAssetId, s, e]
+      );
+      if (nzPiece.rows[0]) {
+        throw new ConflictException(
+          `Can't switch — that nozzle is committed to "${nzPiece.rows[0].piece_name}" during this bed's window. Pick a free one.`
+        );
+      }
+      const nzBed = await this.databaseService.query<{ bed_name: string }>(
+        `SELECT bed_name FROM print_beds
+          WHERE company_id = $1 AND assigned_nozzle_asset_id = $2 AND bed_id <> $3
+            AND status IN ('scheduled','printing')
+            AND scheduled_start_at < $5 AND scheduled_end_at > $4
+          LIMIT 1`,
+        [companyId, nozzleAssetId, bedId, s, e]
+      );
+      if (nzBed.rows[0]) {
+        throw new ConflictException(
+          `Can't switch — that nozzle is committed to bed "${nzBed.rows[0].bed_name}" during this bed's window. Pick a free one.`
+        );
+      }
     }
     const compat = await this.databaseService.query<{ exists: boolean }>(
       `SELECT EXISTS(
@@ -960,6 +993,55 @@ export class BedsService {
     );
     if (bedOverlap.rowCount && bedOverlap.rowCount > 0) {
       throw new ConflictException("Time slot overlaps another bed on this printer.");
+    }
+
+    // The bed's reserved spool(s) — anchored on a child piece — are physical,
+    // time-exclusive resources: reject if any is already feeding another
+    // scheduled/printing piece or bed in this window. Without this, two prints
+    // could be committed to the same physical spool at the same instant.
+    const bedSpools = await this.databaseService.query<{ spool_asset_id: string }>(
+      `SELECT DISTINCT ops.spool_asset_id
+         FROM order_piece_spools ops
+         JOIN order_pieces op ON op.piece_id = ops.piece_id
+        WHERE ops.company_id = $1 AND op.bed_id = $2`,
+      [companyId, bedId]
+    );
+    if (bedSpools.rowCount && bedSpools.rowCount > 0) {
+      const spoolIds = bedSpools.rows.map((r) => r.spool_asset_id);
+      const pieceSpool = await this.databaseService.query<{ piece_name: string }>(
+        `SELECT op.piece_name
+           FROM order_pieces op
+           JOIN order_piece_spools ops ON ops.piece_id = op.piece_id
+          WHERE op.company_id = $1
+            AND ops.spool_asset_id = ANY($2::uuid[])
+            AND op.status IN ('scheduled','printing')
+            AND op.scheduled_start_at < $4 AND op.scheduled_end_at > $3
+          LIMIT 1`,
+        [companyId, spoolIds, start.toISOString(), end.toISOString()]
+      );
+      if (pieceSpool.rows[0]) {
+        throw new ConflictException(
+          `A reserved spool is already feeding "${pieceSpool.rows[0].piece_name}" in this time slot — a spool can't be on two printers at once.`
+        );
+      }
+      const otherBedSpool = await this.databaseService.query<{ bed_name: string }>(
+        `SELECT pb.bed_name
+           FROM print_beds pb
+           JOIN order_pieces op ON op.bed_id = pb.bed_id AND op.company_id = pb.company_id
+           JOIN order_piece_spools ops ON ops.piece_id = op.piece_id
+          WHERE pb.company_id = $1
+            AND pb.bed_id <> $2
+            AND ops.spool_asset_id = ANY($3::uuid[])
+            AND pb.status IN ('scheduled','printing')
+            AND pb.scheduled_start_at < $5 AND pb.scheduled_end_at > $4
+          LIMIT 1`,
+        [companyId, bedId, spoolIds, start.toISOString(), end.toISOString()]
+      );
+      if (otherBedSpool.rows[0]) {
+        throw new ConflictException(
+          `A reserved spool is already feeding bed "${otherBedSpool.rows[0].bed_name}" in this time slot — a spool can't be on two printers at once.`
+        );
+      }
     }
 
     // The nozzle is its own resource — reject if mounted elsewhere in-window.

@@ -391,6 +391,47 @@ export const updateCostingSchema = z
 
 export const costingIdParamSchema = z.object({ costingId: uuidSchema });
 
+// ── Finance constants ────────────────────────────────────────────────────────
+
+export const updateConstantSchema = z.object({
+  // null clears the override (revert to the auto / default value).
+  override_value: z.number().finite().nullable()
+});
+
+export const constantKeyParamSchema = z.object({
+  key: z.enum(["default_profit_margin_pct", "avg_orders_per_month"])
+});
+
+// ── Recurring bills (routine costs) ─────────────────────────────────────────
+
+export const createRecurringBillSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    vendor_id: uuidSchema.optional(),
+    vendor_name: z.string().trim().min(1).optional(),
+    amount: z.number().finite().nonnegative(),
+    expense_account_id: uuidSchema.optional(),
+    day_of_month: z.number().int().min(1).max(28).optional(),
+    notes: z.string().trim().optional()
+  });
+
+export const updateRecurringBillSchema = z
+  .object({
+    name: z.string().trim().min(1).optional(),
+    vendor_id: uuidSchema.nullable().optional(),
+    vendor_name: z.string().trim().min(1).nullable().optional(),
+    amount: z.number().finite().nonnegative().optional(),
+    expense_account_id: uuidSchema.nullable().optional(),
+    day_of_month: z.number().int().min(1).max(28).nullable().optional(),
+    is_active: z.boolean().optional(),
+    notes: z.string().trim().nullable().optional()
+  })
+  .refine((v) => Object.keys(v).length > 0, {
+    message: "At least one field is required."
+  });
+
+export const recurringBillIdParamSchema = z.object({ recurringBillId: uuidSchema });
+
 export const ledgerQuerySchema = z.object({
   from: dateSchema.optional(),
   to: dateSchema.optional(),

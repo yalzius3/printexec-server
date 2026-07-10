@@ -202,4 +202,190 @@ export class FinanceCostingService {
     if (result.rowCount === 0) throw new NotFoundException("Costing variable not found.");
     return { deleted: true };
   }
+
+  // ── Constants (default profit margin, avg orders/month) ─────────────────────
+  // Effective value = override ?? auto ?? fallback. auto_value is recomputed
+  // from >= 2 months of order history; until then override/fallback stands.
+
+  private static readonly CONSTANTS = [
+    { key: "default_profit_margin_pct", label: "Default profit margin", unit: "%", fallback: 30 },
+    { key: "avg_orders_per_month", label: "Average orders / month", unit: "orders", fallback: 0 }
+  ] as const;
+
+  async getConstants(companyId: string) {
+    // Recompute the auto values from history, but only once the tenant has at
+    // least two full months of orders (before that, the numbers are noise).
+    const stats = await this.databaseService.query<{
+      total: string;
+      full_months: string | null;
+      avg_profit: string | null;
+    }>(
+      `
+        SELECT
+          COUNT(*)::text AS total,
+          (date_part('year',  age(CURRENT_DATE, MIN(created_at)::date)) * 12
+           + date_part('month', age(CURRENT_DATE, MIN(created_at)::date)))::int::text AS full_months,
+          AVG(profit_pct)::text AS avg_profit
+        FROM orders
+        WHERE company_id = $1
+      `,
+      [companyId]
+    );
+    const total = Number(stats.rows[0]?.total ?? 0);
+    const fullMonths = Number(stats.rows[0]?.full_months ?? 0);
+    const avgProfit = stats.rows[0]?.avg_profit != null ? Number(stats.rows[0].avg_profit) : null;
+
+    const autos: Record<string, number | null> = {
+      default_profit_margin_pct: null,
+      avg_orders_per_month: null
+    };
+    if (fullMonths >= 2 && total > 0) {
+      autos.avg_orders_per_month = round2(total / Math.max(1, fullMonths));
+      if (avgProfit != null) autos.default_profit_margin_pct = round2(avgProfit);
+    }
+
+    for (const key of Object.keys(autos)) {
+      if (autos[key] != null) {
+        await this.databaseService.query(
+          `
+            INSERT INTO finance_constants (company_id, key, auto_value, auto_computed_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (company_id, key)
+            DO UPDATE SET auto_value = EXCLUDED.auto_value, auto_computed_at = now()
+          `,
+          [companyId, key, autos[key]]
+        );
+      }
+    }
+
+    const rows = await this.databaseService.query<{
+      key: string;
+      override_value: string | null;
+      auto_value: string | null;
+      auto_computed_at: string | null;
+    }>(
+      `SELECT key, override_value::text, auto_value::text, auto_computed_at
+       FROM finance_constants WHERE company_id = $1`,
+      [companyId]
+    );
+    const byKey = new Map(rows.rows.map((r) => [r.key, r]));
+
+    return FinanceCostingService.CONSTANTS.map((c) => {
+      const row = byKey.get(c.key);
+      const override = row?.override_value != null ? Number(row.override_value) : null;
+      const auto = row?.auto_value != null ? Number(row.auto_value) : null;
+      const effective = override ?? auto ?? c.fallback;
+      const source = override != null ? "override" : auto != null ? "auto" : "default";
+      return {
+        key: c.key,
+        label: c.label,
+        unit: c.unit,
+        effective: String(effective),
+        auto: auto != null ? String(auto) : null,
+        override: override != null ? String(override) : null,
+        source,
+        auto_computed_at: row?.auto_computed_at ?? null
+      };
+    });
+  }
+
+  async updateConstant(companyId: string, key: string, override: number | null) {
+    if (!FinanceCostingService.CONSTANTS.some((c) => c.key === key)) {
+      throw new NotFoundException("Unknown constant.");
+    }
+    await this.databaseService.query(
+      `
+        INSERT INTO finance_constants (company_id, key, override_value, updated_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (company_id, key)
+        DO UPDATE SET override_value = EXCLUDED.override_value, updated_at = now()
+      `,
+      [companyId, key, override]
+    );
+    return this.getConstants(companyId);
+  }
+
+  // ── Auto-derived cost factors for the Costing page ──────────────────────────
+  // Read straight from the tenant's live data. All informational (no ledger).
+  async costFactors(companyId: string) {
+    const [company, materials, payroll, rent, printers, recovery] = await Promise.all([
+      this.databaseService.query<{ electricity_price_per_kwh: string | null }>(
+        `SELECT electricity_price_per_kwh FROM companies WHERE company_id = $1`,
+        [companyId]
+      ),
+      // Avg filament price per gram per material (priced parent spools only).
+      this.databaseService.query<{ material_type: string; price_per_gram: string }>(
+        `
+          SELECT fr.material_type,
+                 (SUM(ai.purchase_price) / NULLIF(SUM(ai.initial_grams), 0))::text AS price_per_gram
+          FROM asset_instances ai
+          JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'filament_spool'
+            AND ai.parent_asset_id IS NULL
+            AND ai.purchase_price > 0
+            AND ai.initial_grams > 0
+            AND fr.material_type IS NOT NULL
+          GROUP BY fr.material_type
+          ORDER BY fr.material_type
+        `,
+        [companyId]
+      ),
+      // Payroll: total monthly salary + headcount (any finance user may see it).
+      this.databaseService.query<{ monthly: string; headcount: string }>(
+        `
+          SELECT COALESCE(SUM(monthly_salary), 0)::text AS monthly,
+                 COUNT(*) FILTER (WHERE monthly_salary IS NOT NULL AND monthly_salary > 0)::text AS headcount
+          FROM users WHERE company_id = $1
+        `,
+        [companyId]
+      ),
+      // Fixed monthly recurring cost (Rent, ...).
+      this.databaseService.query<{ monthly: string; count: string }>(
+        `
+          SELECT COALESCE(SUM(amount), 0)::text AS monthly, COUNT(*)::text AS count
+          FROM recurring_bills
+          WHERE company_id = $1 AND is_active = TRUE AND cadence = 'monthly'
+        `,
+        [companyId]
+      ),
+      // Machines, for electricity-per-machine-hour (power_watts, 230W fallback).
+      this.databaseService.query<{ avg_watts: string | null; machines: string }>(
+        `
+          SELECT AVG(COALESCE(power_watts, 230))::text AS avg_watts, COUNT(*)::text AS machines
+          FROM printer_instances WHERE company_id = $1
+        `,
+        [companyId]
+      ),
+      this.databaseService.query<{ avg_recovery: string | null; count: string }>(
+        `
+          SELECT AVG(computed_value)::text AS avg_recovery, COUNT(*)::text AS count
+          FROM costing_variables WHERE company_id = $1 AND is_active = TRUE AND computed_value > 0
+        `,
+        [companyId]
+      )
+    ]);
+
+    const rate = company.rows[0]?.electricity_price_per_kwh;
+    const rateNum = rate != null && rate !== "" ? Number(rate) : 0;
+    const avgWatts = printers.rows[0]?.avg_watts != null ? Number(printers.rows[0].avg_watts) : 230;
+    // kWh per machine-hour = watts/1000; × rate = cost per machine-hour.
+    const elecPerMachineHour = round2((avgWatts / 1000) * rateNum);
+
+    return {
+      electricity_per_kwh: rateNum ? rateNum.toFixed(4) : "0",
+      avg_electricity_per_machine_hour: elecPerMachineHour.toFixed(4),
+      machine_count: Number(printers.rows[0]?.machines ?? 0),
+      filament_avg_prices: materials.rows.map((m) => ({
+        material: m.material_type,
+        price_per_gram: Number(m.price_per_gram).toFixed(4)
+      })),
+      payroll_monthly: payroll.rows[0]?.monthly ?? "0",
+      payroll_headcount: Number(payroll.rows[0]?.headcount ?? 0),
+      rent_monthly: rent.rows[0]?.monthly ?? "0",
+      recurring_count: Number(rent.rows[0]?.count ?? 0),
+      avg_recovery_per_order: recovery.rows[0]?.avg_recovery != null ? round2(Number(recovery.rows[0].avg_recovery)).toFixed(2) : "0",
+      recovery_count: Number(recovery.rows[0]?.count ?? 0)
+    };
+  }
 }

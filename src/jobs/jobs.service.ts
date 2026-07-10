@@ -1363,10 +1363,24 @@ export class JobsService {
     if (!piece.assigned_printer_id) {
       throw new ConflictException("Assign a printer before choosing a nozzle.");
     }
-    if (piece.status !== "assigned" && piece.status !== "ready") {
+    // Assigned/ready swap freely. A SCHEDULED piece may also swap — that's the
+    // quick fix when the chosen nozzle turns out to be busy — but only onto a
+    // nozzle that's actually free during its committed window.
+    if (piece.status !== "assigned" && piece.status !== "ready" && piece.status !== "scheduled") {
       throw new ConflictException(
-        `The nozzle can only be changed on an 'assigned' or 'ready' piece (current: '${piece.status}'). Unschedule it first.`
+        `The nozzle can only be changed on an 'assigned', 'ready' or 'scheduled' piece (current: '${piece.status}').`
       );
+    }
+    if (piece.status === "scheduled" && piece.scheduled_start_at && piece.scheduled_end_at) {
+      const conflict = await this.findResourceConflict(companyId, pieceId, {
+        nozzleAssetId,
+        spoolIds: [],
+        startIso: piece.scheduled_start_at,
+        endIso: piece.scheduled_end_at,
+      });
+      if (conflict) {
+        throw new ConflictException(`Can't switch — ${conflict}. Pick a nozzle that's free in this print's window.`);
+      }
     }
     const compat = await this.databaseService.query<{ exists: boolean }>(
       `SELECT EXISTS(
@@ -1466,11 +1480,11 @@ export class JobsService {
   ): Promise<JobRow> {
     const piece = await this.loadJob(companyId, pieceId);
     // 'assigned' is intentionally NOT allowed here — by design that status
-    // means the slicer file is missing. The DB's chk_scheduled_requires_core_data
+    // means the slicer metadata is missing. The DB's chk_scheduled_requires_core_data
     // would reject anyway; the explicit check gives a friendlier message.
     if (piece.status !== "ready" && piece.status !== "scheduled") {
       throw new ConflictException(
-        `Cannot schedule a '${piece.status}' piece. Upload a slicer file first (status must reach 'ready').`
+        `Cannot schedule a '${piece.status}' piece. Enter its print time + filament grams (typed, quote-assumed, or read from a G-code) so it reaches 'ready' first.`
       );
     }
     // Friendly preflight — the DB enforces these via chk_scheduled_requires_core_data,
@@ -1545,6 +1559,29 @@ export class JobsService {
       throw new ConflictException(
         "A reserved spool is already feeding another print in this time slot — a spool can't be on two printers at once."
       );
+    }
+    // Bed reservations anchor on a CHILD piece that carries no window of its
+    // own (the window lives on print_beds), so the piece-level query above
+    // can't see them — check the bed timeline for those spools explicitly.
+    if (await this.hasBedsTable()) {
+      const bedSpoolOverlap = await this.databaseService.query<{ bed_id: string }>(
+        `SELECT pb.bed_id
+           FROM print_beds pb
+           JOIN order_pieces op ON op.bed_id = pb.bed_id AND op.company_id = pb.company_id
+           JOIN order_piece_spools ops ON ops.piece_id = op.piece_id
+          WHERE pb.company_id = $1
+            AND ops.spool_asset_id = ANY($2::uuid[])
+            AND pb.status IN ('scheduled','printing')
+            AND pb.scheduled_start_at < $4
+            AND pb.scheduled_end_at   > $3
+          LIMIT 1`,
+        [companyId, spoolIds, start.toISOString(), end.toISOString()]
+      );
+      if (bedSpoolOverlap.rowCount && bedSpoolOverlap.rowCount > 0) {
+        throw new ConflictException(
+          "A reserved spool is already feeding a scheduled print bed in this time slot — a spool can't be on two printers at once."
+        );
+      }
     }
 
     // Overlap check on the same printer (skipping this piece's own existing block).
@@ -1646,6 +1683,102 @@ export class JobsService {
     return this.loadJob(companyId, pieceId);
   }
 
+  /** First physical-resource conflict for a window, or null when everything is
+   *  free. Checks the printer, the nozzle, and every spool reserved by the
+   *  piece — against BOTH standalone pieces and print beds (bed spool
+   *  reservations anchor on windowless child pieces, so beds are matched via
+   *  their own timeline). `excludePieceId` skips the piece's own block. */
+  private async findResourceConflict(
+    companyId: string,
+    excludePieceId: string,
+    opts: {
+      printerId?: string | null;
+      nozzleAssetId?: string | null;
+      spoolIds?: string[];
+      startIso: string;
+      endIso: string;
+    }
+  ): Promise<string | null> {
+    const { startIso, endIso } = opts;
+    const hasBeds = await this.hasBedsTable();
+    const spoolIds =
+      opts.spoolIds ??
+      (
+        await this.databaseService.query<{ spool_asset_id: string }>(
+          `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, excludePieceId]
+        )
+      ).rows.map((r) => r.spool_asset_id);
+
+    const pieceHit = async (col: "assigned_printer_id" | "assigned_nozzle_asset_id", id: string) =>
+      (
+        await this.databaseService.query<{ piece_name: string }>(
+          `SELECT piece_name FROM order_pieces
+            WHERE company_id = $1 AND ${col} = $2 AND piece_id <> $3
+              AND status IN ('scheduled','printing')
+              AND scheduled_start_at < $5 AND scheduled_end_at > $4
+            LIMIT 1`,
+          [companyId, id, excludePieceId, startIso, endIso]
+        )
+      ).rows[0]?.piece_name ?? null;
+    const bedHit = async (col: "assigned_printer_id" | "assigned_nozzle_asset_id", id: string) =>
+      !hasBeds
+        ? null
+        : (
+            await this.databaseService.query<{ bed_name: string }>(
+              `SELECT bed_name FROM print_beds
+                WHERE company_id = $1 AND ${col} = $2
+                  AND status IN ('scheduled','printing')
+                  AND scheduled_start_at < $4 AND scheduled_end_at > $3
+                LIMIT 1`,
+              [companyId, id, startIso, endIso]
+            )
+          ).rows[0]?.bed_name ?? null;
+
+    if (opts.printerId) {
+      const p = await pieceHit("assigned_printer_id", opts.printerId);
+      if (p) return `the printer is committed to "${p}" in that window`;
+      const b = await bedHit("assigned_printer_id", opts.printerId);
+      if (b) return `the printer is committed to bed "${b}" in that window`;
+    }
+    if (opts.nozzleAssetId) {
+      const p = await pieceHit("assigned_nozzle_asset_id", opts.nozzleAssetId);
+      if (p) return `the nozzle is committed to "${p}" in that window`;
+      const b = await bedHit("assigned_nozzle_asset_id", opts.nozzleAssetId);
+      if (b) return `the nozzle is committed to bed "${b}" in that window`;
+    }
+    if (spoolIds.length > 0) {
+      const p = await this.databaseService.query<{ piece_name: string }>(
+        `SELECT op.piece_name
+           FROM order_pieces op
+           JOIN order_piece_spools ops ON ops.piece_id = op.piece_id
+          WHERE op.company_id = $1 AND op.piece_id <> $2
+            AND ops.spool_asset_id = ANY($3::uuid[])
+            AND op.status IN ('scheduled','printing')
+            AND op.scheduled_start_at < $5 AND op.scheduled_end_at > $4
+          LIMIT 1`,
+        [companyId, excludePieceId, spoolIds, startIso, endIso]
+      );
+      if (p.rows[0]) return `a reserved spool is feeding "${p.rows[0].piece_name}" in that window`;
+      if (hasBeds) {
+        const b = await this.databaseService.query<{ bed_name: string }>(
+          `SELECT pb.bed_name
+             FROM print_beds pb
+             JOIN order_pieces op ON op.bed_id = pb.bed_id AND op.company_id = pb.company_id
+             JOIN order_piece_spools ops ON ops.piece_id = op.piece_id
+            WHERE pb.company_id = $1
+              AND ops.spool_asset_id = ANY($2::uuid[])
+              AND pb.status IN ('scheduled','printing')
+              AND pb.scheduled_start_at < $4 AND pb.scheduled_end_at > $3
+            LIMIT 1`,
+          [companyId, spoolIds, startIso, endIso]
+        );
+        if (b.rows[0]) return `a reserved spool is feeding bed "${b.rows[0].bed_name}" in that window`;
+      }
+    }
+    return null;
+  }
+
   /** Readiness/scheduling is gated on slicer METADATA (print time + filament
    *  grams) plus an assigned printer + nozzle — never on the slicer file, which
    *  is an optional attachment the system never feeds to a printer. */
@@ -1701,6 +1834,26 @@ export class JobsService {
       throw new BadRequestException(
         "Piece has no assigned printer — cannot start printing."
       );
+    }
+    // Starting means the machine physically runs NOW. Verify the printer, the
+    // nozzle, and every reserved spool are free for the whole run window —
+    // "start now" must respect ALL involved timelines, not just this piece's.
+    // (The piece's own scheduled block is excluded; it's the run being started.)
+    {
+      const durMin = piece.slicer_print_time_minutes != null ? Number(piece.slicer_print_time_minutes) : 1;
+      const runStart = new Date();
+      const runEnd = new Date(runStart.getTime() + Math.max(1, durMin) * 60_000);
+      const conflict = await this.findResourceConflict(companyId, pieceId, {
+        printerId: piece.assigned_printer_id,
+        nozzleAssetId: piece.assigned_nozzle_asset_id,
+        startIso: runStart.toISOString(),
+        endIso: runEnd.toISOString(),
+      });
+      if (conflict) {
+        throw new ConflictException(
+          `Can't start now — ${conflict}. Reschedule one of them or pick a free resource first.`
+        );
+      }
     }
     const printerId = piece.assigned_printer_id;
     await this.databaseService.transaction(async (client) => {

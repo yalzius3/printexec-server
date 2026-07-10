@@ -199,7 +199,7 @@ export class FinanceReportsService {
 
   // Dashboard rollup: the headline numbers plus a 6-month net-income series.
   async summary(companyId: string) {
-    const [cash, ar, ap, month, series, counts, spoolValue, printerValue] = await Promise.all([
+    const [cash, ar, ap, month, series, counts, consumedFilament] = await Promise.all([
       // Cash on hand: every asset account tagged cash/bank.
       this.databaseService.query<{ total: string }>(
         `
@@ -259,29 +259,9 @@ export class FinanceReportsService {
         `,
         [companyId]
       ),
-      // Asset valuation (informational — no ledger posting). Filament stock is
-      // priced by parent spools only (a split keeps the parent as the priced
-      // spool), so child spools never double-count.
-      this.databaseService.query<{ total: string; count: string }>(
-        `
-          SELECT COALESCE(SUM(purchase_price), 0)::text AS total, COUNT(*)::text AS count
-          FROM asset_instances
-          WHERE company_id = $1
-            AND asset_type = 'filament_spool'
-            AND parent_asset_id IS NULL
-            AND purchase_price > 0
-        `,
-        [companyId]
-      ),
-      this.databaseService.query<{ total: string; count: string }>(
-        `
-          SELECT COALESCE(SUM(purchase_price), 0)::text AS total, COUNT(*)::text AS count
-          FROM printer_instances
-          WHERE company_id = $1
-            AND purchase_price > 0
-        `,
-        [companyId]
-      )
+      // Filament is a consumable, not a balance-sheet asset: report the COST of
+      // filament actually consumed this month (pieces finished this month).
+      this.consumedFilamentThisMonth(companyId)
     ]);
 
     return {
@@ -296,13 +276,76 @@ export class FinanceReportsService {
       monthly_series: series.rows,
       draft_invoices: Number(counts.rows[0]?.draft_invoices ?? 0),
       posted_entries: Number(counts.rows[0]?.journal_entries ?? 0),
-      // Informational asset valuation — the current worth of what the shop owns.
-      assets: {
-        spool_value: spoolValue.rows[0]?.total ?? "0",
-        spool_count: Number(spoolValue.rows[0]?.count ?? 0),
-        printer_value: printerValue.rows[0]?.total ?? "0",
-        printer_count: Number(printerValue.rows[0]?.count ?? 0)
+      // Consumable usage — filament burned this month (cost + grams).
+      consumed_filament: consumedFilament
+    };
+  }
+
+  // Cost of filament consumed this calendar month: every piece that finished
+  // printing (print_completed_at) since the 1st, valued at each slot's material
+  // grams × that material's avg price/gram. Mirrors the material portion of the
+  // piece-costing engine so the number reconciles with order costs.
+  async consumedFilamentThisMonth(companyId: string) {
+    const matRes = await this.databaseService.query<{ material_type: string; p: string | null }>(
+      `
+        SELECT fr.material_type,
+               SUM(ai.purchase_price) / NULLIF(SUM(ai.initial_grams), 0) AS p
+        FROM asset_instances ai
+        JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+        WHERE ai.company_id = $1
+          AND ai.asset_type = 'filament_spool'
+          AND ai.parent_asset_id IS NULL
+          AND ai.purchase_price > 0
+          AND ai.initial_grams > 0
+          AND fr.material_type IS NOT NULL
+        GROUP BY fr.material_type
+      `,
+      [companyId]
+    );
+    const matMap = new Map<string, number>();
+    for (const r of matRes.rows) {
+      if (r.p != null && Number.isFinite(Number(r.p))) matMap.set(r.material_type, Number(r.p));
+    }
+
+    const pieces = await this.databaseService.query<{
+      cost_inputs: { grams?: string[] } | null;
+      required_filament_material: string | null;
+      requires_multicolor: boolean;
+      color_slots: { slot_material: string }[] | null;
+    }>(
+      `
+        SELECT op.cost_inputs, op.required_filament_material, op.requires_multicolor,
+               (
+                 SELECT COALESCE(json_agg(json_build_object('slot_material', cs.slot_material) ORDER BY cs.sequence_order), '[]'::json)
+                 FROM order_piece_color_slots cs WHERE cs.piece_id = op.piece_id
+               ) AS color_slots
+        FROM order_pieces op
+        WHERE op.company_id = $1
+          AND op.print_completed_at >= date_trunc('month', CURRENT_DATE)
+      `,
+      [companyId]
+    );
+
+    let cost = 0;
+    let grams = 0;
+    for (const p of pieces.rows) {
+      const gramList = (p.cost_inputs?.grams ?? []).map((g) => Number(g) || 0);
+      for (let j = 0; j < gramList.length; j += 1) {
+        const g = gramList[j] || 0;
+        if (g <= 0) continue;
+        grams += g;
+        const mat = p.requires_multicolor && p.color_slots?.[j]
+          ? p.color_slots[j]!.slot_material
+          : p.required_filament_material ?? undefined;
+        const price = mat ? matMap.get(mat) : undefined;
+        if (price != null) cost += price * g;
       }
+    }
+
+    return {
+      cost: (Math.round(cost * 100) / 100).toFixed(2),
+      grams: Math.round(grams),
+      piece_count: pieces.rows.length
     };
   }
 }

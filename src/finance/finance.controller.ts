@@ -7,6 +7,7 @@ import {
   accountIdParamSchema,
   asOfQuerySchema,
   billIdParamSchema,
+  constantKeyParamSchema,
   costingIdParamSchema,
   createAccountSchema,
   createBillSchema,
@@ -15,9 +16,11 @@ import {
   createInvoiceSchema,
   createJournalEntrySchema,
   createPaymentSchema,
+  createRecurringBillSchema,
   createTaxRateSchema,
   createVendorSchema,
   entryIdParamSchema,
+  recurringBillIdParamSchema,
   expenseIdParamSchema,
   invoiceIdParamSchema,
   ledgerQuerySchema,
@@ -34,9 +37,11 @@ import {
   taxRateIdParamSchema,
   updateAccountSchema,
   updateBillSchema,
+  updateConstantSchema,
   updateCostingSchema,
   updateFinanceSettingsSchema,
   updateInvoiceSchema,
+  updateRecurringBillSchema,
   updateTaxRateSchema,
   updateVendorSchema,
   vendorIdParamSchema
@@ -151,6 +156,68 @@ export class FinanceController {
       vendorId,
       parseWithSchema(updateVendorSchema, body)
     );
+  }
+
+  @Delete("vendors/:vendorId")
+  @RequirePermission("action_finance")
+  deleteVendor(@CompanyId() companyId: string, @Param() params: unknown) {
+    const { vendorId } = parseWithSchema(vendorIdParamSchema, params);
+    return this.financeService.deleteVendor(companyId, vendorId);
+  }
+
+  // ── Recurring bills (routine costs) ─────────────────────────────────────────
+
+  @Get("recurring-bills")
+  @RequirePermission("view_finance")
+  listRecurringBills(@CompanyId() companyId: string) {
+    return this.financeService.listRecurringBills(companyId);
+  }
+
+  @Post("recurring-bills")
+  @RequirePermission("action_finance")
+  createRecurringBill(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Body() body: unknown
+  ) {
+    return this.financeService.createRecurringBill(
+      companyId,
+      userId,
+      parseWithSchema(createRecurringBillSchema, body)
+    );
+  }
+
+  @Patch("recurring-bills/:recurringBillId")
+  @RequirePermission("action_finance")
+  updateRecurringBill(
+    @CompanyId() companyId: string,
+    @Param() params: unknown,
+    @Body() body: unknown
+  ) {
+    const { recurringBillId } = parseWithSchema(recurringBillIdParamSchema, params);
+    return this.financeService.updateRecurringBill(
+      companyId,
+      recurringBillId,
+      parseWithSchema(updateRecurringBillSchema, body)
+    );
+  }
+
+  @Delete("recurring-bills/:recurringBillId")
+  @RequirePermission("action_finance")
+  deleteRecurringBill(@CompanyId() companyId: string, @Param() params: unknown) {
+    const { recurringBillId } = parseWithSchema(recurringBillIdParamSchema, params);
+    return this.financeService.deleteRecurringBill(companyId, recurringBillId);
+  }
+
+  @Post("recurring-bills/:recurringBillId/post")
+  @RequirePermission("action_finance")
+  postRecurringBill(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Param() params: unknown
+  ) {
+    const { recurringBillId } = parseWithSchema(recurringBillIdParamSchema, params);
+    return this.financeService.postRecurringBill(companyId, userId, recurringBillId);
   }
 
   // ── Tax rates ──────────────────────────────────────────────────────────────
@@ -477,6 +544,34 @@ export class FinanceController {
   @RequirePermission("view_finance")
   recoverableAssets(@CompanyId() companyId: string) {
     return this.costingService.recoverableAssets(companyId);
+  }
+
+  // Auto-derived cost factors for the Costing page (rates, materials, payroll,
+  // rent, recovery). Payroll is visible to any finance user.
+  @Get("costing/factors")
+  @RequirePermission("view_finance")
+  costFactors(@CompanyId() companyId: string) {
+    return this.costingService.costFactors(companyId);
+  }
+
+  // ── Finance constants ────────────────────────────────────────────────────
+
+  @Get("constants")
+  @RequirePermission("view_finance")
+  getConstants(@CompanyId() companyId: string) {
+    return this.costingService.getConstants(companyId);
+  }
+
+  @Patch("constants/:key")
+  @RequirePermission("action_finance")
+  updateConstant(
+    @CompanyId() companyId: string,
+    @Param() params: unknown,
+    @Body() body: unknown
+  ) {
+    const { key } = parseWithSchema(constantKeyParamSchema, params);
+    const { override_value } = parseWithSchema(updateConstantSchema, body);
+    return this.costingService.updateConstant(companyId, key, override_value);
   }
 
   @Post("costing")

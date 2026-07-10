@@ -594,7 +594,11 @@ export class PrintersService {
     return result.rows;
   }
 
-  async listNozzleCompatibility(companyId: string, printerId: string) {
+  async listNozzleCompatibility(
+    companyId: string,
+    printerId: string,
+    window?: { from?: string | undefined; to?: string | undefined }
+  ) {
     await this.getPrinterById(companyId, printerId);
 
     const result = await this.databaseService.query(
@@ -621,7 +625,61 @@ export class PrintersService {
       [companyId, printerId]
     );
 
-    return result.rows;
+    // Per-nozzle schedule occupancy inside the asked window (defaults to "right
+    // now"), so pickers can offer the quick busy→free switch: each row gains
+    // busy_in_window + the first conflicting job's name and bounds. Nozzles are
+    // physical, time-exclusive resources — stock status alone can't tell you a
+    // nozzle is committed to another print at 14:00.
+    const fromIso = window?.from ?? new Date().toISOString();
+    const toIso = window?.to ?? new Date(Date.now() + 60_000).toISOString();
+    const nozzleIds = result.rows.map((r) => (r as { nozzle_asset_id: string }).nozzle_asset_id);
+    const busyById = new Map<string, { busy_with: string; busy_from: string; busy_until: string }>();
+    if (nozzleIds.length > 0) {
+      const collect = async (sql: string) => {
+        const r = await this.databaseService.query<{
+          nozzle_asset_id: string; label: string; s: string; e: string;
+        }>(sql, [companyId, nozzleIds, fromIso, toIso]);
+        for (const row of r.rows) {
+          const prev = busyById.get(row.nozzle_asset_id);
+          if (!prev || row.s < prev.busy_from) {
+            busyById.set(row.nozzle_asset_id, { busy_with: row.label, busy_from: row.s, busy_until: row.e });
+          }
+        }
+      };
+      await collect(
+        `SELECT DISTINCT ON (assigned_nozzle_asset_id)
+                assigned_nozzle_asset_id AS nozzle_asset_id, piece_name AS label,
+                scheduled_start_at::text AS s, scheduled_end_at::text AS e
+           FROM order_pieces
+          WHERE company_id = $1 AND assigned_nozzle_asset_id = ANY($2::uuid[])
+            AND status IN ('scheduled','printing')
+            AND scheduled_start_at < $4 AND scheduled_end_at > $3
+          ORDER BY assigned_nozzle_asset_id, scheduled_start_at ASC`
+      );
+      try {
+        await collect(
+          `SELECT DISTINCT ON (assigned_nozzle_asset_id)
+                  assigned_nozzle_asset_id AS nozzle_asset_id, bed_name AS label,
+                  scheduled_start_at::text AS s, scheduled_end_at::text AS e
+             FROM print_beds
+            WHERE company_id = $1 AND assigned_nozzle_asset_id = ANY($2::uuid[])
+              AND status IN ('scheduled','printing')
+              AND scheduled_start_at < $4 AND scheduled_end_at > $3
+            ORDER BY assigned_nozzle_asset_id, scheduled_start_at ASC`
+        );
+      } catch { /* print_beds not migrated yet — piece blocks alone are correct */ }
+    }
+
+    return result.rows.map((r) => {
+      const busy = busyById.get((r as { nozzle_asset_id: string }).nozzle_asset_id) ?? null;
+      return {
+        ...(r as Record<string, unknown>),
+        busy_in_window: !!busy,
+        busy_with: busy?.busy_with ?? null,
+        busy_from: busy?.busy_from ?? null,
+        busy_until: busy?.busy_until ?? null,
+      };
+    });
   }
 
   async addNozzleCompatibility(

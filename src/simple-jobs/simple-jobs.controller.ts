@@ -71,6 +71,15 @@ const attachSlicerSchema = z.object({
     .max(500),
 });
 
+// Auto-schedule: the items to pack (pieces and/or beds), in queue order —
+// deadline still outranks the given order inside the service.
+const autoScheduleSchema = z.object({
+  items: z
+    .array(z.object({ id: z.string().uuid(), is_bed: z.boolean().optional() }))
+    .min(1)
+    .max(200),
+});
+
 // Simple-mode Jobs surface. Additive — the Advanced /jobs endpoints are
 // untouched. Only reachable when the company is in Simple mode (the queue is
 // scoped to the active operation_mode).
@@ -118,5 +127,17 @@ export class SimpleJobsController {
   markFailed(@CompanyId() companyId: string, @Body() body: unknown) {
     const { piece_id, requeue_to, spool_waste } = parseWithSchema(markFailedSchema, body);
     return this.simpleJobsService.markFailed(companyId, piece_id, requeue_to, spool_waste);
+  }
+
+  // One-click constraint-satisfying packer: earliest slot per item where its
+  // printer, nozzle and reserved spool(s) are ALL free; commits via the
+  // guarded jobs/beds schedule(). Mixed pieces + beds. Available in both modes.
+  @Post("auto-schedule")
+  @RequirePermission("action_orders")
+  autoSchedule(@CompanyId() companyId: string, @Body() body: unknown) {
+    return this.simpleJobsService.autoSchedule(
+      companyId,
+      parseWithSchema(autoScheduleSchema, body)
+    );
   }
 }

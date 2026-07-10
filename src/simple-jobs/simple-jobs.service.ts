@@ -1,5 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { JobsService } from "../jobs/jobs.service";
+import { BedsService } from "../beds/beds.service";
 import {
   propagateSlicerMetaToDuplicatesTx,
   quoteAssumedMeta,
@@ -18,7 +20,11 @@ function techFamily(tech: string): string {
 
 @Injectable()
 export class SimpleJobsService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly jobsService: JobsService,
+    private readonly bedsService: BedsService
+  ) {}
 
   // Pieces for orders that live in the company's CURRENT mode — so Simple only
   // ever sees Simple work (and vice-versa), reversibly. Shape matches the
@@ -976,5 +982,248 @@ export class SimpleJobsService {
       requirements,
       printers,
     };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/simple-jobs/auto-schedule
+  // One-click packing: place each ready item at the EARLIEST instant where its
+  // printer AND nozzle AND every reserved spool are simultaneously free —
+  // back-to-back, never overlapping any timeline. Placement math runs here
+  // against one snapshot of all committed blocks; each commit still goes
+  // through jobs/beds schedule() so every server guard re-validates it.
+  // Pieces with no spool reservation get the auto-planned spool reserved
+  // first (same fallback the manual Reserve button uses).
+  // ──────────────────────────────────────────────────────────
+  async autoSchedule(
+    companyId: string,
+    input: { items: Array<{ id: string; is_bed?: boolean | undefined }> }
+  ) {
+    type Interval = { s: number; e: number };
+    const LEAD_MS = 4 * 60_000; // clears schedule()'s past-check + operator lead
+    const HORIZON_MS = 60 * 24 * 60 * 60_000;
+    const now = Date.now();
+
+    const printerBusy = new Map<string, Interval[]>();
+    const nozzleBusy = new Map<string, Interval[]>();
+    const spoolBusy = new Map<string, Interval[]>();
+    const push = (m: Map<string, Interval[]>, k: string | null, iv: Interval) => {
+      if (!k) return;
+      const arr = m.get(k) ?? [];
+      arr.push(iv);
+      m.set(k, arr);
+    };
+
+    // ── Snapshot every committed block (pieces + beds), bucketed per resource.
+    const pieceWindow = new Map<string, Interval>();
+    const pieceBlocks = await this.db.query<{
+      piece_id: string; assigned_printer_id: string | null;
+      assigned_nozzle_asset_id: string | null; s: string; e: string;
+    }>(
+      `SELECT piece_id, assigned_printer_id, assigned_nozzle_asset_id,
+              scheduled_start_at::text AS s, scheduled_end_at::text AS e
+         FROM order_pieces
+        WHERE company_id = $1 AND status IN ('scheduled','printing')
+          AND scheduled_start_at IS NOT NULL AND scheduled_end_at IS NOT NULL`,
+      [companyId]
+    );
+    for (const r of pieceBlocks.rows) {
+      const iv = { s: Date.parse(r.s), e: Date.parse(r.e) };
+      pieceWindow.set(r.piece_id, iv);
+      push(printerBusy, r.assigned_printer_id, iv);
+      push(nozzleBusy, r.assigned_nozzle_asset_id, iv);
+    }
+    const bedWindow = new Map<string, Interval>();
+    try {
+      const bedBlocks = await this.db.query<{
+        bed_id: string; assigned_printer_id: string | null;
+        assigned_nozzle_asset_id: string | null; s: string; e: string;
+      }>(
+        `SELECT bed_id, assigned_printer_id, assigned_nozzle_asset_id,
+                scheduled_start_at::text AS s, scheduled_end_at::text AS e
+           FROM print_beds
+          WHERE company_id = $1 AND status IN ('scheduled','printing')
+            AND scheduled_start_at IS NOT NULL AND scheduled_end_at IS NOT NULL`,
+        [companyId]
+      );
+      for (const r of bedBlocks.rows) {
+        const iv = { s: Date.parse(r.s), e: Date.parse(r.e) };
+        bedWindow.set(r.bed_id, iv);
+        push(printerBusy, r.assigned_printer_id, iv);
+        push(nozzleBusy, r.assigned_nozzle_asset_id, iv);
+      }
+    } catch { /* print_beds not migrated yet */ }
+    // Spool reservations occupy the window of their standalone piece — or of
+    // their parent BED (bed reservations anchor on a windowless child piece).
+    const spoolRes = await this.db.query<{ spool_asset_id: string; piece_id: string; bed_id: string | null }>(
+      `SELECT ops.spool_asset_id, ops.piece_id, op.bed_id
+         FROM order_piece_spools ops
+         JOIN order_pieces op ON op.piece_id = ops.piece_id
+        WHERE ops.company_id = $1`,
+      [companyId]
+    );
+    for (const r of spoolRes.rows) {
+      const iv = r.bed_id ? bedWindow.get(r.bed_id) : pieceWindow.get(r.piece_id);
+      if (iv) push(spoolBusy, r.spool_asset_id, iv);
+    }
+
+    // ── Load the candidates (order preserved for ties; deadline rules).
+    const ids = input.items.filter((i) => !i.is_bed).map((i) => i.id);
+    const bedIds = input.items.filter((i) => i.is_bed).map((i) => i.id);
+    type Candidate = {
+      id: string; is_bed: boolean; name: string; status: string;
+      printer_id: string | null; nozzle_id: string | null;
+      minutes: number | null; deadline: string | null;
+    };
+    const candidates: Candidate[] = [];
+    if (ids.length > 0) {
+      const r = await this.db.query<{
+        piece_id: string; piece_name: string; status: string;
+        assigned_printer_id: string | null; assigned_nozzle_asset_id: string | null;
+        slicer_print_time_minutes: number | null; deadline: string | null;
+      }>(
+        `SELECT op.piece_id, op.piece_name, op.status, op.assigned_printer_id,
+                op.assigned_nozzle_asset_id, op.slicer_print_time_minutes,
+                o.deadline::text AS deadline
+           FROM order_pieces op
+           JOIN orders o ON o.order_id = op.order_id
+          WHERE op.company_id = $1 AND op.piece_id = ANY($2::uuid[])`,
+        [companyId, ids]
+      );
+      for (const p of r.rows) {
+        candidates.push({
+          id: p.piece_id, is_bed: false, name: p.piece_name, status: p.status,
+          printer_id: p.assigned_printer_id, nozzle_id: p.assigned_nozzle_asset_id,
+          minutes: p.slicer_print_time_minutes != null ? Number(p.slicer_print_time_minutes) : null,
+          deadline: p.deadline,
+        });
+      }
+    }
+    if (bedIds.length > 0) {
+      const r = await this.db.query<{
+        bed_id: string; bed_name: string; status: string;
+        assigned_printer_id: string | null; assigned_nozzle_asset_id: string | null;
+        slicer_print_time_minutes: number | null; deadline: string | null;
+      }>(
+        `SELECT bed_id, bed_name, status, assigned_printer_id, assigned_nozzle_asset_id,
+                slicer_print_time_minutes, effective_deadline::text AS deadline
+           FROM print_beds
+          WHERE company_id = $1 AND bed_id = ANY($2::uuid[])`,
+        [companyId, bedIds]
+      );
+      for (const b of r.rows) {
+        candidates.push({
+          id: b.bed_id, is_bed: true, name: b.bed_name, status: b.status,
+          printer_id: b.assigned_printer_id, nozzle_id: b.assigned_nozzle_asset_id,
+          minutes: b.slicer_print_time_minutes != null ? Number(b.slicer_print_time_minutes) : null,
+          deadline: b.deadline,
+        });
+      }
+    }
+    // Deadline-first (nulls last); ties keep the caller's queue order.
+    const orderIndex = new Map(input.items.map((i, idx) => [i.id, idx]));
+    candidates.sort((a, b) => {
+      const da = a.deadline ? Date.parse(a.deadline) : Infinity;
+      const db_ = b.deadline ? Date.parse(b.deadline) : Infinity;
+      if (da !== db_) return da - db_;
+      return (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0);
+    });
+
+    const placed: Array<{ id: string; is_bed: boolean; name: string; start_at: string; end_at: string }> = [];
+    const skipped: Array<{ id: string; is_bed: boolean; name: string; reason: string }> = [];
+
+    for (const c of candidates) {
+      if (c.status !== "ready") {
+        skipped.push({
+          id: c.id, is_bed: c.is_bed, name: c.name,
+          reason: c.status === "scheduled" || c.status === "printing"
+            ? "already on the board"
+            : `not ready yet ('${c.status}' — needs printer, nozzle and print data)`,
+        });
+        continue;
+      }
+      if (!c.printer_id || c.minutes == null || c.minutes <= 0 || (!c.is_bed && !c.nozzle_id)) {
+        skipped.push({ id: c.id, is_bed: c.is_bed, name: c.name, reason: "missing printer/nozzle/print time" });
+        continue;
+      }
+
+      // Ensure a physical spool is reserved (pieces): auto-plan when absent —
+      // the same auto-reservation Save uses, so one click is truly enough.
+      let mySpools: string[] = [];
+      if (!c.is_bed) {
+        const cur = await this.db.query<{ spool_asset_id: string }>(
+          `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, c.id]
+        );
+        mySpools = cur.rows.map((r) => r.spool_asset_id);
+        if (mySpools.length === 0) {
+          try {
+            await this.jobsService.reserveSpools(companyId, c.id, {});
+            const after = await this.db.query<{ spool_asset_id: string }>(
+              `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+              [companyId, c.id]
+            );
+            mySpools = after.rows.map((r) => r.spool_asset_id);
+          } catch (e) {
+            skipped.push({
+              id: c.id, is_bed: false, name: c.name,
+              reason: e instanceof Error ? e.message : "couldn't reserve a spool",
+            });
+            continue;
+          }
+        }
+      } else {
+        const cur = await this.db.query<{ spool_asset_id: string }>(
+          `SELECT DISTINCT ops.spool_asset_id
+             FROM order_piece_spools ops
+             JOIN order_pieces op ON op.piece_id = ops.piece_id
+            WHERE ops.company_id = $1 AND op.bed_id = $2`,
+          [companyId, c.id]
+        );
+        mySpools = cur.rows.map((r) => r.spool_asset_id);
+      }
+
+      // Earliest instant where printer ∧ nozzle ∧ every spool are free.
+      const durMs = Math.max(1, c.minutes) * 60_000;
+      const busy: Interval[] = [
+        ...(printerBusy.get(c.printer_id) ?? []),
+        ...(c.nozzle_id ? nozzleBusy.get(c.nozzle_id) ?? [] : []),
+        ...mySpools.flatMap((sid) => spoolBusy.get(sid) ?? []),
+      ].sort((a, b) => a.s - b.s);
+      let startMs = now + LEAD_MS;
+      let moved = true;
+      while (moved) {
+        moved = false;
+        for (const iv of busy) {
+          if (startMs < iv.e && startMs + durMs > iv.s) { startMs = iv.e; moved = true; }
+        }
+      }
+      if (startMs + durMs > now + HORIZON_MS) {
+        skipped.push({ id: c.id, is_bed: c.is_bed, name: c.name, reason: "no free slot within 60 days" });
+        continue;
+      }
+
+      // Commit through the guarded schedule() — never around it.
+      const startIso = new Date(startMs).toISOString();
+      try {
+        if (c.is_bed) await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
+        else await this.jobsService.schedule(companyId, c.id, { start_at: startIso });
+      } catch (e) {
+        skipped.push({
+          id: c.id, is_bed: c.is_bed, name: c.name,
+          reason: e instanceof Error ? e.message : "schedule was rejected",
+        });
+        continue;
+      }
+      const iv = { s: startMs, e: startMs + durMs };
+      push(printerBusy, c.printer_id, iv);
+      push(nozzleBusy, c.nozzle_id, iv);
+      for (const sid of mySpools) push(spoolBusy, sid, iv);
+      placed.push({
+        id: c.id, is_bed: c.is_bed, name: c.name,
+        start_at: startIso, end_at: new Date(startMs + durMs).toISOString(),
+      });
+    }
+
+    return { placed, skipped };
   }
 }

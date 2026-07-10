@@ -17,6 +17,7 @@ import type {
   createInvoiceSchema,
   createJournalEntrySchema,
   createPaymentSchema,
+  createRecurringBillSchema,
   ledgerQuerySchema,
   listAccountsQuerySchema,
   listBillsQuerySchema,
@@ -46,6 +47,7 @@ type CreatePaymentInput = z.infer<typeof createPaymentSchema>;
 type CreateExpenseInput = z.infer<typeof createExpenseSchema>;
 type CreateJournalEntryInput = z.infer<typeof createJournalEntrySchema>;
 type UpdateBillInput = z.infer<typeof updateBillSchema>;
+type CreateRecurringBillInput = z.infer<typeof createRecurringBillSchema>;
 
 // NUMERIC arrives from pg as a string; every reader goes through here.
 function cents(value: string | number | null | undefined): number {
@@ -536,6 +538,157 @@ export class FinanceService {
     );
     if (!result.rows[0]) throw new NotFoundException("Vendor not found.");
     return result.rows[0];
+  }
+
+  async deleteVendor(companyId: string, vendorId: string) {
+    const existing = await this.databaseService.query(
+      `SELECT 1 FROM vendors WHERE company_id = $1 AND vendor_id = $2`,
+      [companyId, vendorId]
+    );
+    if (!existing.rows[0]) throw new NotFoundException("Vendor not found.");
+    // Bills/expenses/payments reference vendors with ON DELETE SET NULL, and
+    // recurring_bills too — deleting a vendor detaches those documents (keeping
+    // the snapshotted vendor_name) rather than blocking, so removal always works.
+    await this.databaseService.query(
+      `DELETE FROM vendors WHERE company_id = $1 AND vendor_id = $2`,
+      [companyId, vendorId]
+    );
+    return { deleted: true };
+  }
+
+  // ── Recurring bills (routine costs: Rent, ...) ──────────────────────────────
+
+  async listRecurringBills(companyId: string) {
+    const result = await this.databaseService.query(
+      `
+        SELECT rb.recurring_bill_id, rb.name, rb.vendor_id, rb.vendor_name, rb.amount::text,
+               rb.expense_account_id, a.name AS expense_account_name,
+               rb.cadence, rb.day_of_month, rb.is_active, rb.notes, rb.last_posted_period,
+               rb.created_at, rb.updated_at
+        FROM recurring_bills rb
+        LEFT JOIN finance_accounts a ON a.account_id = rb.expense_account_id
+        WHERE rb.company_id = $1
+        ORDER BY rb.is_active DESC, rb.name
+      `,
+      [companyId]
+    );
+    return result.rows;
+  }
+
+  async createRecurringBill(companyId: string, userId: string, input: CreateRecurringBillInput) {
+    let vendorName = input.vendor_name ?? null;
+    if (input.vendor_id) {
+      const v = await this.databaseService.query<{ name: string }>(
+        `SELECT name FROM vendors WHERE company_id = $1 AND vendor_id = $2`,
+        [companyId, input.vendor_id]
+      );
+      vendorName = v.rows[0]?.name ?? vendorName;
+    }
+    if (input.expense_account_id) {
+      const acct = await this.databaseService.query(
+        `SELECT 1 FROM finance_accounts WHERE company_id = $1 AND account_id = $2`,
+        [companyId, input.expense_account_id]
+      );
+      if (!acct.rows[0]) throw new NotFoundException("Expense account not found.");
+    }
+    const result = await this.databaseService.query<{ recurring_bill_id: string }>(
+      `
+        INSERT INTO recurring_bills
+          (company_id, name, vendor_id, vendor_name, amount, expense_account_id, cadence, day_of_month, notes, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, 'monthly', $7, $8, $9)
+        RETURNING recurring_bill_id
+      `,
+      [
+        companyId,
+        input.name,
+        input.vendor_id ?? null,
+        vendorName,
+        input.amount,
+        input.expense_account_id ?? null,
+        input.day_of_month ?? null,
+        input.notes ?? null,
+        userId
+      ]
+    );
+    return { recurring_bill_id: result.rows[0]!.recurring_bill_id };
+  }
+
+  async updateRecurringBill(companyId: string, recurringBillId: string, input: Record<string, unknown>) {
+    const patch = { ...input };
+    if (patch.vendor_id) {
+      const v = await this.databaseService.query<{ name: string }>(
+        `SELECT name FROM vendors WHERE company_id = $1 AND vendor_id = $2`,
+        [companyId, patch.vendor_id]
+      );
+      if (v.rows[0]) patch.vendor_name = v.rows[0].name;
+    }
+    const { clause, values } = buildUpdateClause(patch, 3);
+    if (!clause) throw new BadRequestException("Nothing to update.");
+    const result = await this.databaseService.query(
+      `
+        UPDATE recurring_bills
+        SET ${clause}, updated_at = NOW()
+        WHERE company_id = $1 AND recurring_bill_id = $2
+        RETURNING recurring_bill_id
+      `,
+      [companyId, recurringBillId, ...values]
+    );
+    if (!result.rows[0]) throw new NotFoundException("Recurring bill not found.");
+    return result.rows[0];
+  }
+
+  async deleteRecurringBill(companyId: string, recurringBillId: string) {
+    const result = await this.databaseService.query(
+      `DELETE FROM recurring_bills WHERE company_id = $1 AND recurring_bill_id = $2`,
+      [companyId, recurringBillId]
+    );
+    if (result.rowCount === 0) throw new NotFoundException("Recurring bill not found.");
+    return { deleted: true };
+  }
+
+  // Generate a real DRAFT bill for the current month from a recurring template,
+  // guarded so the same period is never double-posted.
+  async postRecurringBill(companyId: string, userId: string, recurringBillId: string) {
+    const tmpl = await this.databaseService.query<{
+      name: string;
+      vendor_id: string | null;
+      vendor_name: string | null;
+      amount: string;
+      expense_account_id: string | null;
+      is_active: boolean;
+      last_posted_period: string | null;
+    }>(
+      `SELECT name, vendor_id, vendor_name, amount::text, expense_account_id, is_active, last_posted_period
+       FROM recurring_bills WHERE company_id = $1 AND recurring_bill_id = $2`,
+      [companyId, recurringBillId]
+    );
+    const row = tmpl.rows[0];
+    if (!row) throw new NotFoundException("Recurring bill not found.");
+    if (!row.is_active) throw new BadRequestException("This recurring bill is inactive.");
+
+    const period = new Date().toISOString().slice(0, 7); // YYYY-MM
+    if (row.last_posted_period === period) {
+      throw new ConflictException(`${row.name} has already been posted for ${period}.`);
+    }
+
+    const created = await this.createBill(companyId, userId, {
+      vendor_id: row.vendor_id ?? undefined,
+      vendor_name: row.vendor_id ? undefined : row.vendor_name ?? row.name,
+      lines: [
+        {
+          description: `${row.name} — ${period}`,
+          quantity: 1,
+          unit_price: Number(row.amount),
+          account_id: row.expense_account_id ?? undefined
+        }
+      ]
+    } as CreateBillInput);
+
+    await this.databaseService.query(
+      `UPDATE recurring_bills SET last_posted_period = $3, updated_at = NOW() WHERE company_id = $1 AND recurring_bill_id = $2`,
+      [companyId, recurringBillId, period]
+    );
+    return created;
   }
 
   // ── Tax rates ─────────────────────────────────────────────────────────────
