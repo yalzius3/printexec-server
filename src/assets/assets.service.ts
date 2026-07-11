@@ -358,8 +358,15 @@ export class AssetsService {
   // split parents are excluded from filament totals (their grams live on the
   // children), print hours = COALESCE(actual, slicer) minutes on 'done'
   // pieces/beds, and a nozzle counts as installed when a printer mounts it.
-  async getAssetsOverview(companyId: string) {
+  // Filament-on-hand/nozzle-rack are point-in-time inventory snapshots (a
+  // period selector wouldn't mean anything there); printer hours and nozzle
+  // "most used" are genuine period windows, sized by `period`.
+  async getAssetsOverview(companyId: string, period: "week" | "month" | "year" | "all") {
     const num = (v: unknown) => (v == null ? 0 : Number(v));
+    // "all" uses a ~100y window as a practical stand-in for "unbounded" so the
+    // query stays one shape; the previous-period comparison is meaningless at
+    // that scale, so the client suppresses the delta chip when period="all".
+    const days = { week: 7, month: 30, year: 365, all: 36500 }[period];
 
     const [
       filamentByColor,
@@ -368,8 +375,7 @@ export class AssetsService {
       nozzleUsage,
       printerFleet,
       printHours,
-      topPrinters,
-      inventoryValue
+      topPrinters
     ] = await Promise.all([
       // Filament on hand, per material+color (hex kept for swatches). The
       // client rolls colors up into per-material totals.
@@ -439,7 +445,8 @@ export class AssetsService {
           ORDER BY count DESC, ai.nozzle_diameter_mm`,
         [companyId]
       ),
-      // Most-used nozzle spec = piece assignments (all time).
+      // Most-used nozzle spec = completed prints within the window (same
+      // "actually did work" definition as printer hours below).
       this.databaseService.query<{
         nozzle_material: string | null;
         nozzle_diameter_mm: string | null;
@@ -451,10 +458,12 @@ export class AssetsService {
            FROM order_pieces op
            JOIN asset_instances noz ON noz.asset_id = op.assigned_nozzle_asset_id
           WHERE op.company_id = $1
+            AND op.status = 'done'
+            AND op.print_completed_at >= now() - ($2 || ' days')::interval
           GROUP BY noz.nozzle_material, noz.nozzle_diameter_mm
           ORDER BY assignment_count DESC
           LIMIT 5`,
-        [companyId]
+        [companyId, days]
       ),
       // Printer fleet status right now (live in-use, same rule the printers
       // list uses: a printing standalone piece or a printing bed).
@@ -482,13 +491,14 @@ export class AssetsService {
           WHERE pi.company_id = $1`,
         [companyId]
       ),
-      // Worked hours: rolling 7 days, the 7 days before that (for the delta
-      // chip), and all-time accumulated print hours + completed-print count.
+      // Worked hours: the selected window, the equal-length window before it
+      // (for the delta chip), and all-time accumulated print hours + a
+      // window-scoped completed-print count.
       this.databaseService.query<{
-        hours_7d: string | null;
-        hours_prev_7d: string | null;
+        hours_period: string | null;
+        hours_prev_period: string | null;
         hours_all: string | null;
-        prints_7d: string;
+        prints_period: string;
       }>(
         `WITH prints AS (
            SELECT COALESCE(op.actual_print_time_minutes, op.slicer_print_time_minutes, 0) AS mins,
@@ -503,15 +513,15 @@ export class AssetsService {
             WHERE pb.company_id = $1 AND pb.status = 'done'
               AND pb.assigned_printer_id IS NOT NULL
          )
-         SELECT ROUND(COALESCE(SUM(mins) FILTER (WHERE done_at >= now() - interval '7 days'), 0)::numeric / 60.0, 1) AS hours_7d,
-                ROUND(COALESCE(SUM(mins) FILTER (WHERE done_at >= now() - interval '14 days'
-                                                   AND done_at <  now() - interval '7 days'), 0)::numeric / 60.0, 1) AS hours_prev_7d,
+         SELECT ROUND(COALESCE(SUM(mins) FILTER (WHERE done_at >= now() - ($2 || ' days')::interval), 0)::numeric / 60.0, 1) AS hours_period,
+                ROUND(COALESCE(SUM(mins) FILTER (WHERE done_at >= now() - ($3 || ' days')::interval
+                                                   AND done_at <  now() - ($2 || ' days')::interval), 0)::numeric / 60.0, 1) AS hours_prev_period,
                 ROUND(COALESCE(SUM(mins), 0)::numeric / 60.0, 1) AS hours_all,
-                COUNT(*) FILTER (WHERE done_at >= now() - interval '7 days')::int AS prints_7d
+                COUNT(*) FILTER (WHERE done_at >= now() - ($2 || ' days')::interval)::int AS prints_period
            FROM prints`,
-        [companyId]
+        [companyId, days, days * 2]
       ),
-      // Busiest printers over the last 7 days (top 3, for the workload bars).
+      // Busiest printers within the window (top 3, for the workload bars).
       this.databaseService.query<{
         printer_id: string;
         label: string | null;
@@ -523,14 +533,14 @@ export class AssetsService {
              FROM order_pieces op
             WHERE op.company_id = $1 AND op.bed_id IS NULL AND op.status = 'done'
               AND op.assigned_printer_id IS NOT NULL
-              AND op.print_completed_at >= now() - interval '7 days'
+              AND op.print_completed_at >= now() - ($2 || ' days')::interval
            UNION ALL
            SELECT pb.assigned_printer_id,
                   COALESCE(pb.actual_print_time_minutes, pb.slicer_print_time_minutes, 0)
              FROM print_beds pb
             WHERE pb.company_id = $1 AND pb.status = 'done'
               AND pb.assigned_printer_id IS NOT NULL
-              AND pb.print_completed_at >= now() - interval '7 days'
+              AND pb.print_completed_at >= now() - ($2 || ' days')::interval
          )
          SELECT p.printer_id,
                 COALESCE(
@@ -545,30 +555,12 @@ export class AssetsService {
          HAVING SUM(p.mins) > 0
           ORDER BY SUM(p.mins) DESC
           LIMIT 3`,
-        [companyId]
-      ),
-      // Purchase value currently sitting in inventory, per asset family.
-      this.databaseService.query<{
-        spool_value: string;
-        nozzle_value: string;
-        printer_value: string;
-      }>(
-        `SELECT COALESCE((SELECT SUM(purchase_price) FROM asset_instances
-                           WHERE company_id = $1 AND asset_type = 'filament_spool'), 0) AS spool_value,
-                COALESCE((SELECT SUM(purchase_price) FROM asset_instances
-                           WHERE company_id = $1 AND asset_type = 'nozzle'), 0) AS nozzle_value,
-                COALESCE((SELECT SUM(purchase_price) FROM printer_instances
-                           WHERE company_id = $1), 0) AS printer_value`,
-        [companyId]
+        [companyId, days]
       )
     ]);
 
     const hoursRow = printHours.rows[0];
     const fleetRow = printerFleet.rows[0];
-    const valueRow = inventoryValue.rows[0];
-    const spoolValue = num(valueRow?.spool_value);
-    const nozzleValue = num(valueRow?.nozzle_value);
-    const printerValue = num(valueRow?.printer_value);
 
     return {
       filament: {
@@ -604,21 +596,15 @@ export class AssetsService {
         printing_now: num(fleetRow?.printing_now),
         maintenance: num(fleetRow?.maintenance),
         offline: num(fleetRow?.offline),
-        hours_7d: num(hoursRow?.hours_7d),
-        hours_prev_7d: num(hoursRow?.hours_prev_7d),
+        hours_period: num(hoursRow?.hours_period),
+        hours_prev_period: num(hoursRow?.hours_prev_period),
         hours_all: num(hoursRow?.hours_all),
-        prints_7d: num(hoursRow?.prints_7d),
-        top_printers_7d: topPrinters.rows.map((r) => ({
+        prints_period: num(hoursRow?.prints_period),
+        top_printers_period: topPrinters.rows.map((r) => ({
           printer_id: r.printer_id,
           label: r.label ?? "Printer",
           hours: num(r.hours)
         }))
-      },
-      value: {
-        spools: spoolValue,
-        nozzles: nozzleValue,
-        printers: printerValue,
-        total: spoolValue + nozzleValue + printerValue
       }
     };
   }

@@ -320,6 +320,10 @@ export const listAssetHistoryQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).optional().default(30)
 });
 
+export const assetsOverviewQuerySchema = z.object({
+  period: z.enum(["week", "month", "year", "all"]).optional().default("week")
+});
+
 // Split an idle spool into N child spools. `children` is the per-child gram
 // allocation; its sum must equal the parent's current remaining grams (enforced
 // in the service against the live stock value, with a small rounding tolerance).

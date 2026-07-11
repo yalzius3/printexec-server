@@ -12,6 +12,7 @@ import { CompanyId } from "../common/company-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import {
+  assetsOverviewQuerySchema,
   createFilamentReferenceSchema,
   createNozzleSchema,
   createResinTankSchema,
@@ -98,8 +99,9 @@ export class AssetsController {
   // before :assetId so it isn't swallowed as an id.
   @Get("overview")
   @RequirePermission("view_assets")
-  getAssetsOverview(@CompanyId() companyId: string) {
-    return this.assetsService.getAssetsOverview(companyId);
+  getAssetsOverview(@CompanyId() companyId: string, @Query() query: unknown) {
+    const { period } = parseWithSchema(assetsOverviewQuerySchema, query);
+    return this.assetsService.getAssetsOverview(companyId, period);
   }
 
   @Get(":assetId")
