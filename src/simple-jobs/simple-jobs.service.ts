@@ -1000,6 +1000,10 @@ export class SimpleJobsService {
   ) {
     type Interval = { s: number; e: number };
     const LEAD_MS = 4 * 60_000; // clears schedule()'s past-check + operator lead
+    // Mandatory turnaround: every job needs ≥5 min of clear time before AND
+    // after any other block on a shared resource — physically you must pull the
+    // finished print and prep the bed. So no two sequential jobs ever touch.
+    const GAP_MS = 5 * 60_000;
     const HORIZON_MS = 60 * 24 * 60 * 60_000;
     const now = Date.now();
 
@@ -1218,7 +1222,12 @@ export class SimpleJobsService {
       while (moved) {
         moved = false;
         for (const iv of busy) {
-          if (startMs < iv.e && startMs + durMs > iv.s) { startMs = iv.e; moved = true; }
+          // Treat each block as padded by GAP on both sides so the placed job
+          // keeps its 5-min turnaround from whatever it sits next to.
+          if (startMs < iv.e + GAP_MS && startMs + durMs > iv.s - GAP_MS) {
+            startMs = iv.e + GAP_MS;
+            moved = true;
+          }
         }
       }
       if (startMs + durMs > now + HORIZON_MS) {
