@@ -280,8 +280,10 @@ export class FinanceController {
     );
   }
 
+  // Order staff see the invoice window pop open the instant they confirm an
+  // order, so a single invoice read is allowed with view_orders too.
   @Get("invoices/:invoiceId")
-  @RequirePermission("view_finance")
+  @RequirePermission(["view_finance", "view_orders"])
   getInvoice(@CompanyId() companyId: string, @Param() params: unknown) {
     const { invoiceId } = parseWithSchema(invoiceIdParamSchema, params);
     return this.financeService.getInvoice(companyId, invoiceId);
