@@ -119,12 +119,18 @@ export class PrintersController {
     @CompanyId() companyId: string,
     @Param("printerId") printerId: string,
     @Query("from") from?: string,
-    @Query("to") to?: string
+    @Query("to") to?: string,
+    @Query("exclude_piece") excludePiece?: string,
+    @Query("exclude_bed") excludeBed?: string
   ) {
     // Optional window → per-nozzle busy info for that span (defaults to "now").
+    // exclude_piece / exclude_bed: the job being inspected, so its own block
+    // doesn't read as "busy" against itself.
     return this.printersService.listNozzleCompatibility(companyId, printerId, {
       from: from || undefined,
       to: to || undefined,
+      excludePieceId: excludePiece || undefined,
+      excludeBedId: excludeBed || undefined,
     });
   }
 

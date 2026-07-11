@@ -597,7 +597,13 @@ export class PrintersService {
   async listNozzleCompatibility(
     companyId: string,
     printerId: string,
-    window?: { from?: string | undefined; to?: string | undefined }
+    window?: {
+      from?: string | undefined;
+      to?: string | undefined;
+      // The job being inspected — its own block must not count as "busy".
+      excludePieceId?: string | undefined;
+      excludeBedId?: string | undefined;
+    }
   ) {
     await this.getPrinterById(companyId, printerId);
 
@@ -635,10 +641,10 @@ export class PrintersService {
     const nozzleIds = result.rows.map((r) => (r as { nozzle_asset_id: string }).nozzle_asset_id);
     const busyById = new Map<string, { busy_with: string; busy_from: string; busy_until: string }>();
     if (nozzleIds.length > 0) {
-      const collect = async (sql: string) => {
+      const collect = async (sql: string, params: unknown[]) => {
         const r = await this.databaseService.query<{
           nozzle_asset_id: string; label: string; s: string; e: string;
-        }>(sql, [companyId, nozzleIds, fromIso, toIso]);
+        }>(sql, params);
         for (const row of r.rows) {
           const prev = busyById.get(row.nozzle_asset_id);
           if (!prev || row.s < prev.busy_from) {
@@ -646,6 +652,7 @@ export class PrintersService {
           }
         }
       };
+      const base = [companyId, nozzleIds, fromIso, toIso];
       await collect(
         `SELECT DISTINCT ON (assigned_nozzle_asset_id)
                 assigned_nozzle_asset_id AS nozzle_asset_id, piece_name AS label,
@@ -654,7 +661,9 @@ export class PrintersService {
           WHERE company_id = $1 AND assigned_nozzle_asset_id = ANY($2::uuid[])
             AND status IN ('scheduled','printing')
             AND scheduled_start_at < $4 AND scheduled_end_at > $3
-          ORDER BY assigned_nozzle_asset_id, scheduled_start_at ASC`
+            ${window?.excludePieceId ? "AND piece_id <> $5" : ""}
+          ORDER BY assigned_nozzle_asset_id, scheduled_start_at ASC`,
+        window?.excludePieceId ? [...base, window.excludePieceId] : base
       );
       try {
         await collect(
@@ -665,7 +674,9 @@ export class PrintersService {
             WHERE company_id = $1 AND assigned_nozzle_asset_id = ANY($2::uuid[])
               AND status IN ('scheduled','printing')
               AND scheduled_start_at < $4 AND scheduled_end_at > $3
-            ORDER BY assigned_nozzle_asset_id, scheduled_start_at ASC`
+              ${window?.excludeBedId ? "AND bed_id <> $5" : ""}
+            ORDER BY assigned_nozzle_asset_id, scheduled_start_at ASC`,
+          window?.excludeBedId ? [...base, window.excludeBedId] : base
         );
       } catch { /* print_beds not migrated yet — piece blocks alone are correct */ }
     }
