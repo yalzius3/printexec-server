@@ -41,6 +41,8 @@ type AssetRow = {
   nozzle_diameter_mm: string | null;
   nozzle_material: string | null;
   nozzle_max_temp: number | null;
+  nozzle_name: string | null;
+  nozzle_brand: string | null;
   resin_brand: string | null;
   resin_type: string | null;
   resin_color: string | null;
@@ -350,6 +352,277 @@ export class AssetsService {
       }));
   }
 
+  // ── Assets overview (dashboard aggregations) ───────────────────────────────
+  // One round-trip for the Assets → Overview tab. Everything is derived from
+  // live inventory/schedule tables with the same conventions used elsewhere:
+  // split parents are excluded from filament totals (their grams live on the
+  // children), print hours = COALESCE(actual, slicer) minutes on 'done'
+  // pieces/beds, and a nozzle counts as installed when a printer mounts it.
+  async getAssetsOverview(companyId: string) {
+    const num = (v: unknown) => (v == null ? 0 : Number(v));
+
+    const [
+      filamentByColor,
+      consumedByMaterial,
+      nozzleSpecs,
+      nozzleUsage,
+      printerFleet,
+      printHours,
+      topPrinters,
+      inventoryValue
+    ] = await Promise.all([
+      // Filament on hand, per material+color (hex kept for swatches). The
+      // client rolls colors up into per-material totals.
+      this.databaseService.query<{
+        material_type: string | null;
+        color: string | null;
+        hex: string | null;
+        spool_count: string;
+        remaining_grams: string;
+        reserved_grams: string;
+      }>(
+        `SELECT fr.material_type,
+                fr.color,
+                MAX(fr.hex) AS hex,
+                COUNT(*)::int AS spool_count,
+                COALESCE(SUM(COALESCE(ast.remaining_grams, ai.initial_grams)), 0) AS remaining_grams,
+                COALESCE(SUM(COALESCE(ast.reserved_grams, 0)), 0) AS reserved_grams
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+           LEFT JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'filament_spool'
+            AND ai.split_at IS NULL
+          GROUP BY fr.material_type, fr.color
+          ORDER BY remaining_grams DESC`,
+        [companyId]
+      ),
+      // Most-used material = grams actually burned (initial - remaining) on
+      // live spools. Split parents excluded — their depletion is distribution,
+      // not consumption; the children carry the real burn.
+      this.databaseService.query<{ material_type: string; consumed_grams: string }>(
+        `SELECT fr.material_type,
+                COALESCE(SUM(GREATEST(ai.initial_grams - COALESCE(ast.remaining_grams, ai.initial_grams), 0)), 0) AS consumed_grams
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+           JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'filament_spool'
+            AND ai.split_at IS NULL
+            AND fr.material_type IS NOT NULL
+          GROUP BY fr.material_type
+         HAVING SUM(GREATEST(ai.initial_grams - COALESCE(ast.remaining_grams, ai.initial_grams), 0)) > 0
+          ORDER BY consumed_grams DESC`,
+        [companyId]
+      ),
+      // Nozzle rack: counts per material+diameter spec, with live installed
+      // (mounted on a printer) and damaged breakdowns.
+      this.databaseService.query<{
+        nozzle_material: string | null;
+        nozzle_diameter_mm: string | null;
+        count: string;
+        installed_count: string;
+        damaged_count: string;
+      }>(
+        `SELECT ai.nozzle_material,
+                ai.nozzle_diameter_mm,
+                COUNT(*)::int AS count,
+                COUNT(*) FILTER (
+                  WHERE EXISTS (SELECT 1 FROM printer_stock ps WHERE ps.current_nozzle_asset_id = ai.asset_id)
+                )::int AS installed_count,
+                COUNT(*) FILTER (WHERE ast.status = 'damaged')::int AS damaged_count
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'nozzle'
+          GROUP BY ai.nozzle_material, ai.nozzle_diameter_mm
+          ORDER BY count DESC, ai.nozzle_diameter_mm`,
+        [companyId]
+      ),
+      // Most-used nozzle spec = piece assignments (all time).
+      this.databaseService.query<{
+        nozzle_material: string | null;
+        nozzle_diameter_mm: string | null;
+        assignment_count: string;
+      }>(
+        `SELECT noz.nozzle_material,
+                noz.nozzle_diameter_mm,
+                COUNT(*)::int AS assignment_count
+           FROM order_pieces op
+           JOIN asset_instances noz ON noz.asset_id = op.assigned_nozzle_asset_id
+          WHERE op.company_id = $1
+          GROUP BY noz.nozzle_material, noz.nozzle_diameter_mm
+          ORDER BY assignment_count DESC
+          LIMIT 5`,
+        [companyId]
+      ),
+      // Printer fleet status right now (live in-use, same rule the printers
+      // list uses: a printing standalone piece or a printing bed).
+      this.databaseService.query<{
+        total: string;
+        printing_now: string;
+        maintenance: string;
+        offline: string;
+      }>(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (
+                  WHERE EXISTS (
+                          SELECT 1 FROM order_pieces op
+                           WHERE op.assigned_printer_id = pi.printer_id AND op.company_id = pi.company_id
+                             AND op.bed_id IS NULL AND op.status = 'printing')
+                     OR EXISTS (
+                          SELECT 1 FROM print_beds pb
+                           WHERE pb.assigned_printer_id = pi.printer_id AND pb.company_id = pi.company_id
+                             AND pb.status = 'printing')
+                )::int AS printing_now,
+                COUNT(*) FILTER (WHERE ps.is_under_maintenance)::int AS maintenance,
+                COUNT(*) FILTER (WHERE ps.is_offline AND NOT ps.is_under_maintenance)::int AS offline
+           FROM printer_instances pi
+           JOIN printer_stock ps ON ps.printer_id = pi.printer_id
+          WHERE pi.company_id = $1`,
+        [companyId]
+      ),
+      // Worked hours: rolling 7 days, the 7 days before that (for the delta
+      // chip), and all-time accumulated print hours + completed-print count.
+      this.databaseService.query<{
+        hours_7d: string | null;
+        hours_prev_7d: string | null;
+        hours_all: string | null;
+        prints_7d: string;
+      }>(
+        `WITH prints AS (
+           SELECT COALESCE(op.actual_print_time_minutes, op.slicer_print_time_minutes, 0) AS mins,
+                  op.print_completed_at AS done_at
+             FROM order_pieces op
+            WHERE op.company_id = $1 AND op.bed_id IS NULL AND op.status = 'done'
+              AND op.assigned_printer_id IS NOT NULL
+           UNION ALL
+           SELECT COALESCE(pb.actual_print_time_minutes, pb.slicer_print_time_minutes, 0),
+                  pb.print_completed_at
+             FROM print_beds pb
+            WHERE pb.company_id = $1 AND pb.status = 'done'
+              AND pb.assigned_printer_id IS NOT NULL
+         )
+         SELECT ROUND(COALESCE(SUM(mins) FILTER (WHERE done_at >= now() - interval '7 days'), 0)::numeric / 60.0, 1) AS hours_7d,
+                ROUND(COALESCE(SUM(mins) FILTER (WHERE done_at >= now() - interval '14 days'
+                                                   AND done_at <  now() - interval '7 days'), 0)::numeric / 60.0, 1) AS hours_prev_7d,
+                ROUND(COALESCE(SUM(mins), 0)::numeric / 60.0, 1) AS hours_all,
+                COUNT(*) FILTER (WHERE done_at >= now() - interval '7 days')::int AS prints_7d
+           FROM prints`,
+        [companyId]
+      ),
+      // Busiest printers over the last 7 days (top 3, for the workload bars).
+      this.databaseService.query<{
+        printer_id: string;
+        label: string | null;
+        hours: string;
+      }>(
+        `WITH prints AS (
+           SELECT op.assigned_printer_id AS printer_id,
+                  COALESCE(op.actual_print_time_minutes, op.slicer_print_time_minutes, 0) AS mins
+             FROM order_pieces op
+            WHERE op.company_id = $1 AND op.bed_id IS NULL AND op.status = 'done'
+              AND op.assigned_printer_id IS NOT NULL
+              AND op.print_completed_at >= now() - interval '7 days'
+           UNION ALL
+           SELECT pb.assigned_printer_id,
+                  COALESCE(pb.actual_print_time_minutes, pb.slicer_print_time_minutes, 0)
+             FROM print_beds pb
+            WHERE pb.company_id = $1 AND pb.status = 'done'
+              AND pb.assigned_printer_id IS NOT NULL
+              AND pb.print_completed_at >= now() - interval '7 days'
+         )
+         SELECT p.printer_id,
+                COALESCE(
+                  NULLIF(TRIM(COALESCE(pi.brand, pr.brand, '') || ' ' || COALESCE(pi.model, pr.model, '')), ''),
+                  pi.serial_number,
+                  'Printer') AS label,
+                ROUND(SUM(p.mins)::numeric / 60.0, 1) AS hours
+           FROM prints p
+           JOIN printer_instances pi ON pi.printer_id = p.printer_id
+           LEFT JOIN printer_reference pr ON pr.printer_ref_id = pi.printer_ref_id
+          GROUP BY p.printer_id, pi.brand, pi.model, pr.brand, pr.model, pi.serial_number
+         HAVING SUM(p.mins) > 0
+          ORDER BY SUM(p.mins) DESC
+          LIMIT 3`,
+        [companyId]
+      ),
+      // Purchase value currently sitting in inventory, per asset family.
+      this.databaseService.query<{
+        spool_value: string;
+        nozzle_value: string;
+        printer_value: string;
+      }>(
+        `SELECT COALESCE((SELECT SUM(purchase_price) FROM asset_instances
+                           WHERE company_id = $1 AND asset_type = 'filament_spool'), 0) AS spool_value,
+                COALESCE((SELECT SUM(purchase_price) FROM asset_instances
+                           WHERE company_id = $1 AND asset_type = 'nozzle'), 0) AS nozzle_value,
+                COALESCE((SELECT SUM(purchase_price) FROM printer_instances
+                           WHERE company_id = $1), 0) AS printer_value`,
+        [companyId]
+      )
+    ]);
+
+    const hoursRow = printHours.rows[0];
+    const fleetRow = printerFleet.rows[0];
+    const valueRow = inventoryValue.rows[0];
+    const spoolValue = num(valueRow?.spool_value);
+    const nozzleValue = num(valueRow?.nozzle_value);
+    const printerValue = num(valueRow?.printer_value);
+
+    return {
+      filament: {
+        by_color: filamentByColor.rows.map((r) => ({
+          material_type: r.material_type,
+          color: r.color,
+          hex: r.hex,
+          spool_count: num(r.spool_count),
+          remaining_grams: num(r.remaining_grams),
+          reserved_grams: num(r.reserved_grams)
+        })),
+        consumed_by_material: consumedByMaterial.rows.map((r) => ({
+          material_type: r.material_type,
+          consumed_grams: num(r.consumed_grams)
+        }))
+      },
+      nozzles: {
+        by_spec: nozzleSpecs.rows.map((r) => ({
+          nozzle_material: r.nozzle_material,
+          nozzle_diameter_mm: r.nozzle_diameter_mm != null ? Number(r.nozzle_diameter_mm) : null,
+          count: num(r.count),
+          installed_count: num(r.installed_count),
+          damaged_count: num(r.damaged_count)
+        })),
+        most_used: nozzleUsage.rows.map((r) => ({
+          nozzle_material: r.nozzle_material,
+          nozzle_diameter_mm: r.nozzle_diameter_mm != null ? Number(r.nozzle_diameter_mm) : null,
+          assignment_count: num(r.assignment_count)
+        }))
+      },
+      printers: {
+        total: num(fleetRow?.total),
+        printing_now: num(fleetRow?.printing_now),
+        maintenance: num(fleetRow?.maintenance),
+        offline: num(fleetRow?.offline),
+        hours_7d: num(hoursRow?.hours_7d),
+        hours_prev_7d: num(hoursRow?.hours_prev_7d),
+        hours_all: num(hoursRow?.hours_all),
+        prints_7d: num(hoursRow?.prints_7d),
+        top_printers_7d: topPrinters.rows.map((r) => ({
+          printer_id: r.printer_id,
+          label: r.label ?? "Printer",
+          hours: num(r.hours)
+        }))
+      },
+      value: {
+        spools: spoolValue,
+        nozzles: nozzleValue,
+        printers: printerValue,
+        total: spoolValue + nozzleValue + printerValue
+      }
+    };
+  }
+
   async listAssets(companyId: string, query: ListAssetsQuery) {
     const values: unknown[] = [companyId];
     const filters = ["ai.company_id = $1"];
@@ -377,6 +650,8 @@ export class AssetsService {
           OR fr.material_type ILIKE $${values.length}
           OR fr.color ILIKE $${values.length}
           OR ai.nozzle_material ILIKE $${values.length}
+          OR ai.nozzle_name ILIKE $${values.length}
+          OR ai.nozzle_brand ILIKE $${values.length}
           OR ai.resin_brand ILIKE $${values.length}
           OR ai.resin_type ILIKE $${values.length}
         )
@@ -665,67 +940,93 @@ export class AssetsService {
 
   async createNozzle(companyId: string, input: CreateNozzleInput) {
     return this.databaseService.transaction(async (client) => {
-      const createdAsset = await this.databaseService.query<{ asset_id: string }>(
-        `
-          INSERT INTO asset_instances (
-            company_id,
-            asset_type,
-            nozzle_diameter_mm,
-            nozzle_material,
-            nozzle_max_temp,
-            location,
-            notes
-          )
-          VALUES ($1, 'nozzle', $2, $3, $4, $5, $6)
-          RETURNING asset_id
-        `,
-        [
+      // Multiplier: create N identical nozzle instances from one submission
+      // (same convention as spools — each becomes its own inventory row).
+      const quantity = input.quantity ?? 1;
+      const nozzleName =
+        input.nozzle_name ??
+        `${input.nozzle_material} ${input.nozzle_diameter_mm}mm Nozzle`;
+      const createdAssetIds: string[] = [];
+
+      for (let i = 0; i < quantity; i++) {
+        const createdAsset = await this.databaseService.query<{ asset_id: string }>(
+          `
+            INSERT INTO asset_instances (
+              company_id,
+              asset_type,
+              nozzle_name,
+              nozzle_brand,
+              nozzle_diameter_mm,
+              nozzle_material,
+              nozzle_max_temp,
+              purchase_price,
+              location,
+              notes
+            )
+            VALUES ($1, 'nozzle', $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING asset_id
+          `,
+          [
+            companyId,
+            input.nozzle_name ?? null,
+            input.nozzle_brand ?? null,
+            input.nozzle_diameter_mm,
+            input.nozzle_material,
+            input.nozzle_max_temp ?? null,
+            input.purchase_price ?? null,
+            input.location ?? null,
+            input.notes ?? null
+          ],
+          client
+        );
+
+        const createdAssetRow = createdAsset.rows[0];
+
+        if (!createdAssetRow) {
+          throw new BadRequestException("Nozzle insert failed.");
+        }
+
+        await this.databaseService.query(
+          `
+            INSERT INTO asset_stock (
+              asset_id,
+              company_id,
+              status,
+              remaining_grams,
+              remaining_volume_ml,
+              currently_used_in_piece_id,
+              in_use_since,
+              installed_on_asset_id,
+              next_free_at
+            )
+            VALUES ($1, $2, 'available', NULL, NULL, NULL, NULL, NULL, NULL)
+          `,
+          [createdAssetRow.asset_id, companyId],
+          client
+        );
+
+        await this.logAssetEvent(
           companyId,
-          input.nozzle_diameter_mm,
-          input.nozzle_material,
-          input.nozzle_max_temp ?? null,
-          input.location ?? null,
-          input.notes ?? null
-        ],
-        client
-      );
+          createdAssetRow.asset_id,
+          "nozzle",
+          "addition",
+          nozzleName,
+          quantity > 1
+            ? `New nozzle added to inventory (${i + 1} of ${quantity})`
+            : "New nozzle added to inventory",
+          client
+        );
 
-      const createdAssetRow = createdAsset.rows[0];
-
-      if (!createdAssetRow) {
-        throw new BadRequestException("Nozzle insert failed.");
+        createdAssetIds.push(createdAssetRow.asset_id);
       }
 
-      await this.databaseService.query(
-        `
-          INSERT INTO asset_stock (
-            asset_id,
-            company_id,
-            status,
-            remaining_grams,
-            remaining_volume_ml,
-            currently_used_in_piece_id,
-            in_use_since,
-            installed_on_asset_id,
-            next_free_at
-          )
-          VALUES ($1, $2, 'available', NULL, NULL, NULL, NULL, NULL, NULL)
-        `,
-        [createdAssetRow.asset_id, companyId],
-        client
+      const createdAssets = await Promise.all(
+        createdAssetIds.map((id) => this.getAssetById(companyId, id, client))
       );
 
-      await this.logAssetEvent(
-        companyId,
-        createdAssetRow.asset_id,
-        "nozzle",
-        "addition",
-        `${input.nozzle_material} ${input.nozzle_diameter_mm}mm Nozzle`,
-        "New nozzle added to inventory",
-        client
-      );
-
-      return this.getAssetById(companyId, createdAssetRow.asset_id, client);
+      // Same backwards-compat convention as spools: single create returns the
+      // asset object, a multiplier batch returns the array.
+      return quantity > 1 ? createdAssets : createdAssets[0];
     });
   }
 
@@ -826,6 +1127,9 @@ export class AssetsService {
         "nozzle_diameter_mm",
         "nozzle_material",
         "nozzle_max_temp",
+        "nozzle_name",
+        "nozzle_brand",
+        "purchase_price",
         "location",
         "notes"
       ],
@@ -1031,6 +1335,8 @@ export class AssetsService {
         ai.nozzle_diameter_mm,
         ai.nozzle_material,
         ai.nozzle_max_temp,
+        ai.nozzle_name,
+        ai.nozzle_brand,
         ai.resin_brand,
         ai.resin_type,
         ai.resin_color,
@@ -1256,7 +1562,9 @@ export class AssetsService {
         .filter(Boolean).join(" ") || "Filament Spool";
     }
     if (asset.asset_type === "nozzle") {
-      return [asset.nozzle_material, asset.nozzle_diameter_mm ? `${asset.nozzle_diameter_mm}mm` : null]
+      // A user-given name wins; otherwise derive "<brand> <material> <dia>mm Nozzle".
+      if (asset.nozzle_name) return asset.nozzle_name;
+      return [asset.nozzle_brand, asset.nozzle_material, asset.nozzle_diameter_mm ? `${asset.nozzle_diameter_mm}mm` : null]
         .filter(Boolean).join(" ") + " Nozzle" || "Nozzle";
     }
     if (asset.asset_type === "resin_tank") {

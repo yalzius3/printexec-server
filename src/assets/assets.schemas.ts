@@ -147,10 +147,19 @@ export const createSpoolSchema = z
   });
 
 export const createNozzleSchema = z.object({
+  // Optional identity: a freeform display name and a brand. Neither is
+  // mandatory — an unnamed nozzle keeps its "<material> <diameter>mm Nozzle"
+  // derived label everywhere.
+  nozzle_name: z.string().trim().min(1).max(120).optional(),
+  nozzle_brand: z.string().trim().min(1).max(120).optional(),
   nozzle_diameter_mm: boundedNumber(0.1, 2),
   nozzle_material: nozzleMaterialSchema,
   nozzle_max_temp: boundedInt(100, 600).optional(),
+  purchase_price: z.coerce.number().min(0).nullable().optional(),
   location: locationSchema,
+  // Multiplier: create this many identical nozzle instances from one form
+  // submission (same convention as spools). Defaults to 1.
+  quantity: z.coerce.number().int().min(1).max(100).optional(),
   notes: z.string().optional()
 });
 
@@ -192,6 +201,9 @@ export const updateAssetSchema = z
     nozzle_diameter_mm: boundedNumber(0.1, 2).optional(),
     nozzle_material: nozzleMaterialSchema.optional(),
     nozzle_max_temp: boundedInt(100, 600).optional(),
+    // Nullable so the editor can CLEAR the name/brand (client sends null).
+    nozzle_name: z.string().trim().min(1).max(120).nullable().optional(),
+    nozzle_brand: z.string().trim().min(1).max(120).nullable().optional(),
     resin_brand: z.string().trim().min(1).optional(),
     resin_type: z.string().trim().min(1).optional(),
     resin_color: z.string().trim().min(1).optional(),

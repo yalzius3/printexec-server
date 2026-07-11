@@ -94,6 +94,14 @@ export class AssetsController {
     return this.assetsService.listMaterialPricing(companyId);
   }
 
+  // Aggregated insights for the Assets → Overview tab. Static path declared
+  // before :assetId so it isn't swallowed as an id.
+  @Get("overview")
+  @RequirePermission("view_assets")
+  getAssetsOverview(@CompanyId() companyId: string) {
+    return this.assetsService.getAssetsOverview(companyId);
+  }
+
   @Get(":assetId")
   @RequirePermission("view_assets")
   getAsset(
