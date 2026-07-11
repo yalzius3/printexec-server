@@ -76,10 +76,25 @@ export class FinanceCostingService {
       [companyId]
     );
     const perOrder = result.rows.reduce((s, r) => s + Number(r.computed_value), 0);
+
+    // The default sales-tax rate, so the Orders quotation preview can show the
+    // same VAT a generated invoice would carry. 0 when none is set.
+    const tax = await this.databaseService.query<{ rate_pct: string | null }>(
+      `
+        SELECT tr.rate_pct::text
+        FROM finance_settings fs
+        LEFT JOIN tax_rates tr
+          ON tr.tax_rate_id = fs.default_tax_rate_id AND tr.company_id = fs.company_id AND tr.is_active
+        WHERE fs.company_id = $1
+      `,
+      [companyId]
+    );
+
     return {
       per_order_recovery: round2(perOrder).toFixed(2),
       active_count: result.rows.length,
-      variables: result.rows
+      variables: result.rows,
+      default_tax_pct: tax.rows[0]?.rate_pct != null ? Number(tax.rows[0].rate_pct).toFixed(3) : "0"
     };
   }
 
