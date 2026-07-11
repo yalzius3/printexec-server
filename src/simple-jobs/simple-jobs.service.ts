@@ -1119,16 +1119,40 @@ export class SimpleJobsService {
         });
       }
     }
-    // Deadline-first (nulls last); ties keep the caller's queue order.
+    // LEAST-SLACK-FIRST (minimum-laxity). Slack = how much idle buffer a job
+    // has before its deadline if it started as early as possible right now:
+    //   slack = deadline − now − print_duration.
+    // The job with the LEAST slack is the most at-risk of finishing late, so it
+    // claims the earliest free slot first — this beats plain earliest-deadline
+    // ordering because it accounts for how LONG each job runs (a 3h job due in
+    // 4h is tighter than a 10min job due in 1h). Negative slack = already can't
+    // make it even if started now; those sort first so they're placed as early
+    // as physically possible. No deadline → +∞ slack (packed last, after every
+    // time-critical job). Ties break by earlier deadline, then the queue order.
     const orderIndex = new Map(input.items.map((i, idx) => [i.id, idx]));
+    const slackOf = (c: Candidate): number => {
+      if (!c.deadline) return Infinity;
+      const dl = Date.parse(c.deadline);
+      if (Number.isNaN(dl)) return Infinity;
+      return dl - now - Math.max(0, c.minutes ?? 0) * 60_000;
+    };
     candidates.sort((a, b) => {
+      const sa = slackOf(a);
+      const sb = slackOf(b);
+      if (sa !== sb) return sa - sb;
       const da = a.deadline ? Date.parse(a.deadline) : Infinity;
       const db_ = b.deadline ? Date.parse(b.deadline) : Infinity;
       if (da !== db_) return da - db_;
       return (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0);
     });
 
-    const placed: Array<{ id: string; is_bed: boolean; name: string; start_at: string; end_at: string }> = [];
+    // `slack_minutes` = the pre-scheduling buffer (drives the order); `late` =
+    // the placement actually finishes after the deadline; `deadline_at` echoes
+    // the deadline so the UI can explain either.
+    const placed: Array<{
+      id: string; is_bed: boolean; name: string; start_at: string; end_at: string;
+      deadline_at: string | null; slack_minutes: number | null; late: boolean;
+    }> = [];
     const skipped: Array<{ id: string; is_bed: boolean; name: string; reason: string }> = [];
 
     for (const c of candidates) {
@@ -1218,12 +1242,20 @@ export class SimpleJobsService {
       push(printerBusy, c.printer_id, iv);
       push(nozzleBusy, c.nozzle_id, iv);
       for (const sid of mySpools) push(spoolBusy, sid, iv);
+      const dlMs = c.deadline ? Date.parse(c.deadline) : NaN;
+      const hasDl = !Number.isNaN(dlMs);
       placed.push({
         id: c.id, is_bed: c.is_bed, name: c.name,
         start_at: startIso, end_at: new Date(startMs + durMs).toISOString(),
+        deadline_at: c.deadline ?? null,
+        slack_minutes: hasDl ? Math.round((dlMs - now - durMs) / 60_000) : null,
+        late: hasDl && startMs + durMs > dlMs,
       });
     }
 
-    return { placed, skipped };
+    // Surface the packing order actually used (least slack first) so the client
+    // can show why each job landed where it did — and how many will still miss
+    // their deadline even after optimal packing.
+    return { placed, skipped, ordered_by: "least_slack_first" as const };
   }
 }
