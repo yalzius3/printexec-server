@@ -9,6 +9,7 @@ import type { z } from "zod";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService } from "../database/database.service";
 import { OrderCostingService } from "../orders/order-costing";
+import { buildOrderInvoiceLines } from "../orders/order-invoice-lines";
 import type {
   DocumentLineInput,
   createAccountSchema,
@@ -1386,13 +1387,15 @@ export class FinanceService {
         );
       }
 
-      // Price the order EXACTLY as the Orders UI shows it: live per-piece cost
-      // × (1 + profit%). Using the shared costing service (not a re-derivation
-      // from stale SUM(order_pieces.cost)) is what keeps the invoice subtotal
-      // equal to the total the customer was quoted. totalCents is the sell
-      // price; baseCents is the COGS booked at issue time.
-      const totals = await this.orderCosting.computeTotals(companyId, orderId, client);
-      if (!totals.priced || totals.totalCents <= 0) {
+      // Price the order EXACTLY as the Orders UI shows it, and itemise it the
+      // same way the pricing bar's quotation does: the shared costing service
+      // returns the per-piece base breakdown + the order's custom charges, and
+      // order-invoice-lines.ts distributes the margin-loaded total across the
+      // pieces (custom charges kept as their own lines, outside the margin). The
+      // invoice subtotal therefore equals the quoted Total to the cent, and the
+      // customer sees the same lines on the quote and the bill.
+      const basis = await this.orderCosting.computeInvoiceBasis(companyId, orderId, client);
+      if (!basis.priced || Math.round(basis.total * 100) <= 0) {
         throw new BadRequestException(
           "This order has no priced pieces yet, so there is nothing to invoice."
         );
@@ -1440,21 +1443,28 @@ export class FinanceService {
       );
       const invoiceId = created.rows[0]!.invoice_id;
 
-      // One line at the full quoted price. Subtotal therefore equals the order's
-      // displayed total exactly (before tax); tax is added on top.
+      // Itemised lines — one per piece (the margin-loaded total distributed
+      // across pieces) plus each custom charge as its own line. Built by the
+      // shared distributor so they match the on-screen quotation exactly, and
+      // Σ lines === the quoted Total (before tax); tax is added per line on top.
+      // A degenerate empty result (only unpriceable residue) still bills the
+      // full total as a single line so an invoice is never empty.
+      const built = buildOrderInvoiceLines({
+        pieces: basis.pieces,
+        base: basis.base,
+        total: basis.total,
+        customLines: basis.customLines
+      });
+      const lineInputs: DocumentLineInput[] = (built.length > 0
+        ? built.map((l) => ({ description: l.description, quantity: l.quantity, unit_price: l.unitPrice }))
+        : [{ description: `Order ${row.order_number} — ${row.title}`, quantity: 1, unit_price: fromCents(Math.round(basis.total * 100)) }]
+      ).map((l) => ({ ...l, tax_rate_id: defaultTaxRateId }));
       const lineTotals = await this.writeDocumentLines(
         client,
         companyId,
         { table: "invoice_lines", fkColumn: "invoice_id", accountColumn: "revenue_account_id" },
         invoiceId,
-        [
-          {
-            description: `Order ${row.order_number} — ${row.title}`,
-            quantity: 1,
-            unit_price: fromCents(totals.totalCents),
-            tax_rate_id: defaultTaxRateId
-          }
-        ],
+        lineInputs,
         ["revenue"]
       );
       await this.databaseService.query(
