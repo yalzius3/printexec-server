@@ -251,10 +251,13 @@ export class OrderCostingService {
 
     // Costing-variable values are always available (the `variables` formula
     // symbol must be correct even for a no-preset "Standard pricing" order that
-    // selected some).
+    // selected some). computed_value > 0 mirrors the /finance/costing/summary
+    // feed the client bar sums from — a variable whose value has since dropped
+    // to 0 (or negative) must count as 0 on BOTH sides or the invoice diverges
+    // from the quoted Total.
     const varRes = await this.databaseService.query<{ costing_id: string; computed_value: string }>(
       `SELECT costing_id, computed_value::text FROM costing_variables
-        WHERE company_id = $1 AND is_active = TRUE`,
+        WHERE company_id = $1 AND is_active = TRUE AND computed_value > 0`,
       [companyId],
       executor
     );

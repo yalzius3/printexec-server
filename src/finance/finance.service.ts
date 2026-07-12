@@ -1353,9 +1353,14 @@ export class FinanceService {
     });
   }
 
-  // Generic ERP flow: draft an invoice straight from an order. The stored
-  // per-piece cost rollup × profit% is the suggested price; the draft stays
-  // fully editable before issue.
+  // Generic ERP flow: draft an invoice straight from an order, priced by the
+  // shared costing service. Idempotent while the invoice is still a DRAFT with
+  // no payments: calling it again RE-SYNCS the draft's lines, totals and the
+  // billed-to snapshot to the order's CURRENT pricing, so the draft can never
+  // drift from the quotation/pricing bar the operator is looking at (margin,
+  // labour, custom charges and slicer metadata often land AFTER confirm). Once
+  // issued (open/partial/paid) the invoice is a posted accounting document and
+  // this throws instead — void it first to re-bill.
   async createInvoiceFromOrder(companyId: string, userId: string, orderId: string) {
     return this.databaseService.transaction(async (client) => {
       const order = await this.databaseService.query<{
@@ -1376,14 +1381,21 @@ export class FinanceService {
       const row = order.rows[0];
       if (!row) throw new NotFoundException("Order not found.");
 
-      const existing = await this.databaseService.query<{ invoice_number: string }>(
-        `SELECT invoice_number FROM invoices WHERE company_id = $1 AND order_id = $2 AND status <> 'void' LIMIT 1`,
+      const existing = await this.databaseService.query<{
+        invoice_id: string;
+        invoice_number: string;
+        status: string;
+        amount_paid: string;
+      }>(
+        `SELECT invoice_id, invoice_number, status, amount_paid
+           FROM invoices WHERE company_id = $1 AND order_id = $2 AND status <> 'void' LIMIT 1`,
         [companyId, orderId],
         client
       );
-      if (existing.rows[0]) {
+      const prior = existing.rows[0];
+      if (prior && (prior.status !== "draft" || cents(prior.amount_paid) > 0)) {
         throw new ConflictException(
-          `Order ${row.order_number} is already invoiced (${existing.rows[0].invoice_number}).`
+          `Order ${row.order_number} is already invoiced (${prior.invoice_number}) and issued — void it to re-bill.`
         );
       }
 
@@ -1421,27 +1433,43 @@ export class FinanceService {
       );
       const defaultTaxRateId = taxDefault.rows[0]?.tax_rate_id ?? undefined;
 
-      const invoiceNumber = await this.nextDocNumber(client, companyId, "invoice", issueDate);
-      const created = await this.databaseService.query<{ invoice_id: string }>(
-        `
-          INSERT INTO invoices
-            (company_id, invoice_number, customer_id, counterparty_name, order_id, issue_date, memo, created_by)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-          RETURNING invoice_id
-        `,
-        [
-          companyId,
-          invoiceNumber,
-          row.customer_id,
-          counterparty,
-          orderId,
-          issueDate,
-          `Generated from order ${row.order_number}`,
-          userId
-        ],
-        client
-      );
-      const invoiceId = created.rows[0]!.invoice_id;
+      let invoiceId: string;
+      let invoiceNumber: string;
+      if (prior) {
+        // Re-sync an unissued draft: keep its number, refresh the billed-to
+        // snapshot (a customer may have been attached since confirm) — the
+        // lines are wiped and rewritten from the current basis below.
+        invoiceId = prior.invoice_id;
+        invoiceNumber = prior.invoice_number;
+        await this.databaseService.query(
+          `UPDATE invoices SET customer_id = $3, counterparty_name = $4, updated_at = NOW()
+            WHERE company_id = $1 AND invoice_id = $2`,
+          [companyId, invoiceId, row.customer_id, counterparty],
+          client
+        );
+      } else {
+        invoiceNumber = await this.nextDocNumber(client, companyId, "invoice", issueDate);
+        const created = await this.databaseService.query<{ invoice_id: string }>(
+          `
+            INSERT INTO invoices
+              (company_id, invoice_number, customer_id, counterparty_name, order_id, issue_date, memo, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING invoice_id
+          `,
+          [
+            companyId,
+            invoiceNumber,
+            row.customer_id,
+            counterparty,
+            orderId,
+            issueDate,
+            `Generated from order ${row.order_number}`,
+            userId
+          ],
+          client
+        );
+        invoiceId = created.rows[0]!.invoice_id;
+      }
 
       // Itemised lines — one per piece (the margin-loaded total distributed
       // across pieces) plus each custom charge as its own line. Built by the
@@ -1473,7 +1501,7 @@ export class FinanceService {
         client
       );
 
-      return { invoice_id: invoiceId, invoice_number: invoiceNumber };
+      return { invoice_id: invoiceId, invoice_number: invoiceNumber, resynced: Boolean(prior) };
     });
   }
 
