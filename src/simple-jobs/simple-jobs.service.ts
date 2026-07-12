@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { DatabaseService } from "../database/database.service";
 import { JobsService } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
+import { FinanceService } from "../finance/finance.service";
 import {
   propagateSlicerMetaToDuplicatesTx,
   quoteAssumedMeta,
@@ -23,7 +24,8 @@ export class SimpleJobsService {
   constructor(
     private readonly db: DatabaseService,
     private readonly jobsService: JobsService,
-    private readonly bedsService: BedsService
+    private readonly bedsService: BedsService,
+    private readonly finance: FinanceService
   ) {}
 
   // Pieces for orders that live in the company's CURRENT mode — so Simple only
@@ -486,6 +488,7 @@ export class SimpleJobsService {
   // ──────────────────────────────────────────────────────────────────
   async markFailed(
     companyId: string,
+    userId: string,
     pieceId: string,
     requeueTo: "assigned" | "pending",
     spoolWaste: { spool_asset_id: string; grams: number }[]
@@ -545,9 +548,13 @@ export class SimpleJobsService {
           WHERE company_id = $1 AND piece_id = $2`,
         [companyId, pieceId]
       );
+      // Only spools actually reserved for this piece have their stock touched;
+      // collect the same set (with waste > 0) to persist + book as loss below.
+      const wasteEvents: { spoolAssetId: string; grams: number }[] = [];
       for (const r of reserved.rows) {
         const planned = Number(r.planned_grams) || 0;
         const waste = wasteBySpool.get(r.spool_asset_id) ?? 0;
+        if (waste > 0) wasteEvents.push({ spoolAssetId: r.spool_asset_id, grams: waste });
         const restore = alreadyConsumed ? planned : 0;
         // Net change to the spool's physical remaining grams. Floored at 0 by
         // GREATEST so an over-estimate can't drive a spool negative.
@@ -566,6 +573,15 @@ export class SimpleJobsService {
           [r.spool_asset_id, delta]
         );
       }
+      // Persist the measured waste and book it to the ledger (DR Filament Waste
+      // / CR Inventory) in THIS transaction, so the loss record, its journal
+      // entry and the re-queue are all-or-nothing. Reads asset_instances cost,
+      // not the asset_stock grams we just changed, so ordering is irrelevant.
+      await this.finance.recordFilamentWaste(client, companyId, userId, {
+        pieceId,
+        orderId: piece.order_id,
+        wasteBySpool: wasteEvents
+      });
       // Drop the reservation rows BEFORE flipping status. Deleting them lets the
       // reserved-grams recalc trigger release the held grams; doing it first also
       // means the trigger that fires on a 'done'→non-terminal flip finds no rows

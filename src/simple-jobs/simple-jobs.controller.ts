@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Post, Query } from "@nestjs/common";
 import { z } from "zod";
 import { CompanyId } from "../common/company-id.decorator";
+import { UserId } from "../common/user-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import { SimpleJobsService } from "./simple-jobs.service";
@@ -124,9 +125,9 @@ export class SimpleJobsController {
 
   @Post("mark-failed")
   @RequirePermission("action_orders")
-  markFailed(@CompanyId() companyId: string, @Body() body: unknown) {
+  markFailed(@CompanyId() companyId: string, @UserId() userId: string, @Body() body: unknown) {
     const { piece_id, requeue_to, spool_waste } = parseWithSchema(markFailedSchema, body);
-    return this.simpleJobsService.markFailed(companyId, piece_id, requeue_to, spool_waste);
+    return this.simpleJobsService.markFailed(companyId, userId, piece_id, requeue_to, spool_waste);
   }
 
   // One-click constraint-satisfying packer: earliest slot per item where its

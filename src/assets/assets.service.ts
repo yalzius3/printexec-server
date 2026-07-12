@@ -375,7 +375,9 @@ export class AssetsService {
       nozzleUsage,
       printerFleet,
       printHours,
-      topPrinters
+      topPrinters,
+      wasteByMaterial,
+      wasteTotals
     ] = await Promise.all([
       // Filament on hand, per material+color (hex kept for swatches). The
       // client rolls colors up into per-material totals.
@@ -556,6 +558,42 @@ export class AssetsService {
           ORDER BY SUM(p.mins) DESC
           LIMIT 3`,
         [companyId, days]
+      ),
+      // Filament wasted per material within the window (measured failed-print
+      // scrap), valued at the cost snapshotted when each loss was recorded.
+      this.databaseService.query<{ material_type: string | null; grams: string; cost: string }>(
+        `SELECT material_type,
+                COALESCE(SUM(grams), 0) AS grams,
+                COALESCE(SUM(cost), 0)  AS cost
+           FROM filament_waste_events
+          WHERE company_id = $1
+            AND created_at >= now() - ($2 || ' days')::interval
+          GROUP BY material_type
+         HAVING SUM(grams) > 0
+          ORDER BY cost DESC, grams DESC`,
+        [companyId, days]
+      ),
+      // Waste roll-up: the window total, the equal window before it (delta
+      // chip) and the all-time total, in one scan.
+      this.databaseService.query<{
+        grams_period: string;
+        cost_period: string;
+        events_period: string;
+        cost_prev_period: string;
+        grams_lifetime: string;
+        cost_lifetime: string;
+      }>(
+        `SELECT
+           COALESCE(SUM(grams) FILTER (WHERE created_at >= now() - ($2 || ' days')::interval), 0) AS grams_period,
+           COALESCE(SUM(cost)  FILTER (WHERE created_at >= now() - ($2 || ' days')::interval), 0) AS cost_period,
+           COUNT(*) FILTER (WHERE created_at >= now() - ($2 || ' days')::interval)::int          AS events_period,
+           COALESCE(SUM(cost)  FILTER (WHERE created_at >= now() - ($3 || ' days')::interval
+                                         AND created_at <  now() - ($2 || ' days')::interval), 0) AS cost_prev_period,
+           COALESCE(SUM(grams), 0) AS grams_lifetime,
+           COALESCE(SUM(cost), 0)  AS cost_lifetime
+         FROM filament_waste_events
+        WHERE company_id = $1`,
+        [companyId, days, days * 2]
       )
     ]);
 
@@ -576,6 +614,19 @@ export class AssetsService {
           material_type: r.material_type,
           consumed_grams: num(r.consumed_grams)
         }))
+      },
+      waste: {
+        by_material: wasteByMaterial.rows.map((r) => ({
+          material_type: r.material_type,
+          grams: num(r.grams),
+          cost: num(r.cost)
+        })),
+        grams_period: num(wasteTotals.rows[0]?.grams_period),
+        cost_period: num(wasteTotals.rows[0]?.cost_period),
+        events_period: num(wasteTotals.rows[0]?.events_period),
+        cost_prev_period: num(wasteTotals.rows[0]?.cost_prev_period),
+        grams_lifetime: num(wasteTotals.rows[0]?.grams_lifetime),
+        cost_lifetime: num(wasteTotals.rows[0]?.cost_lifetime)
       },
       nozzles: {
         by_spec: nozzleSpecs.rows.map((r) => ({
