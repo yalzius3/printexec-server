@@ -149,6 +149,21 @@ export const createOrderSchema = z
     }
   });
 
+// Per-order pricing tweak persisted on orders.costing_config. variable_ids fold
+// Finance costing variables into the equation's `variables`; custom_lines are
+// ad-hoc charges; margin_override_pct mirrors profit_pct (the canonical override).
+const costingCustomLineSchema = z.object({
+  label: z.string().trim().min(1).max(120),
+  amount: boundedNumber(0, 100000000)
+});
+const costingConfigSchema = z
+  .object({
+    variable_ids: z.array(uuidSchema).max(64).optional(),
+    custom_lines: z.array(costingCustomLineSchema).max(32).optional(),
+    margin_override_pct: boundedNumber(0, 1000000).nullable().optional()
+  })
+  .strip();
+
 export const updateOrderSchema = z
   .object({
     // Assigning a customer to an order that was created without one (and, after
@@ -180,7 +195,11 @@ export const updateOrderSchema = z
     // Operator-entered labour cost for the whole order (nullable to clear).
     labor_cost: boundedNumber(0, 100000000).nullable().optional(),
     // Operator-entered profit margin (%) for the order (nullable to clear).
-    profit_pct: boundedNumber(0, 1000000).nullable().optional()
+    profit_pct: boundedNumber(0, 1000000).nullable().optional(),
+    // Which pricing preset prices this order (null clears → legacy pricing).
+    costing_preset_id: uuidSchema.nullable().optional(),
+    // Per-order costing tweak: selected variables + custom charges (null clears).
+    costing_config: costingConfigSchema.nullable().optional()
   })
   .superRefine((value, ctx) => {
     if (value.established_at && value.deadline && value.established_at > value.deadline) {

@@ -5,6 +5,7 @@ import { reevaluateBedAfterPieceRemoval, releasePrinterForPieceTx } from "../com
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import { CustomersService } from "../customers/customers.service";
+import { OrderCostingService } from "./order-costing";
 import { deriveTenantCodeBase, formatOrderNumber } from "../common/tenant-code";
 import { bumpOrderSequence } from "./order-number";
 import {
@@ -55,6 +56,8 @@ type OrderRow = {
   piece_count: string;
   scheduled_piece_count: string;
   printable_piece_count: string;
+  costing_preset_id: string | null;
+  costing_config: Record<string, unknown> | null;
   order_cost: string | null;
   order_total: string | null;
 };
@@ -63,7 +66,8 @@ type OrderRow = {
 export class OrdersService {
   constructor(
     private readonly databaseService: DatabaseService,
-    private readonly customersService: CustomersService
+    private readonly customersService: CustomersService,
+    private readonly orderCosting: OrderCostingService
   ) {}
 
   async listOrders(companyId: string, query: ListOrdersQuery) {
@@ -106,127 +110,28 @@ export class OrdersService {
     return this.attachInvoiceTotals(companyId, result.rows);
   }
 
-  // Recompute each order's total to equal its invoice total — sum of every
-  // piece's live cost (from its cost_inputs + company rates + order labour),
-  // then × (1 + profit%). This matches the order-detail invoice exactly, even
-  // when the stored per-piece `cost` snapshots are stale or missing. Best-effort:
-  // on any failure we keep the SQL fallback already on each row.
+  // Recompute each order's total to equal its invoice total, via the SAME shared
+  // costing service the invoice is built from: it evaluates the order's preset
+  // formula (or the legacy base × (1 + profit%) when no preset is set) from each
+  // piece's live cost_inputs + company rates + order labour. Routing the list
+  // through it (rather than a re-derivation here) keeps the list total, the
+  // order-detail total and the eventual invoice byte-identical. Best-effort: on
+  // any failure we keep the SQL fallback already on each row.
   private async attachInvoiceTotals(companyId: string, orders: OrderRow[]): Promise<OrderRow[]> {
     if (orders.length === 0) return orders;
     try {
-      const orderIds = orders.map((o) => o.order_id);
-
-      // material_type → avg price/g (priced spools only). Mirrors assets pricing.
-      const matRes = await this.databaseService.query<{ material_type: string; p: string | null }>(
-        `SELECT fr.material_type,
-                SUM(ai.purchase_price) / NULLIF(SUM(ai.initial_grams), 0) AS p
-           FROM asset_instances ai
-           JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
-          WHERE ai.company_id = $1
-            AND ai.asset_type = 'filament_spool'
-            AND ai.parent_asset_id IS NULL
-            AND ai.purchase_price > 0
-            AND ai.initial_grams > 0
-            AND fr.material_type IS NOT NULL
-          GROUP BY fr.material_type`,
-        [companyId]
+      const totals = await this.orderCosting.computeTotalsForOrders(
+        companyId,
+        orders.map((o) => o.order_id)
       );
-      const matMap = new Map<string, number>();
-      for (const r of matRes.rows) {
-        if (r.p != null && Number.isFinite(Number(r.p))) matMap.set(r.material_type, Number(r.p));
-      }
-
-      const compRes = await this.databaseService.query<{ electricity_price_per_kwh: string | null }>(
-        "SELECT electricity_price_per_kwh FROM companies WHERE company_id = $1",
-        [companyId]
-      );
-      const rateRaw = compRes.rows[0]?.electricity_price_per_kwh;
-      const elecRate = rateRaw != null && rateRaw !== "" ? Number(rateRaw) : NaN;
-
-      const pcRes = await this.databaseService.query<{
-        order_id: string;
-        cost: string | null;
-        cost_inputs: { grams?: string[]; time?: string; failure?: string } | null;
-        required_filament_material: string | null;
-        requires_multicolor: boolean;
-        color_slots: { slot_material: string }[] | null;
-      }>(
-        `SELECT op.order_id, op.cost, op.cost_inputs, op.required_filament_material, op.requires_multicolor,
-                (
-                  SELECT COALESCE(json_agg(json_build_object('slot_material', cs.slot_material) ORDER BY cs.sequence_order), '[]'::json)
-                  FROM order_piece_color_slots cs WHERE cs.piece_id = op.piece_id
-                ) AS color_slots
-           FROM order_pieces op
-          WHERE op.company_id = $1 AND op.order_id = ANY($2::uuid[])`,
-        [companyId, orderIds]
-      );
-
-      const piecesByOrder = new Map<string, typeof pcRes.rows>();
-      for (const p of pcRes.rows) {
-        const list = piecesByOrder.get(p.order_id) ?? [];
-        list.push(p);
-        piecesByOrder.set(p.order_id, list);
-      }
-
-      const FALLBACK_WATTS = 230;
-      const pieceCost = (
-        p: (typeof pcRes.rows)[number],
-        laborPerPiece: number,
-      ): number | null => {
-        const ci = p.cost_inputs;
-        if (ci) {
-          const minutes = Number(ci.time);
-          if (Number.isFinite(minutes) && minutes > 0) {
-            const grams = (ci.grams ?? []).map((g) => Number(g) || 0);
-            let material = 0;
-            let totalGrams = 0;
-            for (let j = 0; j < grams.length; j += 1) {
-              const g = grams[j] || 0;
-              if (g <= 0) continue;
-              totalGrams += g;
-              const mat = p.requires_multicolor && p.color_slots?.[j]
-                ? p.color_slots[j]!.slot_material
-                : p.required_filament_material ?? undefined;
-              const price = mat ? matMap.get(mat) : undefined;
-              if (price != null) material += price * g;
-            }
-            if (totalGrams > 0) {
-              const electricity = Number.isFinite(elecRate)
-                ? ((FALLBACK_WATTS * minutes) / 60 / 1000) * elecRate
-                : 0;
-              const labor = Number.isFinite(laborPerPiece) ? laborPerPiece : 0;
-              const complexity = totalGrams / minutes + 1;
-              const failPct = Number(ci.failure);
-              const failFactor = 1 + (Number.isFinite(failPct) ? failPct : 0) / 100;
-              return (material + electricity + labor) * complexity * failFactor;
-            }
-          }
-        }
-        const stored = p.cost != null && p.cost !== "" ? Number(p.cost) : null;
-        return stored != null && Number.isFinite(stored) ? stored : null;
-      };
-
       return orders.map((o) => {
-        const pieces = piecesByOrder.get(o.order_id) ?? [];
-        if (pieces.length === 0) return o;
-        const laborNum = o.labor_cost != null && o.labor_cost !== "" ? Number(o.labor_cost) : NaN;
-        const laborPerPiece = Number.isFinite(laborNum) ? laborNum / Math.max(1, pieces.length) : NaN;
-        let base = 0;
-        let anyPriced = false;
-        for (const p of pieces) {
-          const c = pieceCost(p, laborPerPiece);
-          if (c != null) {
-            anyPriced = true;
-            base += c;
-          }
-        }
-        if (!anyPriced) return { ...o, order_cost: null, order_total: null };
-        const profit = o.profit_pct != null && o.profit_pct !== "" ? Number(o.profit_pct) : 0;
-        const total = base * (1 + (Number.isFinite(profit) ? profit : 0) / 100);
+        const t = totals.get(o.order_id);
+        if (!t) return o; // no pieces → keep the SQL fallback already on the row
+        if (!t.priced) return { ...o, order_cost: null, order_total: null };
         return {
           ...o,
-          order_cost: (Math.round(base * 100) / 100).toString(),
-          order_total: (Math.round(total * 100) / 100).toString(),
+          order_cost: (t.baseCents / 100).toString(),
+          order_total: (t.totalCents / 100).toString()
         };
       });
     } catch {
@@ -259,6 +164,37 @@ export class OrdersService {
     }
 
     return row;
+  }
+
+  // Per-material filament waste for one order: grams + the money it cost, valued
+  // at the per-gram cost snapshotted when each failed print was recorded. Drives
+  // the small "filament wasted" line in the order detail (grams ⇄ money toggle).
+  async getOrderWaste(companyId: string, orderId: string) {
+    const result = await this.databaseService.query<{
+      material_type: string | null;
+      grams: string;
+      cost: string;
+    }>(
+      `SELECT material_type,
+              COALESCE(SUM(grams), 0) AS grams,
+              COALESCE(SUM(cost), 0)  AS cost
+         FROM filament_waste_events
+        WHERE company_id = $1 AND order_id = $2
+        GROUP BY material_type
+       HAVING SUM(grams) > 0
+        ORDER BY cost DESC, grams DESC`,
+      [companyId, orderId]
+    );
+    const byMaterial = result.rows.map((r) => ({
+      material_type: r.material_type,
+      grams: Number(r.grams) || 0,
+      cost: Number(r.cost) || 0
+    }));
+    return {
+      by_material: byMaterial,
+      total_grams: byMaterial.reduce((s, r) => s + r.grams, 0),
+      total_cost: byMaterial.reduce((s, r) => s + r.cost, 0)
+    };
   }
 
   async createOrder(companyId: string, input: CreateOrderInput) {
@@ -768,6 +704,8 @@ export class OrdersService {
         o.notes,
         o.labor_cost,
         o.profit_pct,
+        o.costing_preset_id,
+        o.costing_config,
         o.created_at,
         o.last_updated_at,
         c.customer_type,

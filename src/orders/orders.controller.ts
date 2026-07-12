@@ -61,6 +61,18 @@ export class OrdersController {
     return this.ordersService.getOrderById(companyId, orderId);
   }
 
+  // Filament wasted on this order's failed prints, per material (grams + the
+  // cost snapshotted when each loss was recorded). Its own endpoint so the core
+  // order shape stays untouched and the detail view can lazy-load it.
+  @Get(":orderId/waste")
+  @RequirePermission("view_orders")
+  getOrderWaste(
+    @CompanyId() companyId: string,
+    @Param("orderId") orderId: string
+  ) {
+    return this.ordersService.getOrderWaste(companyId, orderId);
+  }
+
   @Post()
   @RequirePermission("action_orders")
   createOrder(
