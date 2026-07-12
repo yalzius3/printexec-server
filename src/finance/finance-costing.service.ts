@@ -1,8 +1,14 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import type { z } from "zod";
 import { buildUpdateClause } from "../common/sql";
+import { validateFormula } from "../orders/costing-formula";
 import { DatabaseService } from "../database/database.service";
-import type { createCostingSchema, updateCostingSchema } from "./finance.schemas";
+import type {
+  createCostingSchema,
+  createPresetSchema,
+  updateCostingSchema,
+  updatePresetSchema
+} from "./finance.schemas";
 
 // ════════════════════════════════════════════════════════════════
 // FinanceCostingService — reusable capital-recovery / margin calculators.
@@ -16,6 +22,8 @@ import type { createCostingSchema, updateCostingSchema } from "./finance.schemas
 
 type CreateCostingInput = z.infer<typeof createCostingSchema>;
 type UpdateCostingInput = z.infer<typeof updateCostingSchema>;
+type CreatePresetInput = z.infer<typeof createPresetSchema>;
+type UpdatePresetInput = z.infer<typeof updatePresetSchema>;
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -90,11 +98,32 @@ export class FinanceCostingService {
       [companyId]
     );
 
+    // The two pricing constants a preset formula can reference (margin default +
+    // orders/month divisor), so the order bar can price a preset without the
+    // finance-only /constants endpoint. Effective = override ?? auto ?? fallback.
+    const consts = await this.databaseService.query<{
+      key: string;
+      override_value: string | null;
+      auto_value: string | null;
+    }>(
+      `SELECT key, override_value::text, auto_value::text
+         FROM finance_constants
+        WHERE company_id = $1 AND key IN ('default_profit_margin_pct', 'avg_orders_per_month')`,
+      [companyId]
+    );
+    const byKey = new Map(consts.rows.map((r) => [r.key, r]));
+    const marginRow = byKey.get("default_profit_margin_pct");
+    const marginEff = marginRow?.override_value ?? marginRow?.auto_value ?? null;
+    const opmRow = byKey.get("avg_orders_per_month");
+    const opmEff = opmRow?.override_value ?? opmRow?.auto_value ?? null;
+
     return {
       per_order_recovery: round2(perOrder).toFixed(2),
       active_count: result.rows.length,
       variables: result.rows,
-      default_tax_pct: tax.rows[0]?.rate_pct != null ? Number(tax.rows[0].rate_pct).toFixed(3) : "0"
+      default_tax_pct: tax.rows[0]?.rate_pct != null ? Number(tax.rows[0].rate_pct).toFixed(3) : "0",
+      default_margin_pct: marginEff != null ? Number(marginEff).toFixed(2) : "30",
+      orders_per_month: opmEff != null ? Number(opmEff).toFixed(2) : "0"
     };
   }
 
@@ -215,6 +244,112 @@ export class FinanceCostingService {
       [companyId, costingId]
     );
     if (result.rowCount === 0) throw new NotFoundException("Costing variable not found.");
+    return { deleted: true };
+  }
+
+  // ── Costing presets (reusable pricing formulas) ─────────────────────────────
+  // A preset is a named formula over the whitelisted costing symbols. The Orders
+  // pricing bar reads them (view_orders is allowed on the list endpoint) and the
+  // server evaluates the same formula when pricing/invoicing, so quote == invoice.
+
+  private assertFormula(formula: string) {
+    const check = validateFormula(formula);
+    if (!check.ok) throw new BadRequestException(`Invalid formula: ${check.error}`);
+  }
+
+  async listPresets(companyId: string) {
+    const result = await this.databaseService.query(
+      `
+        SELECT preset_id, name, formula, default_variable_ids, is_default, is_active,
+               notes, created_at, updated_at
+        FROM costing_presets
+        WHERE company_id = $1
+        ORDER BY is_active DESC, is_default DESC, name
+      `,
+      [companyId]
+    );
+    return result.rows;
+  }
+
+  async createPreset(companyId: string, userId: string, input: CreatePresetInput) {
+    this.assertFormula(input.formula);
+    return this.databaseService.transaction(async (client) => {
+      // At most one default per company: clear the current default first.
+      if (input.is_default) {
+        await client.query(
+          `UPDATE costing_presets SET is_default = FALSE, updated_at = now()
+           WHERE company_id = $1 AND is_default`,
+          [companyId]
+        );
+      }
+      const result = await client.query<{ preset_id: string }>(
+        `
+          INSERT INTO costing_presets
+            (company_id, name, formula, default_variable_ids, is_default, notes, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          RETURNING preset_id
+        `,
+        [
+          companyId,
+          input.name,
+          input.formula,
+          input.default_variable_ids ?? [],
+          input.is_default ?? false,
+          input.notes ?? null,
+          userId
+        ]
+      );
+      return { preset_id: result.rows[0]!.preset_id };
+    });
+  }
+
+  async updatePreset(companyId: string, presetId: string, input: UpdatePresetInput) {
+    if (input.formula !== undefined) this.assertFormula(input.formula);
+    return this.databaseService.transaction(async (client) => {
+      const existing = await client.query(
+        `SELECT preset_id FROM costing_presets WHERE company_id = $1 AND preset_id = $2`,
+        [companyId, presetId]
+      );
+      if (!existing.rows[0]) throw new NotFoundException("Costing preset not found.");
+
+      // Promoting this preset to default demotes whichever other one held it.
+      if (input.is_default === true) {
+        await client.query(
+          `UPDATE costing_presets SET is_default = FALSE, updated_at = now()
+           WHERE company_id = $1 AND is_default AND preset_id <> $2`,
+          [companyId, presetId]
+        );
+      }
+
+      const patch: Record<string, unknown> = {};
+      if (input.name !== undefined) patch.name = input.name;
+      if (input.formula !== undefined) patch.formula = input.formula;
+      if (input.default_variable_ids !== undefined) patch.default_variable_ids = input.default_variable_ids;
+      if (input.is_default !== undefined) patch.is_default = input.is_default;
+      if (input.is_active !== undefined) patch.is_active = input.is_active;
+      if (input.notes !== undefined) patch.notes = input.notes;
+
+      const { clause, values } = buildUpdateClause(patch, 3);
+      if (!clause) throw new BadRequestException("Nothing to update.");
+      const result = await client.query(
+        `
+          UPDATE costing_presets
+          SET ${clause}, updated_at = now()
+          WHERE company_id = $1 AND preset_id = $2
+          RETURNING preset_id, is_default
+        `,
+        [companyId, presetId, ...values]
+      );
+      return result.rows[0];
+    });
+  }
+
+  async removePreset(companyId: string, presetId: string) {
+    const result = await this.databaseService.query(
+      `DELETE FROM costing_presets WHERE company_id = $1 AND preset_id = $2`,
+      [companyId, presetId]
+    );
+    if (result.rowCount === 0) throw new NotFoundException("Costing preset not found.");
     return { deleted: true };
   }
 

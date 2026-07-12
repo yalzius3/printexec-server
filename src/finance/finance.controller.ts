@@ -16,6 +16,7 @@ import {
   createInvoiceSchema,
   createJournalEntrySchema,
   createPaymentSchema,
+  createPresetSchema,
   createRecurringBillSchema,
   createTaxRateSchema,
   createVendorSchema,
@@ -34,6 +35,7 @@ import {
   orderIdParamSchema,
   paymentIdParamSchema,
   periodQuerySchema,
+  presetIdParamSchema,
   taxRateIdParamSchema,
   updateAccountSchema,
   updateBillSchema,
@@ -41,6 +43,7 @@ import {
   updateCostingSchema,
   updateFinanceSettingsSchema,
   updateInvoiceSchema,
+  updatePresetSchema,
   updateRecurringBillSchema,
   updateTaxRateSchema,
   updateVendorSchema,
@@ -610,6 +613,52 @@ export class FinanceController {
   deleteCosting(@CompanyId() companyId: string, @Param() params: unknown) {
     const { costingId } = parseWithSchema(costingIdParamSchema, params);
     return this.costingService.remove(companyId, costingId);
+  }
+
+  // ── Costing presets (reusable pricing formulas) ─────────────────────────────
+
+  // Read by the Orders pricing screen too (to pick/apply a preset), so order
+  // staff can list them without the Finance module.
+  @Get("costing/presets")
+  @RequirePermission(["view_finance", "view_orders"])
+  listPresets(@CompanyId() companyId: string) {
+    return this.costingService.listPresets(companyId);
+  }
+
+  @Post("costing/presets")
+  @RequirePermission("action_finance")
+  createPreset(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Body() body: unknown
+  ) {
+    return this.costingService.createPreset(
+      companyId,
+      userId,
+      parseWithSchema(createPresetSchema, body)
+    );
+  }
+
+  @Patch("costing/presets/:presetId")
+  @RequirePermission("action_finance")
+  updatePreset(
+    @CompanyId() companyId: string,
+    @Param() params: unknown,
+    @Body() body: unknown
+  ) {
+    const { presetId } = parseWithSchema(presetIdParamSchema, params);
+    return this.costingService.updatePreset(
+      companyId,
+      presetId,
+      parseWithSchema(updatePresetSchema, body)
+    );
+  }
+
+  @Delete("costing/presets/:presetId")
+  @RequirePermission("action_finance")
+  deletePreset(@CompanyId() companyId: string, @Param() params: unknown) {
+    const { presetId } = parseWithSchema(presetIdParamSchema, params);
+    return this.costingService.removePreset(companyId, presetId);
   }
 
   // ── Reports ────────────────────────────────────────────────────────────────

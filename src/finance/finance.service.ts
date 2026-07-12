@@ -183,7 +183,7 @@ export class FinanceService {
     params: {
       entryDate: string;
       memo?: string | null;
-      sourceType: "manual" | "invoice" | "bill" | "payment" | "expense" | "reversal";
+      sourceType: "manual" | "invoice" | "bill" | "payment" | "expense" | "reversal" | "waste";
       sourceId?: string | null;
       reversesEntryId?: string | null;
       lines: JournalLineSpec[];
@@ -241,6 +241,154 @@ export class FinanceService {
     }
 
     return { entry_id: entryId, entry_number: entryNumber };
+  }
+
+  // ── Filament waste ────────────────────────────────────────────────────────
+  // Record the material lost on a failed print and book it to the ledger.
+  //
+  // Called from SimpleJobsService.markFailed INSIDE its transaction (pass the
+  // same client), so the durable waste rows, the ledger entry and the piece
+  // re-queue all commit together. Each wasted spool is costed from its OWN
+  // price/g (purchase_price / initial_grams), falling back to the material
+  // average — the same basis order costing uses — and both the material and the
+  // cost are SNAPSHOTTED onto the row so later re-pricing or spool deletion can
+  // never rewrite the loss.
+  //
+  // The booked entry is the exact mirror of the COGS entry an invoice posts:
+  //   DR 5100 Filament Waste (expense)  /  CR 1200 Inventory
+  // i.e. production consumption that produced scrap instead of a sellable good.
+  // Spools with no cost basis still get a waste row (grams only) but book
+  // nothing, so an unpriced spool never blocks the failure.
+  async recordFilamentWaste(
+    client: PoolClient,
+    companyId: string,
+    userId: string | null,
+    params: {
+      pieceId: string;
+      orderId: string;
+      wasteBySpool: { spoolAssetId: string; grams: number }[];
+    }
+  ): Promise<{ grams: number; cost: number }> {
+    const spools = params.wasteBySpool.filter((w) => w.grams > 0);
+    if (spools.length === 0) return { grams: 0, cost: 0 };
+
+    const spoolIds = spools.map((s) => s.spoolAssetId);
+
+    // Each spool's material + its own price/g (NULL when unpriced).
+    const spoolMeta = await this.databaseService.query<{
+      asset_id: string;
+      material_type: string | null;
+      spool_ppg: string | null;
+    }>(
+      `SELECT ai.asset_id,
+              fr.material_type,
+              CASE WHEN ai.initial_grams > 0 AND ai.purchase_price > 0
+                   THEN ai.purchase_price / ai.initial_grams END AS spool_ppg
+         FROM asset_instances ai
+         LEFT JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+        WHERE ai.company_id = $1 AND ai.asset_id = ANY($2::uuid[])`,
+      [companyId, spoolIds],
+      client
+    );
+    const metaById = new Map(spoolMeta.rows.map((r) => [r.asset_id, r]));
+
+    // Material average price/g — the fallback when a spool carries no price.
+    // Mirrors AssetsService.listMaterialPricing / OrderCostingService exactly.
+    const matRes = await this.databaseService.query<{ material_type: string; p: string | null }>(
+      `SELECT fr.material_type,
+              SUM(ai.purchase_price) / NULLIF(SUM(ai.initial_grams), 0) AS p
+         FROM asset_instances ai
+         JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+        WHERE ai.company_id = $1
+          AND ai.asset_type = 'filament_spool'
+          AND ai.parent_asset_id IS NULL
+          AND ai.purchase_price > 0
+          AND ai.initial_grams > 0
+          AND fr.material_type IS NOT NULL
+        GROUP BY fr.material_type`,
+      [companyId],
+      client
+    );
+    const matAvg = new Map<string, number>();
+    for (const r of matRes.rows) {
+      if (r.p != null && Number.isFinite(Number(r.p))) matAvg.set(r.material_type, Number(r.p));
+    }
+
+    type WasteRow = {
+      spoolAssetId: string;
+      materialType: string | null;
+      grams: number;
+      unit: number;
+      costCents: number;
+    };
+    const rows: WasteRow[] = spools.map((w) => {
+      const meta = metaById.get(w.spoolAssetId);
+      const material = meta?.material_type ?? null;
+      const spoolPpg = meta?.spool_ppg != null ? Number(meta.spool_ppg) : NaN;
+      const unit = Number.isFinite(spoolPpg) && spoolPpg > 0
+        ? spoolPpg
+        : (material != null ? matAvg.get(material) ?? 0 : 0);
+      return {
+        spoolAssetId: w.spoolAssetId,
+        materialType: material,
+        grams: w.grams,
+        unit,
+        costCents: Math.round(w.grams * unit * 100)
+      };
+    });
+
+    const totalCents = rows.reduce((s, r) => s + r.costCents, 0);
+
+    // Book DR Filament Waste / CR Inventory for the priced total (skip when
+    // nothing could be priced — postEntry requires a positive, balanced entry).
+    let entryId: string | null = null;
+    if (totalCents > 0) {
+      const wasteAccount = await this.systemAccount(client, companyId, "filament_waste");
+      const inventoryAccount = await this.systemAccount(client, companyId, "inventory");
+      const today = new Date().toISOString().slice(0, 10);
+      const entry = await this.postEntry(client, companyId, userId, {
+        entryDate: today,
+        memo: "Filament wasted on a failed print",
+        sourceType: "waste",
+        sourceId: params.pieceId,
+        lines: [
+          { accountId: wasteAccount, debit: totalCents, credit: 0, description: "Filament waste (spoilage)" },
+          { accountId: inventoryAccount, debit: 0, credit: totalCents, description: "Inventory / production consumed" }
+        ]
+      });
+      entryId = entry.entry_id;
+    }
+
+    let totalGrams = 0;
+    let totalCost = 0;
+    for (const r of rows) {
+      totalGrams += r.grams;
+      totalCost += r.costCents / 100;
+      await this.databaseService.query(
+        `
+          INSERT INTO filament_waste_events
+            (company_id, order_id, piece_id, spool_asset_id, material_type,
+             grams, unit_cost_per_gram, cost, source, journal_entry_id, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'simple_failed', $9, $10)
+        `,
+        [
+          companyId,
+          params.orderId,
+          params.pieceId,
+          r.spoolAssetId,
+          r.materialType,
+          r.grams,
+          r.unit,
+          r.costCents / 100,
+          // Only priced rows are covered by the entry; unpriced rows book nothing.
+          r.costCents > 0 ? entryId : null,
+          userId
+        ],
+        client
+      );
+    }
+
+    return { grams: totalGrams, cost: totalCost };
   }
 
   // Post the exact mirror of an existing entry (void mechanics).

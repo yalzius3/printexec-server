@@ -391,6 +391,37 @@ export const updateCostingSchema = z
 
 export const costingIdParamSchema = z.object({ costingId: uuidSchema });
 
+// ── Costing presets (reusable pricing formulas) ─────────────────────────────
+// `formula` is a plain arithmetic string over the whitelisted costing symbols;
+// its parse + allowed-identifier check happens in the service (validateFormula),
+// so here we only guard shape/length.
+
+const presetFormulaSchema = z.string().trim().min(1).max(500);
+const presetVariableIdsSchema = z.array(uuidSchema).max(64);
+
+export const createPresetSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  formula: presetFormulaSchema,
+  default_variable_ids: presetVariableIdsSchema.optional(),
+  is_default: z.boolean().optional(),
+  notes: z.string().trim().max(2000).optional()
+});
+
+export const updatePresetSchema = z
+  .object({
+    name: z.string().trim().min(1).max(120).optional(),
+    formula: presetFormulaSchema.optional(),
+    default_variable_ids: presetVariableIdsSchema.optional(),
+    is_default: z.boolean().optional(),
+    is_active: z.boolean().optional(),
+    notes: z.string().trim().max(2000).nullable().optional()
+  })
+  .refine((v) => Object.keys(v).length > 0, {
+    message: "At least one field is required."
+  });
+
+export const presetIdParamSchema = z.object({ presetId: uuidSchema });
+
 // ── Finance constants ────────────────────────────────────────────────────────
 
 export const updateConstantSchema = z.object({
