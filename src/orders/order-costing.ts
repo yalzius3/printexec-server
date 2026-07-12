@@ -313,7 +313,7 @@ export class OrderCostingService {
             ? ((FALLBACK_WATTS * minutes) / 60 / 1000) * elecRate
             : 0;
           const labor = Number.isFinite(laborPerPiece) ? laborPerPiece : 0;
-          const complexity = minutes / totalGrams + 1;
+          const complexity = Math.max(1, minutes / totalGrams);
           const failPct = Number(ci.failure);
           const failFactor = 1 + (Number.isFinite(failPct) ? failPct : 0) / 100;
           const m = material * complexity * failFactor;
