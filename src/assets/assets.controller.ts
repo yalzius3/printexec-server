@@ -9,6 +9,7 @@ import {
   Delete
 } from "@nestjs/common";
 import { CompanyId } from "../common/company-id.decorator";
+import { UserId } from "../common/user-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import {
@@ -117,10 +118,12 @@ export class AssetsController {
   @RequirePermission("action_assets")
   createSpool(
     @CompanyId() companyId: string,
+    @UserId() userId: string,
     @Body() body: unknown
   ) {
     return this.assetsService.createSpool(
       companyId,
+      userId,
       parseWithSchema(createSpoolSchema, body)
     );
   }

@@ -119,7 +119,23 @@ export const createSpoolSchema = z
     // submission (e.g. a box of 4). Defaults to 1. Each spool becomes its own
     // physical inventory row; they share the resolved filament reference.
     quantity: z.coerce.number().int().min(1).max(100).optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    // ── Finance integration (Assets → Finance) ──────────────────────────────
+    // When a vendor name is supplied, adding the spool also books an itemized
+    // filament-purchase bill (see FinanceService.recordFilamentPurchase). All
+    // fields are optional so plain spool intake — and other callers such as the
+    // bulk piece editor — are unchanged.
+    // Free-text vendor; matched case-insensitively against existing finance
+    // vendors, registering a new one when nothing matches.
+    vendor_name: z.string().trim().min(1).max(200).optional(),
+    // Optional shipping/handling charge, booked as its own bill line.
+    delivery_cost: z.coerce.number().min(0).max(999999999).optional(),
+    // "Purchase Price already includes tax" — true suppresses tax (the price is
+    // the gross line total); false/absent adds the company default tax rate.
+    price_includes_tax: z.boolean().optional(),
+    // "Already paid" — true posts the bill AND settles it from Cash in one step;
+    // false/absent leaves it as an open payable.
+    already_paid: z.boolean().optional()
   })
   .superRefine((value, ctx) => {
     if (!value.filament_ref_id && !value.custom_reference) {

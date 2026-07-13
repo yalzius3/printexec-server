@@ -1,5 +1,6 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
+import { FinanceService } from "../finance/finance.service";
 import { buildUpdateClause } from "../common/sql";
 import {
   createFilamentReferenceSchema,
@@ -93,7 +94,12 @@ type AssetRow = {
 
 @Injectable()
 export class AssetsService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  private readonly logger = new Logger(AssetsService.name);
+
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly financeService: FinanceService
+  ) {}
 
   async listFilamentReferences(query: ListFilamentReferencesQuery) {
     const values: unknown[] = [];
@@ -735,8 +741,8 @@ export class AssetsService {
     return row;
   }
 
-  async createSpool(companyId: string, input: CreateSpoolInput) {
-    return this.databaseService.transaction(async (client) => {
+  async createSpool(companyId: string, userId: string, input: CreateSpoolInput) {
+    const spools = await this.databaseService.transaction(async (client) => {
       const resolvedReference = input.filament_ref_id
         ? input.filament_ref_id
         : (
@@ -834,10 +840,75 @@ export class AssetsService {
         createdAssetIds.map((id) => this.getAssetById(companyId, id, client))
       );
 
-      // Stay backwards-compatible: a single spool returns the asset object, while
-      // a multiplier batch returns the array of created spools.
-      return quantity > 1 ? createdAssets : createdAssets[0];
+      return createdAssets;
     });
+
+    // Assets → Finance: best-effort, post-commit. A finance hiccup must never
+    // undo the spools the operator just added, so failures are logged, not thrown.
+    await this.recordSpoolPurchaseInFinance(companyId, userId, input, spools);
+
+    // Stay backwards-compatible: a single spool returns the asset object, while
+    // a multiplier batch returns the array of created spools.
+    return (input.quantity ?? 1) > 1 ? spools : spools[0];
+  }
+
+  // Book the just-added spool(s) as an itemized filament-purchase bill in
+  // Finance. Only fires when a vendor name was supplied and there is something
+  // billable (a spool price and/or a delivery cost). The spool line's quantity is
+  // the ×N multiplier, so a "box of 4" reads as one line of qty 4. Best-effort:
+  // any failure (e.g. books locked for that date) is logged and swallowed so the
+  // physical inventory the operator created is never rolled back.
+  private async recordSpoolPurchaseInFinance(
+    companyId: string,
+    userId: string,
+    input: CreateSpoolInput,
+    spools: AssetRow[]
+  ): Promise<void> {
+    const vendorName = input.vendor_name?.trim();
+    if (!vendorName) return;
+
+    const unitPrice = input.purchase_price ?? 0;
+    const deliveryCost = input.delivery_cost ?? 0;
+    if (unitPrice <= 0 && deliveryCost <= 0) return;
+
+    const first = spools[0];
+    const label =
+      [first?.filament_brand, first?.filament_material_type, first?.filament_color]
+        .filter(Boolean)
+        .join(" ")
+        .trim() || "Filament spool";
+    const grams = input.initial_grams;
+    const description = grams ? `${label} — spool (${grams} g)` : `${label} — spool`;
+    // Cross-reference the created inventory rows so the bill is traceable back to
+    // the physical spools (and vice-versa via the vendor_reference column).
+    const reference = spools.length
+      ? `Spool ${spools.map((s) => s.asset_id).join(", ")}`.slice(0, 200)
+      : null;
+
+    try {
+      const result = await this.financeService.recordFilamentPurchase(companyId, userId, {
+        vendorName,
+        description,
+        unitPrice,
+        quantity: input.quantity ?? 1,
+        deliveryCost,
+        priceIncludesTax: input.price_includes_tax ?? false,
+        alreadyPaid: input.already_paid ?? false,
+        purchaseDate: input.purchase_date ?? null,
+        reference
+      });
+      if (result) {
+        this.logger.log(
+          `Recorded filament purchase ${result.bill_number} (${result.status}) for company ${companyId}.`
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to auto-record filament purchase for company ${companyId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
   }
 
   // Split one idle spool into N child spools. The parent is kept intact but

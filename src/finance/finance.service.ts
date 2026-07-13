@@ -2157,6 +2157,157 @@ export class FinanceService {
     });
   }
 
+  // ── Filament purchase (Assets → Finance integration) ────────────────────────
+  // Adding a spool with a vendor name auto-records the purchase as an itemized
+  // vendor bill: one line for the spool batch (quantity = the ×N multiplier,
+  // booked to Inventory) plus an optional delivery line (Operating Expenses).
+  // The vendor name is matched case-insensitively; an unknown name registers a
+  // new vendor so the next purchase auto-links. The bill posts to A/P; when
+  // `alreadyPaid` it is also settled from Cash in the same call. `priceIncludesTax`
+  // suppresses tax (the unit price is treated as the gross total); otherwise the
+  // company default tax rate is applied on top. Reuses the canonical
+  // createBill/openBill/createPayment paths so the double-entry logic — and its
+  // rounding — stay single-sourced. Returns null when there is nothing billable.
+  async recordFilamentPurchase(
+    companyId: string,
+    userId: string,
+    input: {
+      vendorName: string;
+      description: string;
+      unitPrice: number;
+      quantity: number;
+      deliveryCost?: number | null;
+      priceIncludesTax?: boolean;
+      alreadyPaid?: boolean;
+      purchaseDate?: string | null;
+      reference?: string | null;
+    }
+  ): Promise<{ bill_id: string; bill_number: string; status: "open" | "paid" } | null> {
+    const unitPrice = Number.isFinite(input.unitPrice) ? Math.max(0, input.unitPrice) : 0;
+    const deliveryCost =
+      input.deliveryCost != null && Number.isFinite(input.deliveryCost)
+        ? Math.max(0, input.deliveryCost)
+        : 0;
+    const quantity = Math.max(1, Math.trunc(input.quantity || 1));
+
+    // Nothing billable → no document (a zero-total bill can't be posted anyway).
+    const hasSpoolLine = unitPrice > 0;
+    if (!hasSpoolLine && deliveryCost <= 0) return null;
+
+    const vendorId = await this.resolveOrCreateVendorByName(companyId, input.vendorName);
+    const accounts = await this.resolveSystemAccountIds(
+      companyId,
+      input.alreadyPaid
+        ? ["inventory", "operating_expenses", "cash"]
+        : ["inventory", "operating_expenses"]
+    );
+    const taxRateId = input.priceIncludesTax
+      ? undefined
+      : (await this.defaultTaxRateId(companyId)) ?? undefined;
+
+    const lines: DocumentLineInput[] = [];
+    if (hasSpoolLine) {
+      lines.push({
+        description: input.description,
+        quantity,
+        unit_price: unitPrice,
+        account_id: accounts.inventory,
+        tax_rate_id: taxRateId
+      });
+    }
+    if (deliveryCost > 0) {
+      lines.push({
+        description: "Delivery / shipping",
+        quantity: 1,
+        unit_price: deliveryCost,
+        account_id: accounts.operating_expenses,
+        tax_rate_id: taxRateId
+      });
+    }
+
+    const bill = await this.createBill(companyId, userId, {
+      vendor_id: vendorId,
+      issue_date: input.purchaseDate ?? undefined,
+      vendor_reference: input.reference ?? undefined,
+      memo: "Filament spool purchase",
+      lines
+    } as CreateBillInput);
+
+    await this.openBill(companyId, userId, bill.bill_id);
+
+    let status: "open" | "paid" = "open";
+    if (input.alreadyPaid) {
+      const totalRow = await this.databaseService.query<{ total: string }>(
+        `SELECT total FROM bills WHERE company_id = $1 AND bill_id = $2`,
+        [companyId, bill.bill_id]
+      );
+      const total = Number(totalRow.rows[0]?.total ?? 0);
+      if (total > 0) {
+        await this.createPayment(companyId, userId, {
+          direction: "out",
+          method: "cash",
+          payment_date: input.purchaseDate ?? undefined,
+          amount: total,
+          deposit_account_id: accounts.cash!,
+          vendor_id: vendorId,
+          applications: [{ bill_id: bill.bill_id, amount: total }]
+        } as CreatePaymentInput);
+        status = "paid";
+      }
+    }
+
+    return { bill_id: bill.bill_id, bill_number: bill.bill_number, status };
+  }
+
+  // Case-insensitive vendor match by name; registers a new vendor when nothing
+  // matches so a free-text name typed on the spool form still links cleanly and
+  // future purchases from the same vendor auto-associate.
+  private async resolveOrCreateVendorByName(companyId: string, rawName: string): Promise<string> {
+    const name = rawName.trim();
+    const existing = await this.databaseService.query<{ vendor_id: string }>(
+      `SELECT vendor_id FROM vendors WHERE company_id = $1 AND LOWER(name) = LOWER($2) ORDER BY created_at LIMIT 1`,
+      [companyId, name]
+    );
+    if (existing.rows[0]) return existing.rows[0].vendor_id;
+    const created = await this.databaseService.query<{ vendor_id: string }>(
+      `INSERT INTO vendors (company_id, name) VALUES ($1, $2) RETURNING vendor_id`,
+      [companyId, name]
+    );
+    return created.rows[0]!.vendor_id;
+  }
+
+  // Resolve several system accounts by subtype in one connection. Reuses the
+  // self-healing systemAccount() so a company that never touched Finance still
+  // gets its chart of accounts seeded on first purchase.
+  private resolveSystemAccountIds(
+    companyId: string,
+    subtypes: string[]
+  ): Promise<Record<string, string>> {
+    return this.databaseService.transaction(async (client) => {
+      const out: Record<string, string> = {};
+      for (const subtype of subtypes) {
+        out[subtype] = await this.systemAccount(client, companyId, subtype);
+      }
+      return out;
+    });
+  }
+
+  // The company's configured default tax rate, but only when it's still active —
+  // mirrors writeDocumentLines, which rejects an inactive tax_rate_id.
+  private async defaultTaxRateId(companyId: string): Promise<string | null> {
+    const settings = await this.databaseService.query<{ default_tax_rate_id: string | null }>(
+      `SELECT default_tax_rate_id FROM finance_settings WHERE company_id = $1`,
+      [companyId]
+    );
+    const id = settings.rows[0]?.default_tax_rate_id ?? null;
+    if (!id) return null;
+    const active = await this.databaseService.query(
+      `SELECT 1 FROM tax_rates WHERE company_id = $1 AND tax_rate_id = $2 AND is_active = TRUE`,
+      [companyId, id]
+    );
+    return active.rows[0] ? id : null;
+  }
+
   // ── Journal ───────────────────────────────────────────────────────────────
 
   async listJournal(companyId: string, query: z.infer<typeof listJournalQuerySchema>) {
