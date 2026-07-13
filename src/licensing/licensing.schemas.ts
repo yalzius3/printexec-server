@@ -19,6 +19,27 @@ export const endTrialSchema = z.object({
   company_id: z.string().uuid()
 });
 
+// Admin: set (or lift, with hold=null) a moderation hold on a company.
+//   grace     → nag + block printer adds   suspended → read-only
+//   banned    → full lockout
+export const setHoldSchema = z.object({
+  company_id: z.string().uuid(),
+  hold: z.enum(["grace", "suspended", "banned"]).nullable(),
+  reason: z.string().trim().max(500).optional()
+});
+
+// Admin: soft-delete / restore a company. reason is optional context.
+export const companyRefSchema = z.object({
+  company_id: z.string().uuid(),
+  reason: z.string().trim().max(500).optional()
+});
+
+// Admin: send an in-app message to one company (shown as a dismissible banner).
+export const sendMessageSchema = z.object({
+  company_id: z.string().uuid(),
+  body: z.string().trim().min(1).max(2000)
+});
+
 export const createGrantSchema = z.object({
   plan_code: z.string().trim().min(1).max(40),
   note: z.string().trim().max(500).optional(),

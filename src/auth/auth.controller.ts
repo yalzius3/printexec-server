@@ -130,6 +130,20 @@ export class AuthController {
     } catch {
       // licensing tables not migrated yet — profile still returns without it
     }
+    // Best-effort: undismissed platform messages for the in-app banner.
+    try {
+      const msgs = await this.db.query<{ message_id: string; body: string; created_at: string }>(
+        `SELECT message_id, body, created_at
+         FROM company_admin_messages
+         WHERE company_id = $1 AND dismissed_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [rows[0]!.company_id]
+      );
+      profile.admin_messages = msgs.rows;
+    } catch {
+      // messages table not migrated yet — profile returns without them
+    }
     profile.is_platform_admin = this.licensing.isPlatformAdminEmail(rows[0]!.email);
     return profile;
   }

@@ -6,6 +6,7 @@ import {
   Get,
   GoneException,
   NotFoundException,
+  Param,
   Post
 } from "@nestjs/common";
 import { CompanyId } from "../common/company-id.decorator";
@@ -125,5 +126,37 @@ export class LicensingController {
 
     this.licensing.invalidate(companyId);
     return this.licensing.getStatus(companyId, true);
+  }
+
+  // In-app messages the platform sent this company. @LicenseExempt (class-level)
+  // so a suspended / read-only workspace can still read and dismiss them.
+  @Get("messages")
+  async listMessages(@CompanyId() companyId: string) {
+    try {
+      const { rows } = await this.db.query(
+        `SELECT message_id, body, created_at
+         FROM company_admin_messages
+         WHERE company_id = $1 AND dismissed_at IS NULL
+         ORDER BY created_at DESC`,
+        [companyId]
+      );
+      return rows;
+    } catch {
+      // messages table not migrated yet — nothing to show.
+      return [];
+    }
+  }
+
+  @Post("messages/:messageId/dismiss")
+  async dismissMessage(
+    @CompanyId() companyId: string,
+    @Param("messageId") messageId: string
+  ) {
+    await this.db.query(
+      `UPDATE company_admin_messages SET dismissed_at = now()
+       WHERE message_id = $1 AND company_id = $2 AND dismissed_at IS NULL`,
+      [messageId, companyId]
+    );
+    return { ok: true };
   }
 }

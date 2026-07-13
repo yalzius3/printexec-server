@@ -12,7 +12,14 @@ import { UserId } from "../common/user-id.decorator";
 import { parseWithSchema } from "../common/zod";
 import { DatabaseService } from "../database/database.service";
 import { LicenseExempt } from "./license-exempt.decorator";
-import { assignPlanSchema, createGrantSchema, endTrialSchema } from "./licensing.schemas";
+import {
+  assignPlanSchema,
+  companyRefSchema,
+  createGrantSchema,
+  endTrialSchema,
+  sendMessageSchema,
+  setHoldSchema
+} from "./licensing.schemas";
 import { LicensingService } from "./licensing.service";
 
 // ════════════════════════════════════════════════════════════════
@@ -36,27 +43,66 @@ export class LicensingAdminController {
   @Get("overview")
   async overview(@UserId() userId: string) {
     await this.assertPlatformAdmin(userId);
-    const { rows } = await this.db.query(
-      `SELECT
-         c.company_id,
-         c.name,
-         c.owner_email,
-         cs.plan_code,
-         p.display_name AS plan_name,
-         p.max_printers,
-         cs.status,
-         cs.source,
-         cs.current_period_end,
-         cs.limit_exceeded_since,
-         g.code AS grant_code,
-         (SELECT count(*)::int FROM printer_instances pi WHERE pi.company_id = c.company_id) AS printer_count
-       FROM companies c
-       LEFT JOIN company_subscriptions cs ON cs.company_id = c.company_id
-       LEFT JOIN plans p ON p.plan_code = cs.plan_code
-       LEFT JOIN license_grants g ON g.grant_id = cs.grant_id
-       ORDER BY c.name`
-    );
-    return rows;
+    try {
+      const { rows } = await this.db.query(
+        `SELECT
+           c.company_id,
+           c.name,
+           c.owner_email,
+           cs.plan_code,
+           p.display_name AS plan_name,
+           p.max_printers,
+           cs.status,
+           cs.source,
+           cs.current_period_end,
+           cs.limit_exceeded_since,
+           g.code AS grant_code,
+           c.admin_hold,
+           c.admin_hold_reason,
+           c.deleted_at,
+           (SELECT count(*)::int FROM printer_instances pi WHERE pi.company_id = c.company_id) AS printer_count,
+           (SELECT count(*)::int FROM company_admin_messages m
+              WHERE m.company_id = c.company_id AND m.dismissed_at IS NULL) AS unread_messages
+         FROM companies c
+         LEFT JOIN company_subscriptions cs ON cs.company_id = c.company_id
+         LEFT JOIN plans p ON p.plan_code = cs.plan_code
+         LEFT JOIN license_grants g ON g.grant_id = cs.grant_id
+         ORDER BY c.deleted_at NULLS FIRST, c.name`
+      );
+      return rows;
+    } catch (err) {
+      const code = typeof err === "object" && err !== null ? (err as { code?: string }).code : undefined;
+      // Pre-migration (admin-control columns / messages table absent): fall
+      // back to the base overview so the admin area still loads.
+      if (code !== "42703" && code !== "42P01") throw err;
+      const { rows } = await this.db.query(
+        `SELECT
+           c.company_id,
+           c.name,
+           c.owner_email,
+           cs.plan_code,
+           p.display_name AS plan_name,
+           p.max_printers,
+           cs.status,
+           cs.source,
+           cs.current_period_end,
+           cs.limit_exceeded_since,
+           g.code AS grant_code,
+           (SELECT count(*)::int FROM printer_instances pi WHERE pi.company_id = c.company_id) AS printer_count
+         FROM companies c
+         LEFT JOIN company_subscriptions cs ON cs.company_id = c.company_id
+         LEFT JOIN plans p ON p.plan_code = cs.plan_code
+         LEFT JOIN license_grants g ON g.grant_id = cs.grant_id
+         ORDER BY c.name`
+      );
+      return rows.map((r) => ({
+        ...r,
+        admin_hold: null,
+        admin_hold_reason: null,
+        deleted_at: null,
+        unread_messages: 0
+      }));
+    }
   }
 
   // Manually put a company on a plan (Enterprise deals close here). Resets
@@ -137,6 +183,105 @@ export class LicensingAdminController {
 
     this.licensing.invalidate(company_id);
     return this.licensing.getStatus(company_id, true);
+  }
+
+  // ── Moderation holds ─────────────────────────────────────────────────────
+  // Set or lift a hold. grace → nag + block printer adds; suspended → workspace
+  // read-only; banned → full lockout. hold=null lifts it. Enforced immediately
+  // in the LicenseGuard (not gated by LICENSING_ENFORCED).
+  @Post("hold")
+  async setHold(@UserId() userId: string, @Body() body: unknown) {
+    const adminEmail = await this.assertPlatformAdmin(userId);
+    const input = parseWithSchema(setHoldSchema, body);
+
+    const res = await this.db.query(
+      `UPDATE companies
+         SET admin_hold = $2,
+             admin_hold_reason = CASE WHEN $2::text IS NULL THEN NULL ELSE $3 END,
+             admin_hold_at     = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,
+             admin_hold_by     = CASE WHEN $2::text IS NULL THEN NULL ELSE $4 END
+       WHERE company_id = $1`,
+      [input.company_id, input.hold, input.reason ?? null, adminEmail]
+    );
+    if (!res.rowCount) throw new NotFoundException("Company not found.");
+
+    this.licensing.invalidate(input.company_id);
+    return this.licensing.getStatus(input.company_id, true);
+  }
+
+  // Soft-delete: full lockout + hidden by default, all data retained. Reversible
+  // via /restore. current_period_end is left untouched so restore returns the
+  // company to exactly its prior billing state.
+  @Post("delete")
+  async softDelete(@UserId() userId: string, @Body() body: unknown) {
+    const adminEmail = await this.assertPlatformAdmin(userId);
+    const input = parseWithSchema(companyRefSchema, body);
+
+    const res = await this.db.query(
+      `UPDATE companies
+         SET deleted_at = COALESCE(deleted_at, now()),
+             deleted_by = $2,
+             admin_hold_reason = COALESCE($3, admin_hold_reason)
+       WHERE company_id = $1`,
+      [input.company_id, adminEmail, input.reason ?? null]
+    );
+    if (!res.rowCount) throw new NotFoundException("Company not found.");
+
+    this.licensing.invalidate(input.company_id);
+    return { ok: true };
+  }
+
+  // Restore a soft-deleted company.
+  @Post("restore")
+  async restore(@UserId() userId: string, @Body() body: unknown) {
+    await this.assertPlatformAdmin(userId);
+    const input = parseWithSchema(companyRefSchema, body);
+
+    const res = await this.db.query(
+      "UPDATE companies SET deleted_at = NULL, deleted_by = NULL WHERE company_id = $1",
+      [input.company_id]
+    );
+    if (!res.rowCount) throw new NotFoundException("Company not found.");
+
+    this.licensing.invalidate(input.company_id);
+    return this.licensing.getStatus(input.company_id, true);
+  }
+
+  // ── In-app messages ──────────────────────────────────────────────────────
+  // Send a message to a company; the tenant sees a dismissible in-app banner.
+  @Post("messages")
+  async sendMessage(@UserId() userId: string, @Body() body: unknown) {
+    const adminEmail = await this.assertPlatformAdmin(userId);
+    const input = parseWithSchema(sendMessageSchema, body);
+
+    const company = await this.db.query(
+      "SELECT 1 FROM companies WHERE company_id = $1",
+      [input.company_id]
+    );
+    if (!company.rowCount) throw new NotFoundException("Company not found.");
+
+    const { rows } = await this.db.query(
+      `INSERT INTO company_admin_messages (company_id, body, created_by)
+       VALUES ($1, $2, $3)
+       RETURNING message_id, company_id, body, created_by, created_at, dismissed_at`,
+      [input.company_id, input.body, adminEmail]
+    );
+    return rows[0];
+  }
+
+  // Message history for one company (context for the admin composer).
+  @Get("messages/:companyId")
+  async listCompanyMessages(@UserId() userId: string, @Param("companyId") companyId: string) {
+    await this.assertPlatformAdmin(userId);
+    const { rows } = await this.db.query(
+      `SELECT message_id, body, created_by, created_at, dismissed_at
+       FROM company_admin_messages
+       WHERE company_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [companyId]
+    );
+    return rows;
   }
 
   @Get("grants")

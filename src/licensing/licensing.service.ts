@@ -19,7 +19,17 @@ import { DatabaseService, type SqlExecutor } from "../database/database.service"
 // ════════════════════════════════════════════════════════════════
 
 export type LicenseState = "ok" | "grace" | "readonly";
-export type LicenseReason = "expired" | "canceled" | "revoked" | "over_limit" | null;
+export type AdminHold = "grace" | "suspended" | "banned";
+export type LicenseReason =
+  | "expired"
+  | "canceled"
+  | "revoked"
+  | "over_limit"
+  | "suspended"
+  | "banned"
+  | "deleted"
+  | "admin_hold"
+  | null;
 
 export interface LicenseStatus {
   plan_code: string;
@@ -38,6 +48,15 @@ export interface LicenseStatus {
   grace_until: string | null;
   /** Whether the gate actually blocks (LICENSING_ENFORCED). */
   enforced: boolean;
+  /**
+   * Platform-admin hold overriding the billing state (null = none). Unlike the
+   * billing gate this is enforced immediately in the LicenseGuard.
+   */
+  admin_hold: AdminHold | null;
+  /** Free-text reason attached to the hold / deletion, shown to the tenant. */
+  admin_hold_reason: string | null;
+  /** Soft-deleted by a platform admin: full lockout + hidden from the list. */
+  deleted: boolean;
 }
 
 interface SubscriptionRow {
@@ -131,7 +150,10 @@ export class LicensingService {
         state: "ok",
         reason: null,
         grace_until: null,
-        enforced: this.enforced
+        enforced: this.enforced,
+        admin_hold: null,
+        admin_hold_reason: null,
+        deleted: false
       };
     }
   }
@@ -217,6 +239,50 @@ export class LicensingService {
       state = now < graceUntil ? "grace" : "readonly";
     }
 
+    // ── Platform-admin holds override the computed billing state. This is an
+    // explicit, per-company decision (grace / suspend / ban / soft-delete) and
+    // is enforced immediately in the LicenseGuard, NOT gated by
+    // LICENSING_ENFORCED. Read best-effort so a not-yet-migrated companies
+    // table never breaks the (working) billing resolution below. ──
+    let adminHold: AdminHold | null = null;
+    let adminHoldReason: string | null = null;
+    let deleted = false;
+    try {
+      const { rows } = await this.db.query<{
+        admin_hold: AdminHold | null;
+        admin_hold_reason: string | null;
+        deleted: boolean;
+      }>(
+        "SELECT admin_hold, admin_hold_reason, (deleted_at IS NOT NULL) AS deleted FROM companies WHERE company_id = $1",
+        [companyId]
+      );
+      if (rows[0]) {
+        adminHold = rows[0].admin_hold ?? null;
+        adminHoldReason = rows[0].admin_hold_reason ?? null;
+        deleted = rows[0].deleted === true;
+      }
+    } catch {
+      // admin-control columns not migrated yet — treat as no hold.
+    }
+
+    if (deleted) {
+      state = "readonly";
+      reason = "deleted";
+      graceUntil = null;
+    } else if (adminHold === "banned") {
+      state = "readonly";
+      reason = "banned";
+      graceUntil = null;
+    } else if (adminHold === "suspended") {
+      state = "readonly";
+      reason = "suspended";
+      graceUntil = null;
+    } else if (adminHold === "grace") {
+      state = "grace";
+      reason = "admin_hold";
+      graceUntil = null;
+    }
+
     return {
       plan_code: sub.plan_code,
       plan_name: sub.plan_name,
@@ -230,7 +296,10 @@ export class LicensingService {
       state,
       reason,
       grace_until: graceUntil ? new Date(graceUntil).toISOString() : null,
-      enforced: this.enforced
+      enforced: this.enforced,
+      admin_hold: adminHold,
+      admin_hold_reason: adminHoldReason,
+      deleted
     };
   }
 
