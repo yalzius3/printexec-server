@@ -27,9 +27,12 @@ class LoggingExceptionFilter extends BaseExceptionFilter {
   }
 }
 
-// 250 MB ceiling — large complex STL/3MF/gcode files routinely exceed the
-// fastify default of 1 MB. Anything bigger should still be rejected loudly.
-const UPLOAD_BYTES_LIMIT = 250 * 1024 * 1024;
+// 96 MB ceiling. All production traffic reaches this API through the
+// Cloudflare Pages proxy, whose request-body cap (~100 MB) silently kills
+// anything larger at the edge — the old 250 MB server limit was unreachable
+// and just produced opaque edge errors. The client pre-checks the same 96 MB
+// (MAX_UPLOAD_BYTES in App.tsx) so users get a clear message before sending.
+const UPLOAD_BYTES_LIMIT = 96 * 1024 * 1024;
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(

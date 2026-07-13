@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy } from "@nestjs/common";
+import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
 
@@ -6,6 +6,7 @@ export type SqlExecutor = Pool | PoolClient;
 
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
+  private readonly logger = new Logger(DatabaseService.name);
   private readonly pool: Pool;
 
   constructor(configService: ConfigService) {
@@ -13,7 +14,25 @@ export class DatabaseService implements OnModuleDestroy {
       connectionString: configService.getOrThrow<string>("DATABASE_URL"),
       ssl: {
         rejectUnauthorized: false
-      }
+      },
+      // Fail fast when the DB is unreachable instead of queueing checkouts
+      // forever, and recycle idle connections before the pooler's own idle
+      // close can race a checkout.
+      connectionTimeoutMillis: 10_000,
+      idleTimeoutMillis: 30_000,
+      keepAlive: true,
+      // Client-side per-query ceiling: a wedged statement rejects its promise
+      // and frees the pool slot instead of pinning it forever. Generous —
+      // nothing legitimate in the API runs anywhere near this long.
+      query_timeout: 60_000
+    });
+
+    // A dropped IDLE connection (Supabase restart, pooler failover, network
+    // blip) emits 'error' on the pool. Without a listener Node treats that as
+    // an uncaught exception and kills the process; with one, the broken
+    // client is discarded and the pool replaces it on the next checkout.
+    this.pool.on("error", (err) => {
+      this.logger.warn(`Idle database connection errored (client recycled): ${err.message}`);
     });
   }
 

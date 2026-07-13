@@ -558,35 +558,6 @@ export class AuthController {
       // de-duplicated to stay globally unique, so it never changes if the name
       // later does. We deliberately do not set it here — letting the trigger own
       // assignment is what keeps it race-safe under concurrent signups.
-      const company = await this.db.query<{ company_id: string }>(
-        `INSERT INTO companies (
-           name, slug, email, owner_user_id,
-           city, address_line_1, address_line_2, postal_code,
-           website, industry, company_size, tax_id,
-           currency_default, timezone,
-           owner_wrkxyz_id, owner_display_name, owner_email
-         )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-         RETURNING company_id`,
-        [
-          companyName, uniqueSlug, email, userId,
-          parsed.data.city             ?? null,
-          parsed.data.address_line_1   ?? null,
-          parsed.data.address_line_2   ?? null,
-          parsed.data.postal_code      ?? null,
-          parsed.data.website          ?? null,
-          parsed.data.industry         ?? null,
-          parsed.data.company_size     ?? null,
-          parsed.data.tax_id           ?? null,
-          parsed.data.currency_default ?? null,
-          parsed.data.timezone         ?? null,
-          userId,
-          displayName,
-          email
-        ]
-      );
-
-      const companyId = company.rows[0]!.company_id;
       const ownerPerms = {
         view_orders: true, action_orders: true,
         view_customers: true, action_customers: true,
@@ -594,23 +565,69 @@ export class AuthController {
         can_send_invites: true, can_manage_permissions: true
       };
 
-      await this.db.query(
-        `INSERT INTO users (id, company_id, email, display_name, role, permissions)
-         VALUES ($1, $2, $3, $4, 'owner', $5)`,
-        [userId, companyId, email, displayName, JSON.stringify(ownerPerms)]
-      );
+      // Narrowed owner variant, captured so the union narrowing survives into
+      // the transaction closure below.
+      const owner = parsed.data;
 
-      await this.db.query(
-        `INSERT INTO company_memberships (company_id, wrkxyz_account_id, role, permissions)
-         VALUES ($1, $2, 'owner', $3)`,
-        [companyId, userId, JSON.stringify(ownerPerms)]
-      );
+      // All-or-nothing: company + owner user + membership are ONE signup. A
+      // mid-flight failure used to strand an orphaned companies row, and the
+      // duplicate-name check above then rejected every retry ("You already
+      // have a company with this name") — a permanently stuck signup.
+      const companyId = await this.db.transaction(async (client) => {
+        const company = await this.db.query<{ company_id: string }>(
+          `INSERT INTO companies (
+             name, slug, email, owner_user_id,
+             city, address_line_1, address_line_2, postal_code,
+             website, industry, company_size, tax_id,
+             currency_default, timezone,
+             owner_wrkxyz_id, owner_display_name, owner_email
+           )
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           RETURNING company_id`,
+          [
+            companyName, uniqueSlug, email, userId,
+            owner.city             ?? null,
+            owner.address_line_1   ?? null,
+            owner.address_line_2   ?? null,
+            owner.postal_code      ?? null,
+            owner.website          ?? null,
+            owner.industry         ?? null,
+            owner.company_size     ?? null,
+            owner.tax_id           ?? null,
+            owner.currency_default ?? null,
+            owner.timezone         ?? null,
+            userId,
+            displayName,
+            email
+          ],
+          client
+        );
 
-      await this.db.query(
-        `UPDATE users SET companies_owned = array_append(companies_owned, $1::uuid)
-         WHERE id = $2`,
-        [companyId, userId]
-      );
+        const newCompanyId = company.rows[0]!.company_id;
+
+        await this.db.query(
+          `INSERT INTO users (id, company_id, email, display_name, role, permissions)
+           VALUES ($1, $2, $3, $4, 'owner', $5)`,
+          [userId, newCompanyId, email, displayName, JSON.stringify(ownerPerms)],
+          client
+        );
+
+        await this.db.query(
+          `INSERT INTO company_memberships (company_id, wrkxyz_account_id, role, permissions)
+           VALUES ($1, $2, 'owner', $3)`,
+          [newCompanyId, userId, JSON.stringify(ownerPerms)],
+          client
+        );
+
+        await this.db.query(
+          `UPDATE users SET companies_owned = array_append(companies_owned, $1::uuid)
+           WHERE id = $2`,
+          [newCompanyId, userId],
+          client
+        );
+
+        return newCompanyId;
+      });
 
       // Start the new company's trial. Best-effort: signup must never break
       // on licensing (e.g. the licensing migration not applied yet) — the
@@ -662,28 +679,42 @@ export class AuthController {
 
     const emptyPerms = {};
 
-    await this.db.query(
-      `INSERT INTO users (id, company_id, email, display_name, role, permissions)
-       VALUES ($1, $2, $3, $4, 'staff', $5)`,
-      [userId, companyId, email, displayName, JSON.stringify(emptyPerms)]
-    );
+    // All-or-nothing, and the invite is CLAIMED first with a compare-and-set:
+    // two people racing the same code can both pass the friendly checks above,
+    // but only one "WHERE used_at IS NULL" update wins — the loser's whole
+    // membership rolls back instead of leaving half-created rows.
+    await this.db.transaction(async (client) => {
+      const claimed = await this.db.query(
+        `UPDATE company_invites SET used_at = now(), used_by = $1
+          WHERE token = $2 AND used_at IS NULL`,
+        [userId, inviteToken],
+        client
+      );
+      if (!claimed.rowCount) {
+        throw new ConflictException("This invite code has already been used.");
+      }
 
-    await this.db.query(
-      `INSERT INTO company_memberships (company_id, wrkxyz_account_id, role, permissions)
-       VALUES ($1, $2, 'staff', '{}')`,
-      [companyId, userId]
-    );
+      await this.db.query(
+        `INSERT INTO users (id, company_id, email, display_name, role, permissions)
+         VALUES ($1, $2, $3, $4, 'staff', $5)`,
+        [userId, companyId, email, displayName, JSON.stringify(emptyPerms)],
+        client
+      );
 
-    await this.db.query(
-      `UPDATE users SET companies_joined = array_append(companies_joined, $1::uuid)
-       WHERE id = $2`,
-      [companyId, userId]
-    );
+      await this.db.query(
+        `INSERT INTO company_memberships (company_id, wrkxyz_account_id, role, permissions)
+         VALUES ($1, $2, 'staff', '{}')`,
+        [companyId, userId],
+        client
+      );
 
-    await this.db.query(
-      `UPDATE company_invites SET used_at = now(), used_by = $1 WHERE token = $2`,
-      [userId, inviteToken]
-    );
+      await this.db.query(
+        `UPDATE users SET companies_joined = array_append(companies_joined, $1::uuid)
+         WHERE id = $2`,
+        [companyId, userId],
+        client
+      );
+    });
 
     const { rows: companyRows } = await this.db.query<{ name: string }>(
       "SELECT name FROM companies WHERE company_id = $1",
