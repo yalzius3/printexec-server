@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 import { APP_GUARD } from "@nestjs/core";
 import { ConfigModule } from "@nestjs/config";
+import { AnalyticsModule } from "./analytics/analytics.module";
 import { AssetsModule } from "./assets/assets.module";
 import { AuthModule } from "./auth/auth.module";
 import { CustomersModule } from "./customers/customers.module";
@@ -27,6 +28,7 @@ import { LicenseGuard } from "./licensing/license.guard";
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     DatabaseModule,
+    AnalyticsModule,
     AuthModule,
     AssetsModule,
     BedsModule,
