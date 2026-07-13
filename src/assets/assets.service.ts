@@ -6,6 +6,7 @@ import {
   createFilamentReferenceSchema,
   createNozzleSchema,
   createResinTankSchema,
+  createSparePartSchema,
   createSpoolSchema,
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
@@ -20,6 +21,7 @@ type FilamentReferenceInput = z.infer<typeof createFilamentReferenceSchema>;
 type CreateSpoolInput = z.infer<typeof createSpoolSchema>;
 type CreateNozzleInput = z.infer<typeof createNozzleSchema>;
 type CreateResinTankInput = z.infer<typeof createResinTankSchema>;
+type CreateSparePartInput = z.infer<typeof createSparePartSchema>;
 type ListAssetsQuery = z.infer<typeof listAssetsQuerySchema>;
 type UpdateAssetInput = z.infer<typeof updateAssetSchema>;
 type UpdateAssetStockInput = z.infer<typeof updateAssetStockSchema>;
@@ -30,7 +32,7 @@ type SplitSpoolInput = z.infer<typeof splitSpoolSchema>;
 type AssetRow = {
   asset_id: string;
   company_id: string;
-  asset_type: "filament_spool" | "nozzle" | "resin_tank";
+  asset_type: "filament_spool" | "nozzle" | "resin_tank" | "spare_part";
   filament_ref_id: string | null;
   parent_asset_id: string | null;
   split_at: string | null;
@@ -44,6 +46,8 @@ type AssetRow = {
   nozzle_max_temp: number | null;
   nozzle_name: string | null;
   nozzle_brand: string | null;
+  spare_part_name: string | null;
+  spare_part_brand: string | null;
   resin_brand: string | null;
   resin_type: string | null;
   resin_color: string | null;
@@ -383,7 +387,9 @@ export class AssetsService {
       printHours,
       topPrinters,
       wasteByMaterial,
-      wasteTotals
+      wasteTotals,
+      sparePartTotals,
+      sparePartsByPart
     ] = await Promise.all([
       // Filament on hand, per material+color (hex kept for swatches). The
       // client rolls colors up into per-material totals.
@@ -600,6 +606,54 @@ export class AssetsService {
          FROM filament_waste_events
         WHERE company_id = $1`,
         [companyId, days, days * 2]
+      ),
+      // Spare-part roll-up: on-hand count/value are point-in-time inventory
+      // snapshots (like filament-on-hand); additions/spend are genuine period
+      // windows with the equal-length previous window for the delta chip.
+      this.databaseService.query<{
+        total: string;
+        damaged: string;
+        value_total: string;
+        added_period: string;
+        spend_period: string;
+        spend_prev_period: string;
+      }>(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE ast.status = 'damaged')::int AS damaged,
+                COALESCE(SUM(ai.purchase_price), 0) AS value_total,
+                COUNT(*) FILTER (WHERE ai.created_at >= now() - ($2 || ' days')::interval)::int AS added_period,
+                COALESCE(SUM(ai.purchase_price) FILTER (WHERE ai.created_at >= now() - ($2 || ' days')::interval), 0) AS spend_period,
+                COALESCE(SUM(ai.purchase_price) FILTER (WHERE ai.created_at >= now() - ($3 || ' days')::interval
+                                                          AND ai.created_at <  now() - ($2 || ' days')::interval), 0) AS spend_prev_period
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'spare_part'`,
+        [companyId, days, days * 2]
+      ),
+      // The bin, per part identity: duplicates of the same name+brand roll up
+      // into one row (case-insensitive on the name; MIN() picks a display
+      // casing) with live damaged counts and summed purchase value.
+      this.databaseService.query<{
+        name: string | null;
+        brand: string | null;
+        count: string;
+        damaged_count: string;
+        value: string;
+      }>(
+        `SELECT MIN(ai.spare_part_name) AS name,
+                ai.spare_part_brand AS brand,
+                COUNT(*)::int AS count,
+                COUNT(*) FILTER (WHERE ast.status = 'damaged')::int AS damaged_count,
+                COALESCE(SUM(ai.purchase_price), 0) AS value
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'spare_part'
+          GROUP BY lower(ai.spare_part_name), ai.spare_part_brand
+          ORDER BY count DESC, value DESC
+          LIMIT 10`,
+        [companyId]
       )
     ]);
 
@@ -662,6 +716,21 @@ export class AssetsService {
           label: r.label ?? "Printer",
           hours: num(r.hours)
         }))
+      },
+      spare_parts: {
+        total: num(sparePartTotals.rows[0]?.total),
+        damaged: num(sparePartTotals.rows[0]?.damaged),
+        value_total: num(sparePartTotals.rows[0]?.value_total),
+        added_period: num(sparePartTotals.rows[0]?.added_period),
+        spend_period: num(sparePartTotals.rows[0]?.spend_period),
+        spend_prev_period: num(sparePartTotals.rows[0]?.spend_prev_period),
+        by_part: sparePartsByPart.rows.map((r) => ({
+          name: r.name,
+          brand: r.brand,
+          count: num(r.count),
+          damaged_count: num(r.damaged_count),
+          value: num(r.value)
+        }))
       }
     };
   }
@@ -695,6 +764,8 @@ export class AssetsService {
           OR ai.nozzle_material ILIKE $${values.length}
           OR ai.nozzle_name ILIKE $${values.length}
           OR ai.nozzle_brand ILIKE $${values.length}
+          OR ai.spare_part_name ILIKE $${values.length}
+          OR ai.spare_part_brand ILIKE $${values.length}
           OR ai.resin_brand ILIKE $${values.length}
           OR ai.resin_type ILIKE $${values.length}
         )
@@ -886,7 +957,7 @@ export class AssetsService {
       : null;
 
     try {
-      const result = await this.financeService.recordFilamentPurchase(companyId, userId, {
+      const result = await this.financeService.recordInventoryPurchase(companyId, userId, {
         vendorName,
         description,
         unitPrice,
@@ -895,7 +966,8 @@ export class AssetsService {
         priceIncludesTax: input.price_includes_tax ?? false,
         alreadyPaid: input.already_paid ?? false,
         purchaseDate: input.purchase_date ?? null,
-        reference
+        reference,
+        memo: "Filament spool purchase"
       });
       if (result) {
         this.logger.log(
@@ -1138,6 +1210,153 @@ export class AssetsService {
     });
   }
 
+  // Spare parts (fans, belts, PTFE tubes, …): the simplest asset shape — a
+  // direct asset_instances + asset_stock pair like nozzles, identity in
+  // spare_part_name/brand, price in purchase_price, description in notes.
+  // Same ×N multiplier convention and the same post-commit finance purchase
+  // rider as spools.
+  async createSparePart(companyId: string, userId: string, input: CreateSparePartInput) {
+    const parts = await this.databaseService.transaction(async (client) => {
+      const quantity = input.quantity ?? 1;
+      const createdAssetIds: string[] = [];
+
+      for (let i = 0; i < quantity; i++) {
+        const createdAsset = await this.databaseService.query<{ asset_id: string }>(
+          `
+            INSERT INTO asset_instances (
+              company_id,
+              asset_type,
+              spare_part_name,
+              spare_part_brand,
+              purchase_price,
+              location,
+              notes
+            )
+            VALUES ($1, 'spare_part', $2, $3, $4, $5, $6)
+            RETURNING asset_id
+          `,
+          [
+            companyId,
+            input.spare_part_name,
+            input.spare_part_brand ?? null,
+            input.purchase_price ?? null,
+            input.location ?? null,
+            input.notes ?? null
+          ],
+          client
+        );
+
+        const createdAssetRow = createdAsset.rows[0];
+
+        if (!createdAssetRow) {
+          throw new BadRequestException("Spare part insert failed.");
+        }
+
+        await this.databaseService.query(
+          `
+            INSERT INTO asset_stock (
+              asset_id,
+              company_id,
+              status,
+              remaining_grams,
+              remaining_volume_ml,
+              currently_used_in_piece_id,
+              in_use_since,
+              installed_on_asset_id,
+              next_free_at
+            )
+            VALUES ($1, $2, 'available', NULL, NULL, NULL, NULL, NULL, NULL)
+          `,
+          [createdAssetRow.asset_id, companyId],
+          client
+        );
+
+        await this.logAssetEvent(
+          companyId,
+          createdAssetRow.asset_id,
+          "spare_part",
+          "addition",
+          input.spare_part_name,
+          quantity > 1
+            ? `New spare part added to inventory (${i + 1} of ${quantity})`
+            : "New spare part added to inventory",
+          client
+        );
+
+        createdAssetIds.push(createdAssetRow.asset_id);
+      }
+
+      const createdAssets = await Promise.all(
+        createdAssetIds.map((id) => this.getAssetById(companyId, id, client))
+      );
+
+      return createdAssets;
+    });
+
+    // Assets → Finance: best-effort, post-commit — a finance hiccup must never
+    // undo the parts the operator just added (same discipline as spools).
+    await this.recordSparePartPurchaseInFinance(companyId, userId, input, parts);
+
+    // Same backwards-compat convention as spools/nozzles: single create returns
+    // the asset object, a multiplier batch returns the array.
+    return (input.quantity ?? 1) > 1 ? parts : parts[0];
+  }
+
+  // Book the just-added spare part(s) as an itemized purchase bill in Finance.
+  // Mirrors recordSpoolPurchaseInFinance: only fires when a vendor name was
+  // supplied and there is something billable; the part line's quantity is the
+  // ×N multiplier. Best-effort — failures are logged, never thrown.
+  private async recordSparePartPurchaseInFinance(
+    companyId: string,
+    userId: string,
+    input: CreateSparePartInput,
+    parts: AssetRow[]
+  ): Promise<void> {
+    const vendorName = input.vendor_name?.trim();
+    if (!vendorName) return;
+
+    const unitPrice = input.purchase_price ?? 0;
+    const deliveryCost = input.delivery_cost ?? 0;
+    if (unitPrice <= 0 && deliveryCost <= 0) return;
+
+    const label = [input.spare_part_brand, input.spare_part_name]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || "Spare part";
+    const description = `${label} — spare part`;
+    // Cross-reference the created inventory rows so the bill is traceable back
+    // to the physical parts (and vice-versa via the vendor_reference column).
+    const reference = parts.length
+      ? `Spare part ${parts.map((p) => p.asset_id).join(", ")}`.slice(0, 200)
+      : null;
+
+    try {
+      const result = await this.financeService.recordInventoryPurchase(companyId, userId, {
+        vendorName,
+        description,
+        unitPrice,
+        quantity: input.quantity ?? 1,
+        deliveryCost,
+        priceIncludesTax: input.price_includes_tax ?? false,
+        alreadyPaid: input.already_paid ?? false,
+        purchaseDate: null,
+        reference,
+        memo: "Spare part purchase"
+      });
+      if (result) {
+        this.logger.log(
+          `Recorded spare part purchase ${result.bill_number} (${result.status}) for company ${companyId}.`
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to auto-record spare part purchase for company ${companyId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
   async createResinTank(companyId: string, input: CreateResinTankInput) {
     return this.databaseService.transaction(async (client) => {
       const createdAsset = await this.databaseService.query<{ asset_id: string }>(
@@ -1237,6 +1456,13 @@ export class AssetsService {
         "nozzle_max_temp",
         "nozzle_name",
         "nozzle_brand",
+        "purchase_price",
+        "location",
+        "notes"
+      ],
+      spare_part: [
+        "spare_part_name",
+        "spare_part_brand",
         "purchase_price",
         "location",
         "notes"
@@ -1445,6 +1671,8 @@ export class AssetsService {
         ai.nozzle_max_temp,
         ai.nozzle_name,
         ai.nozzle_brand,
+        ai.spare_part_name,
+        ai.spare_part_brand,
         ai.resin_brand,
         ai.resin_type,
         ai.resin_color,
@@ -1674,6 +1902,13 @@ export class AssetsService {
       if (asset.nozzle_name) return asset.nozzle_name;
       return [asset.nozzle_brand, asset.nozzle_material, asset.nozzle_diameter_mm ? `${asset.nozzle_diameter_mm}mm` : null]
         .filter(Boolean).join(" ") + " Nozzle" || "Nozzle";
+    }
+    if (asset.asset_type === "spare_part") {
+      // The name IS the identity (required on create); brand is a prefix bonus.
+      if (asset.spare_part_name) {
+        return [asset.spare_part_brand, asset.spare_part_name].filter(Boolean).join(" ");
+      }
+      return "Spare Part";
     }
     if (asset.asset_type === "resin_tank") {
       return [asset.resin_brand, asset.resin_type, asset.resin_color]

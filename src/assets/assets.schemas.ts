@@ -44,7 +44,7 @@ const locationSchema = z.string().trim().min(1).max(120).optional();
 const markerSchema = z.string().trim().min(1).max(16).optional();
 
 export const listAssetsQuerySchema = z.object({
-  asset_type: z.enum(["filament_spool", "nozzle", "resin_tank"]).optional(),
+  asset_type: z.enum(["filament_spool", "nozzle", "resin_tank", "spare_part"]).optional(),
   status: z.enum(["available", "in_use", "installed", "empty", "damaged"]).optional(),
   search: z.string().trim().min(1).optional()
 });
@@ -179,6 +179,32 @@ export const createNozzleSchema = z.object({
   notes: z.string().optional()
 });
 
+// Spare parts (fans, belts, PTFE tubes — any loose replacement piece) are the
+// simplest asset shape: a required name, an optional brand, a price, and an
+// optional description (stored in the shared notes column). Same ×N multiplier
+// and finance-purchase riders as spools/nozzles.
+export const createSparePartSchema = z.object({
+  spare_part_name: z.string().trim().min(1).max(160),
+  spare_part_brand: z.string().trim().min(1).max(120).optional(),
+  purchase_price: z.coerce.number().min(0).nullable().optional(),
+  location: locationSchema,
+  // Multiplier: create this many identical spare-part instances from one form
+  // submission (same convention as spools/nozzles). Defaults to 1.
+  quantity: z.coerce.number().int().min(1).max(100).optional(),
+  // The form's "Description" — persisted in asset_instances.notes like every
+  // other asset's freeform text.
+  notes: z.string().optional(),
+  // ── Finance integration (Assets → Finance) ──────────────────────────────
+  // Identical mechanism to spools: a vendor name books the purchase as an
+  // itemized bill (part line ×N → Inventory, optional delivery line, tax/paid
+  // toggles). The client's "record a purchase bill" switch simply omits these
+  // fields, so intake without a bill needs no special casing here.
+  vendor_name: z.string().trim().min(1).max(200).optional(),
+  delivery_cost: z.coerce.number().min(0).max(999999999).optional(),
+  price_includes_tax: z.boolean().optional(),
+  already_paid: z.boolean().optional()
+});
+
 export const createResinTankSchema = z
   .object({
     resin_brand: z.string().trim().min(1),
@@ -220,6 +246,11 @@ export const updateAssetSchema = z
     // Nullable so the editor can CLEAR the name/brand (client sends null).
     nozzle_name: z.string().trim().min(1).max(120).nullable().optional(),
     nozzle_brand: z.string().trim().min(1).max(120).nullable().optional(),
+    // A spare part's name is its whole identity, so it can be changed but not
+    // cleared (the client drops the field when the input is emptied); the
+    // brand is clearable like the nozzle one.
+    spare_part_name: z.string().trim().min(1).max(160).optional(),
+    spare_part_brand: z.string().trim().min(1).max(120).nullable().optional(),
     resin_brand: z.string().trim().min(1).optional(),
     resin_type: z.string().trim().min(1).optional(),
     resin_color: z.string().trim().min(1).optional(),
@@ -332,7 +363,7 @@ export const listFilamentReferencesQuerySchema = z.object({
 
 export const listAssetHistoryQuerySchema = z.object({
   event_type: z.enum(["addition", "edit", "assignation"]).optional(),
-  asset_type: z.enum(["filament_spool", "nozzle", "resin_tank"]).optional(),
+  asset_type: z.enum(["filament_spool", "nozzle", "resin_tank", "spare_part"]).optional(),
   days: z.coerce.number().int().min(1).max(365).optional().default(30)
 });
 

@@ -2157,10 +2157,11 @@ export class FinanceService {
     });
   }
 
-  // ── Filament purchase (Assets → Finance integration) ────────────────────────
-  // Adding a spool with a vendor name auto-records the purchase as an itemized
-  // vendor bill: one line for the spool batch (quantity = the ×N multiplier,
-  // booked to Inventory) plus an optional delivery line (Operating Expenses).
+  // ── Inventory purchase (Assets → Finance integration) ───────────────────────
+  // Adding an asset (filament spool, spare part, …) with a vendor name
+  // auto-records the purchase as an itemized vendor bill: one line for the item
+  // batch (quantity = the ×N multiplier, booked to Inventory) plus an optional
+  // delivery line (Operating Expenses).
   // The vendor name is matched case-insensitively; an unknown name registers a
   // new vendor so the next purchase auto-links. The bill posts to A/P; when
   // `alreadyPaid` it is also settled from Cash in the same call. `priceIncludesTax`
@@ -2168,7 +2169,7 @@ export class FinanceService {
   // company default tax rate is applied on top. Reuses the canonical
   // createBill/openBill/createPayment paths so the double-entry logic — and its
   // rounding — stay single-sourced. Returns null when there is nothing billable.
-  async recordFilamentPurchase(
+  async recordInventoryPurchase(
     companyId: string,
     userId: string,
     input: {
@@ -2181,6 +2182,8 @@ export class FinanceService {
       alreadyPaid?: boolean;
       purchaseDate?: string | null;
       reference?: string | null;
+      /** Bill memo — names the intake flow ("Filament spool purchase", "Spare part purchase"). */
+      memo?: string | null;
     }
   ): Promise<{ bill_id: string; bill_number: string; status: "open" | "paid" } | null> {
     const unitPrice = Number.isFinite(input.unitPrice) ? Math.max(0, input.unitPrice) : 0;
@@ -2191,8 +2194,8 @@ export class FinanceService {
     const quantity = Math.max(1, Math.trunc(input.quantity || 1));
 
     // Nothing billable → no document (a zero-total bill can't be posted anyway).
-    const hasSpoolLine = unitPrice > 0;
-    if (!hasSpoolLine && deliveryCost <= 0) return null;
+    const hasItemLine = unitPrice > 0;
+    if (!hasItemLine && deliveryCost <= 0) return null;
 
     const vendorId = await this.resolveOrCreateVendorByName(companyId, input.vendorName);
     const accounts = await this.resolveSystemAccountIds(
@@ -2206,7 +2209,7 @@ export class FinanceService {
       : (await this.defaultTaxRateId(companyId)) ?? undefined;
 
     const lines: DocumentLineInput[] = [];
-    if (hasSpoolLine) {
+    if (hasItemLine) {
       lines.push({
         description: input.description,
         quantity,
@@ -2229,7 +2232,7 @@ export class FinanceService {
       vendor_id: vendorId,
       issue_date: input.purchaseDate ?? undefined,
       vendor_reference: input.reference ?? undefined,
-      memo: "Filament spool purchase",
+      memo: input.memo ?? "Filament spool purchase",
       lines
     } as CreateBillInput);
 

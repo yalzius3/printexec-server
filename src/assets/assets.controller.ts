@@ -17,6 +17,7 @@ import {
   createFilamentReferenceSchema,
   createNozzleSchema,
   createResinTankSchema,
+  createSparePartSchema,
   createSpoolSchema,
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
@@ -137,6 +138,22 @@ export class AssetsController {
     return this.assetsService.createNozzle(
       companyId,
       parseWithSchema(createNozzleSchema, body)
+    );
+  }
+
+  // Spare parts (fans, belts, …). Carries the user id because — like spools —
+  // a vendor-named intake books a purchase bill in Finance on their behalf.
+  @Post("spare-parts")
+  @RequirePermission("action_assets")
+  createSparePart(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Body() body: unknown
+  ) {
+    return this.assetsService.createSparePart(
+      companyId,
+      userId,
+      parseWithSchema(createSparePartSchema, body)
     );
   }
 
