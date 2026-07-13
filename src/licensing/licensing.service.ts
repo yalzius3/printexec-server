@@ -186,27 +186,33 @@ export class LicensingService {
       );
     }
 
-    // Whichever condition's grace window lapses first wins.
+    // Whichever condition's grace window lapses first wins. A trial gets NO
+    // grace: the moment it ends — naturally expired or stopped by an admin —
+    // the workspace goes read-only, so the tenant has to subscribe to keep
+    // working. A lapsed *paid* plan and the over-limit condition still get the
+    // full graceDays cushion.
     let state: LicenseState = "ok";
     let reason: LicenseReason = null;
     let graceUntil: number | null = null;
 
     if (lapsed || overLimit) {
-      const anchors: { anchor: number; reason: Exclude<LicenseReason, null> }[] = [];
+      const candidates: { graceUntil: number; reason: Exclude<LicenseReason, null> }[] = [];
       if (lapsed) {
-        anchors.push({
-          anchor: lapseAnchor,
+        const graceMs = (sub.source === "trial" ? 0 : this.graceDays) * DAY_MS;
+        candidates.push({
+          graceUntil: lapseAnchor + graceMs,
           reason:
             sub.status === "revoked" ? "revoked" :
             sub.status === "canceled" ? "canceled" : "expired"
         });
       }
       if (overLimit && overSince !== null) {
-        anchors.push({ anchor: overSince, reason: "over_limit" });
+        candidates.push({ graceUntil: overSince + this.graceDays * DAY_MS, reason: "over_limit" });
       }
-      anchors.sort((a, b) => a.anchor - b.anchor);
-      const first = anchors[0]!;
-      graceUntil = first.anchor + this.graceDays * DAY_MS;
+      // Most-restrictive wins: the earliest transition into read-only.
+      candidates.sort((a, b) => a.graceUntil - b.graceUntil);
+      const first = candidates[0]!;
+      graceUntil = first.graceUntil;
       reason = first.reason;
       state = now < graceUntil ? "grace" : "readonly";
     }

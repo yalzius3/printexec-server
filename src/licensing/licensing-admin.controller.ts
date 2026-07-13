@@ -12,7 +12,7 @@ import { UserId } from "../common/user-id.decorator";
 import { parseWithSchema } from "../common/zod";
 import { DatabaseService } from "../database/database.service";
 import { LicenseExempt } from "./license-exempt.decorator";
-import { assignPlanSchema, createGrantSchema } from "./licensing.schemas";
+import { assignPlanSchema, createGrantSchema, endTrialSchema } from "./licensing.schemas";
 import { LicensingService } from "./licensing.service";
 
 // ════════════════════════════════════════════════════════════════
@@ -100,6 +100,43 @@ export class LicensingAdminController {
 
     this.licensing.invalidate(input.company_id);
     return this.licensing.getStatus(input.company_id, true);
+  }
+
+  // Stop a company's trial right now. Trials carry no grace (see
+  // LicensingService.resolve), so expiring the trial this instant drops the
+  // company straight into read-only — they must pick a plan or redeem a code
+  // to keep working. Reversible: "assign" a plan (or the trial plan with a
+  // future end date) to restore access.
+  @Post("end-trial")
+  async endTrial(@UserId() userId: string, @Body() body: unknown) {
+    await this.assertPlatformAdmin(userId);
+    const { company_id } = parseWithSchema(endTrialSchema, body);
+
+    const { rows } = await this.db.query<{ status: string }>(
+      "SELECT status FROM company_subscriptions WHERE company_id = $1",
+      [company_id]
+    );
+    const sub = rows[0];
+    if (!sub) throw new NotFoundException("This company has no trial to end.");
+    if (sub.status !== "trialing") {
+      throw new BadRequestException("This company is not on a trial.");
+    }
+
+    // Expire the trial a moment ago so the next resolve reads it as ended
+    // regardless of app/DB clock skew. status stays 'trialing' and source
+    // stays 'trial', so the tenant sees trial-flavoured "your trial has ended"
+    // copy and the zero-grace rule applies.
+    await this.db.query(
+      `UPDATE company_subscriptions
+       SET current_period_end = now() - INTERVAL '1 second',
+           limit_exceeded_since = NULL,
+           updated_at = now()
+       WHERE company_id = $1`,
+      [company_id]
+    );
+
+    this.licensing.invalidate(company_id);
+    return this.licensing.getStatus(company_id, true);
   }
 
   @Get("grants")

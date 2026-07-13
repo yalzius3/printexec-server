@@ -57,7 +57,7 @@ export class LicenseGuard implements CanActivate {
 
     throw new ForbiddenException(
       status.status === "trialing"
-        ? "Your trial has ended and the grace period is over — your workspace is read-only. Choose a plan to continue."
+        ? "Your trial has ended — your workspace is read-only. Choose a plan to continue."
         : "Your plan is inactive and the grace period is over — your workspace is read-only. Renew your plan to continue."
     );
   }

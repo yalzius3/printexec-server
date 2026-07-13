@@ -13,6 +13,12 @@ export const assignPlanSchema = z.object({
   status: z.enum(["active", "canceled"]).optional()
 });
 
+// Admin: stop a company's trial right now. Trials get no grace, so this drops
+// the company straight into read-only until they subscribe.
+export const endTrialSchema = z.object({
+  company_id: z.string().uuid()
+});
+
 export const createGrantSchema = z.object({
   plan_code: z.string().trim().min(1).max(40),
   note: z.string().trim().max(500).optional(),
