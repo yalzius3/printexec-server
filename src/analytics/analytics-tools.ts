@@ -830,6 +830,194 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
         by_printer: byPrinter.rows.map((r) => ({ ...r, label: r.label ?? "Unassigned" }))
       };
     }
+  },
+
+  // ── Wave 2 — paged dashboard ──────────────────────────────────────────────
+  {
+    name: "orders_timeseries",
+    title: "Orders created vs fulfilled",
+    description:
+      "Orders created and orders fulfilled per day/week/month bucket over a period, INCLUDING empty buckets, with period totals and the previous same-length period's totals for comparison. Use for demand-vs-delivery pace questions ('are we keeping up with incoming orders').",
+    financial: false,
+    params: seriesParamsSchema,
+    jsonSchema: seriesJsonSchema,
+    async run(db, companyId, params) {
+      const p = resolvePeriod(params as { from?: string; to?: string });
+      const g = resolveGranularity(p.spanDays, (params as { granularity?: string }).granularity);
+      const [series, totals] = await Promise.all([
+        db.query<{ t: string; created: number; fulfilled: number }>(
+          `
+            WITH buckets AS (
+              SELECT generate_series(date_trunc($4, $2::date), date_trunc($4, $3::date), ('1 ' || $4)::interval)::date AS t
+            ),
+            created AS (
+              SELECT date_trunc($4, o.created_at)::date AS t, COUNT(*) AS n
+              FROM orders o
+              WHERE o.company_id = $1 AND o.created_at >= $2::date AND o.created_at < ($3::date + 1)
+              GROUP BY 1
+            ),
+            fulfilled AS (
+              SELECT date_trunc($4, o.fulfilled_at)::date AS t, COUNT(*) AS n
+              FROM orders o
+              WHERE o.company_id = $1 AND o.fulfilled_at >= $2::date AND o.fulfilled_at < ($3::date + 1)
+              GROUP BY 1
+            )
+            SELECT b.t::text AS t,
+                   COALESCE(c.n, 0)::int AS created,
+                   COALESCE(f.n, 0)::int AS fulfilled
+            FROM buckets b
+            LEFT JOIN created c ON c.t = b.t
+            LEFT JOIN fulfilled f ON f.t = b.t
+            ORDER BY b.t
+          `,
+          [companyId, p.from, p.to, g]
+        ),
+        db.query<{ created: number; fulfilled: number; created_prev: number; fulfilled_prev: number }>(
+          `
+            SELECT
+              (SELECT COUNT(*) FROM orders o WHERE o.company_id = $1 AND o.created_at >= $2::date AND o.created_at < ($3::date + 1))::int AS created,
+              (SELECT COUNT(*) FROM orders o WHERE o.company_id = $1 AND o.fulfilled_at >= $2::date AND o.fulfilled_at < ($3::date + 1))::int AS fulfilled,
+              (SELECT COUNT(*) FROM orders o WHERE o.company_id = $1 AND o.created_at >= $4::date AND o.created_at < ($5::date + 1))::int AS created_prev,
+              (SELECT COUNT(*) FROM orders o WHERE o.company_id = $1 AND o.fulfilled_at >= $4::date AND o.fulfilled_at < ($5::date + 1))::int AS fulfilled_prev
+          `,
+          [companyId, p.from, p.to, p.prevFrom, p.prevTo]
+        )
+      ]);
+      return {
+        period: { from: p.from, to: p.to, prev_from: p.prevFrom, prev_to: p.prevTo },
+        granularity: g,
+        buckets: series.rows,
+        ...totals.rows[0]
+      };
+    }
+  },
+  {
+    name: "customer_growth",
+    title: "Customer growth",
+    description:
+      "New CRM customers added per day/week/month bucket over a period (empty buckets included), plus totals: customers added this period, the previous same-length period, and the all-time customer count. Counts only — no money. Use for 'is our customer base growing' questions.",
+    financial: false,
+    params: seriesParamsSchema,
+    jsonSchema: seriesJsonSchema,
+    async run(db, companyId, params) {
+      const p = resolvePeriod(params as { from?: string; to?: string });
+      const g = resolveGranularity(p.spanDays, (params as { granularity?: string }).granularity);
+      const [series, totals] = await Promise.all([
+        db.query<{ t: string; added: number }>(
+          `
+            WITH buckets AS (
+              SELECT generate_series(date_trunc($4, $2::date), date_trunc($4, $3::date), ('1 ' || $4)::interval)::date AS t
+            ),
+            agg AS (
+              SELECT date_trunc($4, c.created_at)::date AS t, COUNT(*) AS n
+              FROM customers c
+              WHERE c.company_id = $1 AND c.created_at >= $2::date AND c.created_at < ($3::date + 1)
+              GROUP BY 1
+            )
+            SELECT b.t::text AS t, COALESCE(a.n, 0)::int AS added
+            FROM buckets b LEFT JOIN agg a ON a.t = b.t
+            ORDER BY b.t
+          `,
+          [companyId, p.from, p.to, g]
+        ),
+        db.query<{ added: number; added_prev: number; total: number }>(
+          `
+            SELECT
+              (SELECT COUNT(*) FROM customers c WHERE c.company_id = $1 AND c.created_at >= $2::date AND c.created_at < ($3::date + 1))::int AS added,
+              (SELECT COUNT(*) FROM customers c WHERE c.company_id = $1 AND c.created_at >= $4::date AND c.created_at < ($5::date + 1))::int AS added_prev,
+              (SELECT COUNT(*) FROM customers c WHERE c.company_id = $1)::int AS total
+          `,
+          [companyId, p.from, p.to, p.prevFrom, p.prevTo]
+        )
+      ]);
+      return {
+        period: { from: p.from, to: p.to, prev_from: p.prevFrom, prev_to: p.prevTo },
+        granularity: g,
+        buckets: series.rows,
+        ...totals.rows[0]
+      };
+    }
+  },
+  {
+    name: "material_consumption",
+    title: "Material consumption",
+    description:
+      "Filament consumed by completed pieces over a period, per material: grams, pieces, share_pct of period grams, and the previous same-length period's grams for comparison. Consumption only — failed-print scrap lives in waste_summary. Use for 'what materials do we actually print with' questions.",
+    financial: false,
+    params: periodParamsSchema,
+    jsonSchema: periodJsonSchema,
+    async run(db, companyId, params) {
+      const p = resolvePeriod(params as { from?: string; to?: string });
+      const { rows } = await db.query<{ material: string; grams: number; pieces: number; grams_prev: number }>(
+        `
+          WITH cur AS (
+            SELECT COALESCE(op.required_filament_material, 'Unknown') AS material,
+                   SUM(COALESCE(op.slicer_filament_used_grams, 0))::float8 AS grams,
+                   COUNT(*)::int AS pieces
+            FROM order_pieces op
+            WHERE op.company_id = $1
+              AND op.print_completed_at >= $2::date AND op.print_completed_at < ($3::date + 1)
+            GROUP BY 1
+          ),
+          prev AS (
+            SELECT COALESCE(op.required_filament_material, 'Unknown') AS material,
+                   SUM(COALESCE(op.slicer_filament_used_grams, 0))::float8 AS grams
+            FROM order_pieces op
+            WHERE op.company_id = $1
+              AND op.print_completed_at >= $4::date AND op.print_completed_at < ($5::date + 1)
+            GROUP BY 1
+          )
+          SELECT COALESCE(c.material, pr.material) AS material,
+                 COALESCE(c.grams, 0)::float8 AS grams,
+                 COALESCE(c.pieces, 0)::int AS pieces,
+                 COALESCE(pr.grams, 0)::float8 AS grams_prev
+          FROM cur c
+          FULL OUTER JOIN prev pr ON pr.material = c.material
+          ORDER BY COALESCE(c.grams, 0) DESC
+          LIMIT 20
+        `,
+        [companyId, p.from, p.to, p.prevFrom, p.prevTo]
+      );
+      const total = rows.reduce((s, r) => s + num(r.grams), 0);
+      return {
+        period: { from: p.from, to: p.to, prev_from: p.prevFrom, prev_to: p.prevTo },
+        total_grams: Math.round(total),
+        rows: rows.map((r) => ({
+          material: r.material,
+          grams: Math.round(num(r.grams)),
+          pieces: r.pieces,
+          grams_prev: Math.round(num(r.grams_prev)),
+          share_pct: total > 0 ? round1((num(r.grams) / total) * 100) : null
+        }))
+      };
+    }
+  },
+  {
+    name: "invoice_status_mix",
+    title: "Invoice status mix",
+    description:
+      "Current snapshot of ALL invoices by status (draft, open, partial, paid, void): count, total value, and outstanding balance per status. No period parameters. Use for 'how much is drafted / billed / collected' questions.",
+    financial: true,
+    params: emptyParamsSchema,
+    jsonSchema: emptyJsonSchema,
+    async run(db, companyId) {
+      const { rows } = await db.query<{ status: string; n: number; total: string; balance: string }>(
+        `
+          SELECT i.status,
+                 COUNT(*)::int AS n,
+                 COALESCE(SUM(i.total), 0)::text AS total,
+                 COALESCE(SUM(i.balance_due), 0)::text AS balance
+          FROM invoices i
+          WHERE i.company_id = $1
+          GROUP BY i.status
+        `,
+        [companyId]
+      );
+      const order = ["draft", "open", "partial", "paid", "void"];
+      return {
+        statuses: order.map((s) => rows.find((r) => r.status === s) ?? { status: s, n: 0, total: "0", balance: "0" })
+      };
+    }
   }
 ];
 

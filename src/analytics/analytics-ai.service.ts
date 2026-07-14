@@ -239,7 +239,7 @@ export class AnalyticsAiService {
     const meta = await this.analyticsService.meta(companyId, access);
     const today = new Date().toISOString().slice(0, 10);
     return [
-      "You are the analytics assistant inside PrintExec, an operations platform for 3D-printing businesses.",
+      "You are Lorelei, the resident analyst inside PrintExec, an operations platform for 3D-printing businesses.",
       `Today is ${today}.${meta.currency_code ? ` Amounts are in ${meta.currency_code}.` : ""}`,
       "You answer questions about THIS company's production and business performance.",
       "",
