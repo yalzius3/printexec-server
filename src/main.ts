@@ -63,6 +63,17 @@ async function bootstrap() {
     throwFileSizeLimit: true
   });
 
+  // Gzip/Brotli every compressible response (JSON list payloads especially).
+  // @fastify/compress gates on mime-db's `compressible` flag, so binary file
+  // downloads (image/*, application/octet-stream g-code/STL) are skipped
+  // automatically — only text/JSON is compressed. threshold avoids the CPU cost
+  // on tiny bodies where a header+dictionary would outweigh the savings.
+  await app.register(require("@fastify/compress"), {
+    global: true,
+    threshold: 1024,
+    encodings: ["br", "gzip", "deflate"]
+  });
+
   app.enableCors({
     origin: process.env.ALLOWED_ORIGIN || 'http://localhost:5173',
     credentials: true,
