@@ -1,4 +1,12 @@
-import { BadGatewayException, Injectable, ServiceUnavailableException } from "@nestjs/common";
+import {
+  BadGatewayException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  Logger,
+  ServiceUnavailableException
+} from "@nestjs/common";
+import { DatabaseService } from "../database/database.service";
 import { ANALYTICS_TOOLS, type AnalyticsTool } from "./analytics-tools";
 import { AnalyticsService, canUseTool, type AnalyticsAccess } from "./analytics.service";
 import type { AskBody } from "./analytics.schemas";
@@ -14,19 +22,26 @@ import type { AskBody } from "./analytics.schemas";
 //
 // Provider-agnostic BY DESIGN (owner decision 2026-07-13): a thin adapter
 // over the two wire formats that cover practically every LLM API —
-//   · "openai"    — OpenAI-compatible /chat/completions (OpenAI, OpenRouter,
-//                   Groq, Gemini-compat, local llama.cpp/vLLM, …)
-//   · "anthropic" — Anthropic /v1/messages
+//   · "openai"     — OpenAI-compatible /chat/completions (OpenAI, Groq,
+//                    Gemini-compat, local llama.cpp/vLLM, …)
+//   · "openrouter" — same wire format as "openai", plus per-call USD cost
+//                    accounting (usage.cost) + attribution headers; this is
+//                    what backs the spend budget below
+//   · "anthropic"  — Anthropic /v1/messages
 // Plain fetch, no SDK dependency: the feature is env-gated and optional, so
 // it must not add weight to the deploy when it's off.
 //
 // Env (all optional until the feature is switched on):
-//   AI_ANALYST_ENABLED=true      master switch (EMAIL_ENABLED-style gate)
-//   AI_PROVIDER=openai|anthropic default openai
-//   AI_BASE_URL=…                default per provider
-//   AI_API_KEY=…                 required to enable
-//   AI_MODEL=…                   required to enable (never hardcoded here)
-//   AI_MAX_TOKENS=…              default 1500 (per round)
+//   AI_ANALYST_ENABLED=true                  master switch (EMAIL_ENABLED-style)
+//   AI_PROVIDER=openai|openrouter|anthropic   default openai
+//   AI_BASE_URL=…                            default per provider
+//   AI_API_KEY=…                             required to enable
+//   AI_MODEL=…                               required to enable (never hardcoded)
+//   AI_MAX_TOKENS=…                          default 1500 (per round)
+//
+// Spend budget (rolling-window USD cap, metered from provider cost / tokens):
+//   AI_BUDGET_USD=2  AI_BUDGET_WINDOW_DAYS=14  AI_BUDGET_SCOPE=global|company
+// Needs migrations/2026-07-15_ai_usage_budget.sql; fails OPEN until applied.
 // ════════════════════════════════════════════════════════════════
 
 const MAX_ROUNDS = 6;
@@ -40,9 +55,17 @@ interface NeutralToolCall {
   args: Record<string, unknown>;
 }
 
+interface TurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  /** Real dollar cost of the call when the provider reports it (OpenRouter). */
+  costUsd?: number | undefined;
+}
+
 interface NeutralTurn {
   text: string | null;
   toolCalls: NeutralToolCall[];
+  usage?: TurnUsage | undefined;
 }
 
 export interface AskStep {
@@ -65,6 +88,29 @@ const env = (key: string): string | undefined => {
 
 const truncate = (s: string): string =>
   s.length <= MAX_RESULT_CHARS ? s : `${s.slice(0, MAX_RESULT_CHARS)}… [truncated ${s.length - MAX_RESULT_CHARS} chars]`;
+
+const asTokens = (v: unknown): number => {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
+// OpenAI-compatible usage block. OpenRouter adds `cost` (USD) when the request
+// asks for it; plain OpenAI omits it (we fall back to a token estimate).
+const readOpenAiUsage = (raw: unknown): TurnUsage | undefined => {
+  if (!raw || typeof raw !== "object") return undefined;
+  const u = raw as Record<string, unknown>;
+  return {
+    inputTokens: asTokens(u.prompt_tokens),
+    outputTokens: asTokens(u.completion_tokens),
+    costUsd: typeof u.cost === "number" && Number.isFinite(u.cost) ? u.cost : undefined
+  };
+};
+
+const readAnthropicUsage = (raw: unknown): TurnUsage | undefined => {
+  if (!raw || typeof raw !== "object") return undefined;
+  const u = raw as Record<string, unknown>;
+  return { inputTokens: asTokens(u.input_tokens), outputTokens: asTokens(u.output_tokens) };
+};
 
 async function providerFetch(url: string, headers: Record<string, string>, body: unknown): Promise<Record<string, unknown>> {
   let response: Response;
@@ -97,7 +143,11 @@ class OpenAiCompatAdapter implements ProviderAdapter {
     private readonly baseUrl: string,
     private readonly apiKey: string,
     private readonly model: string,
-    private readonly maxTokens: number
+    private readonly maxTokens: number,
+    // OpenRouter: ask for per-call cost accounting (usage.cost) and send its
+    // optional attribution headers. Plain OpenAI leaves both off.
+    private readonly costAccounting = false,
+    private readonly extraHeaders: Record<string, string> = {}
   ) {}
 
   init(system: string, history: { role: "user" | "assistant"; content: string }[], question: string) {
@@ -109,19 +159,22 @@ class OpenAiCompatAdapter implements ProviderAdapter {
   }
 
   async call(tools: AnalyticsTool[]): Promise<NeutralTurn> {
+    const body: Record<string, unknown> = {
+      model: this.model,
+      max_tokens: this.maxTokens,
+      messages: this.messages,
+      tools: tools.map((t) => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.jsonSchema }
+      })),
+      tool_choice: "auto"
+    };
+    // OpenRouter returns the call's real USD cost on usage.cost when asked.
+    if (this.costAccounting) body.usage = { include: true };
     const payload = await providerFetch(
       `${this.baseUrl}/chat/completions`,
-      { authorization: `Bearer ${this.apiKey}` },
-      {
-        model: this.model,
-        max_tokens: this.maxTokens,
-        messages: this.messages,
-        tools: tools.map((t) => ({
-          type: "function",
-          function: { name: t.name, description: t.description, parameters: t.jsonSchema }
-        })),
-        tool_choice: "auto"
-      }
+      { authorization: `Bearer ${this.apiKey}`, ...this.extraHeaders },
+      body
     );
     const choice = (payload.choices as { message?: Record<string, unknown> }[] | undefined)?.[0];
     const message = choice?.message ?? {};
@@ -137,7 +190,11 @@ class OpenAiCompatAdapter implements ProviderAdapter {
       }
       return { id: c.id ?? `call_${i}`, name: c.function?.name ?? "", args };
     });
-    return { text: typeof message.content === "string" ? message.content : null, toolCalls };
+    return {
+      text: typeof message.content === "string" ? message.content : null,
+      toolCalls,
+      usage: readOpenAiUsage(payload.usage)
+    };
   }
 
   appendToolResults(results: { call: NeutralToolCall; content: string }[]) {
@@ -182,7 +239,11 @@ class AnthropicAdapter implements ProviderAdapter {
     // Echo the assistant content back verbatim (tool_use ids must survive).
     this.messages.push({ role: "assistant", content });
     if (payload.stop_reason === "refusal") {
-      return { text: "The AI provider declined to answer this question.", toolCalls: [] };
+      return {
+        text: "The AI provider declined to answer this question.",
+        toolCalls: [],
+        usage: readAnthropicUsage(payload.usage)
+      };
     }
     const text = content
       .filter((b) => b.type === "text" && typeof b.text === "string")
@@ -196,7 +257,7 @@ class AnthropicAdapter implements ProviderAdapter {
         name: typeof b.name === "string" ? b.name : "",
         args: (b.input as Record<string, unknown> | undefined) ?? {}
       }));
-    return { text: text || null, toolCalls };
+    return { text: text || null, toolCalls, usage: readAnthropicUsage(payload.usage) };
   }
 
   appendToolResults(results: { call: NeutralToolCall; content: string }[]) {
@@ -216,7 +277,12 @@ class AnthropicAdapter implements ProviderAdapter {
 
 @Injectable()
 export class AnalyticsAiService {
-  constructor(private readonly analyticsService: AnalyticsService) {}
+  private readonly logger = new Logger(AnalyticsAiService.name);
+
+  constructor(
+    private readonly analyticsService: AnalyticsService,
+    private readonly databaseService: DatabaseService
+  ) {}
 
   enabled(): boolean {
     return env("AI_ANALYST_ENABLED") === "true" && !!env("AI_API_KEY") && !!env("AI_MODEL");
@@ -230,6 +296,15 @@ export class AnalyticsAiService {
     if (provider === "anthropic") {
       const base = (env("AI_BASE_URL") ?? "https://api.anthropic.com").replace(/\/+$/, "");
       return new AnthropicAdapter(base, apiKey, model, maxTokens);
+    }
+    if (provider === "openrouter") {
+      const base = (env("AI_BASE_URL") ?? "https://openrouter.ai/api/v1").replace(/\/+$/, "");
+      // OpenRouter-recommended (optional) attribution headers.
+      const headers: Record<string, string> = { "X-Title": env("AI_OPENROUTER_TITLE") ?? "PrintExec Lorelei" };
+      const referer = env("AI_OPENROUTER_REFERER") ?? env("PUBLIC_APP_URL");
+      if (referer) headers["HTTP-Referer"] = referer;
+      // costAccounting=true → request usage.cost so the budget meters real spend.
+      return new OpenAiCompatAdapter(base, apiKey, model, maxTokens, true, headers);
     }
     const base = (env("AI_BASE_URL") ?? "https://api.openai.com/v1").replace(/\/+$/, "");
     return new OpenAiCompatAdapter(base, apiKey, model, maxTokens);
@@ -256,33 +331,144 @@ export class AnalyticsAiService {
     if (!this.enabled()) {
       throw new ServiceUnavailableException("The AI analyst is not enabled on this server.");
     }
+    await this.enforceBudget(companyId);
+
     const belt = ANALYTICS_TOOLS.filter((t) => canUseTool(access, t));
     const adapter = this.buildAdapter();
     adapter.init(await this.systemPrompt(companyId, access, belt), body.history ?? [], body.question);
 
     const steps: AskStep[] = [];
-    for (let round = 0; round < MAX_ROUNDS; round += 1) {
-      const turn = await adapter.call(belt);
-      if (turn.toolCalls.length === 0) {
-        return { answer: turn.text ?? "I could not produce an answer.", steps };
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let costUsd = 0;
+    try {
+      for (let round = 0; round < MAX_ROUNDS; round += 1) {
+        const turn = await adapter.call(belt);
+        if (turn.usage) {
+          inputTokens += turn.usage.inputTokens;
+          outputTokens += turn.usage.outputTokens;
+          // Prefer the provider's real cost; estimate from tokens otherwise.
+          costUsd += turn.usage.costUsd ?? this.estimateCostUsd(turn.usage.inputTokens, turn.usage.outputTokens);
+        }
+        if (turn.toolCalls.length === 0) {
+          return { answer: turn.text ?? "I could not produce an answer.", steps };
+        }
+        const results = await Promise.all(
+          turn.toolCalls.map(async (call) => {
+            try {
+              const data = await this.analyticsService.execute(call.name, call.args, companyId, access);
+              steps.push({ tool: call.name, params: call.args, ok: true });
+              return { call, content: truncate(JSON.stringify(data)) };
+            } catch (e) {
+              steps.push({ tool: call.name, params: call.args, ok: false });
+              return { call, content: JSON.stringify({ error: e instanceof Error ? e.message : "Tool failed." }) };
+            }
+          })
+        );
+        adapter.appendToolResults(results);
       }
-      const results = await Promise.all(
-        turn.toolCalls.map(async (call) => {
-          try {
-            const data = await this.analyticsService.execute(call.name, call.args, companyId, access);
-            steps.push({ tool: call.name, params: call.args, ok: true });
-            return { call, content: truncate(JSON.stringify(data)) };
-          } catch (e) {
-            steps.push({ tool: call.name, params: call.args, ok: false });
-            return { call, content: JSON.stringify({ error: e instanceof Error ? e.message : "Tool failed." }) };
-          }
-        })
-      );
-      adapter.appendToolResults(results);
+      return {
+        answer: "I hit the tool-call limit before finishing. Try a narrower question.",
+        steps
+      };
+    } finally {
+      // Record whatever was spent even if a round threw mid-loop.
+      if (inputTokens > 0 || outputTokens > 0 || costUsd > 0) {
+        await this.recordSpend(companyId, costUsd, inputTokens, outputTokens, env("AI_MODEL") ?? "");
+      }
     }
-    return {
-      answer: "I hit the tool-call limit before finishing. Try a narrower question.",
-      steps
-    };
+  }
+
+  // ── Spend budget ──────────────────────────────────────────────────────────
+  // Rolling-window cap on real model cost (USD), metered from the provider's
+  // reported per-call cost (OpenRouter usage.cost) or a token-price estimate.
+  // Default: ~$2 / 14 days GLOBAL across the deployment — it guards the owner's
+  // provider key, not per-tenant fairness. AI_BUDGET_SCOPE=company meters each
+  // tenant separately; AI_BUDGET_USD=0 disables the cap.
+
+  private budgetUsd(): number {
+    const raw = env("AI_BUDGET_USD");
+    if (raw === undefined) return 2;
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? v : 2;
+  }
+
+  private windowDays(): number {
+    const v = Math.floor(Number(env("AI_BUDGET_WINDOW_DAYS") ?? 14));
+    return Number.isFinite(v) && v > 0 ? v : 14;
+  }
+
+  private budgetScope(): "global" | "company" {
+    return env("AI_BUDGET_SCOPE") === "company" ? "company" : "global";
+  }
+
+  /** Token-price fallback; defaults are Claude Sonnet 5 list price ($/1M). */
+  private estimateCostUsd(inputTokens: number, outputTokens: number): number {
+    const inPerM = Number(env("AI_PRICE_INPUT_PER_MTOK") ?? 3);
+    const outPerM = Number(env("AI_PRICE_OUTPUT_PER_MTOK") ?? 15);
+    const i = Number.isFinite(inPerM) ? inPerM : 3;
+    const o = Number.isFinite(outPerM) ? outPerM : 15;
+    return (inputTokens / 1_000_000) * i + (outputTokens / 1_000_000) * o;
+  }
+
+  private async enforceBudget(companyId: string): Promise<void> {
+    const cap = this.budgetUsd();
+    if (cap <= 0) return; // cap disabled
+    const days = this.windowDays();
+    try {
+      const where = ["created_at >= now() - make_interval(days => $1::int)"];
+      const params: unknown[] = [days];
+      if (this.budgetScope() === "company") {
+        where.push("company_id = $2");
+        params.push(companyId);
+      }
+      const { rows } = await this.databaseService.query<{ spend: string; oldest: Date | null }>(
+        `SELECT COALESCE(SUM(cost_usd), 0)::text AS spend, MIN(created_at) AS oldest
+           FROM ai_usage_events
+          WHERE ${where.join(" AND ")}`,
+        params
+      );
+      const spend = Number(rows[0]?.spend ?? 0);
+      if (spend < cap) return;
+      const oldest = rows[0]?.oldest ? new Date(rows[0].oldest) : null;
+      const resetAt = oldest ? new Date(oldest.getTime() + days * 86_400_000) : null;
+      const tail = resetAt ? ` Earlier usage starts rolling off around ${resetAt.toISOString().slice(0, 10)}.` : "";
+      throw new HttpException(
+        `Lorelei has reached her AI budget (about $${cap.toFixed(2)} every ${days} days) and is resting for now.${tail}`,
+        HttpStatus.TOO_MANY_REQUESTS
+      );
+    } catch (e) {
+      if (e instanceof HttpException) throw e;
+      // Fail OPEN on any accounting error so the analyst keeps working. The
+      // usual case is the table not being migrated yet (Postgres 42P01) — the
+      // cap simply isn't enforced until migrations/2026-07-15_ai_usage_budget.sql
+      // is applied.
+      const code = (e as { code?: string })?.code;
+      this.logger.warn(
+        code === "42P01"
+          ? "AI budget not enforced: ai_usage_events is missing — apply migrations/2026-07-15_ai_usage_budget.sql."
+          : `AI budget check failed (allowing request): ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  }
+
+  private async recordSpend(
+    companyId: string,
+    costUsd: number,
+    inputTokens: number,
+    outputTokens: number,
+    model: string
+  ): Promise<void> {
+    try {
+      await this.databaseService.query(
+        `INSERT INTO ai_usage_events (company_id, model, input_tokens, output_tokens, cost_usd)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [companyId, model || null, Math.round(inputTokens), Math.round(outputTokens), costUsd]
+      );
+    } catch (e) {
+      // Never fail the user's answer over accounting. Pre-migration this just
+      // means spend isn't tracked yet.
+      this.logger.warn(`AI usage not recorded: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
