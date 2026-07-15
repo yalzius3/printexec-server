@@ -7,9 +7,18 @@ import {
   ServiceUnavailableException
 } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
-import { ANALYTICS_TOOLS, type AnalyticsTool } from "./analytics-tools";
+import { ANALYTICS_TOOLS } from "./analytics-tools";
 import { AnalyticsService, canUseTool, type AnalyticsAccess } from "./analytics.service";
-import type { AskBody } from "./analytics.schemas";
+import {
+  chartArtifactSchema,
+  reportArtifactSchema,
+  tableArtifactSchema,
+  type AskBody,
+  type ChartArtifact,
+  type ReportArtifact,
+  type TableArtifact
+} from "./analytics.schemas";
+import type { ZodType } from "zod";
 
 // ════════════════════════════════════════════════════════════════
 // AnalyticsAiService — the "Ask" analyst.
@@ -19,6 +28,12 @@ import type { AskBody } from "./analytics.schemas";
 // zod-validated params, we execute, it composes the answer. Every executed
 // call is returned to the client as an evidence step so the UI can show its
 // work.
+//
+// Besides query tools the belt carries three PRESENTATION tools
+// (present_chart / present_table / compose_report): server-validated artifact
+// payloads the client renders with the dashboard's own chart primitives. The
+// ask response also returns per-answer token/cost usage and the live budget
+// snapshot, so the client can meter spend without extra round-trips.
 //
 // Provider-agnostic BY DESIGN (owner decision 2026-07-13): a thin adapter
 // over the two wire formats that cover practically every LLM API —
@@ -37,22 +52,32 @@ import type { AskBody } from "./analytics.schemas";
 //   AI_BASE_URL=…                            default per provider
 //   AI_API_KEY=…                             required to enable
 //   AI_MODEL=…                               required to enable (never hardcoded)
-//   AI_MAX_TOKENS=…                          default 1500 (per round)
+//   AI_MAX_TOKENS=…                          default 3000 (per round)
 //
 // Spend budget (rolling-window USD cap, metered from provider cost / tokens):
 //   AI_BUDGET_USD=2  AI_BUDGET_WINDOW_DAYS=14  AI_BUDGET_SCOPE=global|company
 // Needs migrations/2026-07-15_ai_usage_budget.sql; fails OPEN until applied.
 // ════════════════════════════════════════════════════════════════
 
-const MAX_ROUNDS = 6;
+const MAX_ROUNDS = 8;
 const CALL_TIMEOUT_MS = 60_000;
 /** Hard cap on a single tool result as seen by the model. */
 const MAX_RESULT_CHARS = 14_000;
+/** Hard cap on rendered artifacts per answer. */
+const MAX_ARTIFACTS = 5;
 
 interface NeutralToolCall {
   id: string;
   name: string;
   args: Record<string, unknown>;
+}
+
+/** The minimal tool shape the wire adapters need — registry query tools and
+ *  the presentation tools below both satisfy it. */
+interface ToolDef {
+  name: string;
+  description: string;
+  jsonSchema: Record<string, unknown>;
 }
 
 interface TurnUsage {
@@ -77,7 +102,7 @@ export interface AskStep {
 interface ProviderAdapter {
   /** Provider-native message list, seeded with history + question. */
   init(system: string, history: { role: "user" | "assistant"; content: string }[], question: string): void;
-  call(tools: AnalyticsTool[]): Promise<NeutralTurn>;
+  call(tools: ToolDef[]): Promise<NeutralTurn>;
   appendToolResults(results: { call: NeutralToolCall; content: string }[]): void;
 }
 
@@ -158,7 +183,7 @@ class OpenAiCompatAdapter implements ProviderAdapter {
     ];
   }
 
-  async call(tools: AnalyticsTool[]): Promise<NeutralTurn> {
+  async call(tools: ToolDef[]): Promise<NeutralTurn> {
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: this.maxTokens,
@@ -223,7 +248,7 @@ class AnthropicAdapter implements ProviderAdapter {
     ];
   }
 
-  async call(tools: AnalyticsTool[]): Promise<NeutralTurn> {
+  async call(tools: ToolDef[]): Promise<NeutralTurn> {
     const payload = await providerFetch(
       `${this.baseUrl}/v1/messages`,
       { "x-api-key": this.apiKey, "anthropic-version": "2023-06-01" },
@@ -274,6 +299,126 @@ class AnthropicAdapter implements ProviderAdapter {
 }
 
 // ════════════════════════════════════════════════════════════════
+// Presentation tools — how Lorelei SHOWS things.
+//
+// Unlike registry tools these never run SQL: the model calls them with data
+// it already fetched in this conversation, the server zod-validates the shape
+// and hands the artifact to the client, which renders it with the same chart
+// primitives the dashboard cards use. The model gets back a short ack so it
+// can reference the artifact in its prose instead of repeating the numbers.
+// ════════════════════════════════════════════════════════════════
+
+export type AskArtifact =
+  | ({ kind: "chart" } & ChartArtifact)
+  | ({ kind: "table" } & TableArtifact)
+  | ({ kind: "report" } & ReportArtifact);
+
+interface PresentationTool extends ToolDef {
+  kind: AskArtifact["kind"];
+  schema: ZodType;
+}
+
+const seriesJson = {
+  type: "array",
+  minItems: 1,
+  maxItems: 2,
+  items: {
+    type: "object",
+    properties: {
+      name: { type: "string", maxLength: 44, description: "Series name shown in the legend." },
+      values: {
+        type: "array",
+        items: { type: "number" },
+        description: "One number per label, copied verbatim from tool results in this conversation."
+      }
+    },
+    required: ["name", "values"],
+    additionalProperties: false
+  }
+};
+
+const PRESENTATION_TOOLS: PresentationTool[] = [
+  {
+    kind: "chart",
+    name: "present_chart",
+    description:
+      "Render an interactive chart to the user inside the chat, from data you already fetched with the query tools in THIS conversation. Use when shape tells the story better than prose: 'bar' compares buckets or categories (may carry a second series for a comparison), 'line' shows a continuous trend over time (one series), 'donut' shows share of a whole (one series; labels are the slices). Values must be copied verbatim from tool results — never invented, never re-scaled. Put the period in the title; set unit to what the numbers are ('EGP', 'g', 'hours', 'orders'). After presenting, give the takeaway in a sentence — do not re-list the values.",
+    schema: chartArtifactSchema,
+    jsonSchema: {
+      type: "object",
+      properties: {
+        chart: { type: "string", enum: ["bar", "line", "donut"], description: "bar = comparison, line = trend, donut = mix." },
+        title: { type: "string", maxLength: 90, description: "What the chart shows, including the period." },
+        unit: { type: "string", maxLength: 14, description: "Unit suffix for values ('EGP', 'g', 'hours')." },
+        labels: {
+          type: "array",
+          items: { type: "string", maxLength: 44 },
+          description: "X-axis buckets (ISO dates render as short dates) or donut slice names. Max 62."
+        },
+        series: seriesJson,
+        note: { type: "string", maxLength: 280, description: "Optional one-line caption under the chart." }
+      },
+      required: ["chart", "title", "labels", "series"],
+      additionalProperties: false
+    }
+  },
+  {
+    kind: "table",
+    name: "present_table",
+    description:
+      "Render a compact data table to the user inside the chat, from data you already fetched in THIS conversation. Use for leaderboards and itemized comparisons where the exact figures matter more than the shape. 2-7 columns, up to 40 rows, values verbatim from tool results. Pass numbers as JSON numbers (not pre-formatted strings) so the UI can align and format them; null for missing cells.",
+    schema: tableArtifactSchema,
+    jsonSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", maxLength: 90 },
+        columns: { type: "array", items: { type: "string", maxLength: 40 }, description: "2-7 column headers." },
+        rows: {
+          type: "array",
+          items: { type: "array", items: { type: ["string", "number", "null"], maxLength: 160 } },
+          description: "Up to 40 rows; each row has exactly one cell per column."
+        },
+        note: { type: "string", maxLength: 280, description: "Optional one-line caption under the table." }
+      },
+      required: ["title", "columns", "rows"],
+      additionalProperties: false
+    }
+  },
+  {
+    kind: "report",
+    name: "compose_report",
+    description:
+      "Assemble a structured written report the user can read in the chat and download as a document (title, optional subtitle, sections with headings and bodies; bodies support paragraphs, **bold**, `code` and '- ' lists). Use ONLY when the user asks for a report, briefing or summary document, or when the answer genuinely needs several sections of narrative — ordinary questions get an ordinary chat answer. Every figure in the body must come from tool results in this conversation. Charts and tables are separate artifacts — reference them by title instead of embedding.",
+    schema: reportArtifactSchema,
+    jsonSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", maxLength: 90 },
+        subtitle: { type: "string", maxLength: 140, description: "Optional dateline/scope line, e.g. the period covered." },
+        sections: {
+          type: "array",
+          minItems: 1,
+          maxItems: 12,
+          items: {
+            type: "object",
+            properties: {
+              heading: { type: "string", maxLength: 90 },
+              body: { type: "string", maxLength: 5000 }
+            },
+            required: ["heading", "body"],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ["title", "sections"],
+      additionalProperties: false
+    }
+  }
+];
+
+const PRESENTATION_BY_NAME = new Map(PRESENTATION_TOOLS.map((t) => [t.name, t]));
+
+// ════════════════════════════════════════════════════════════════
 
 @Injectable()
 export class AnalyticsAiService {
@@ -292,7 +437,9 @@ export class AnalyticsAiService {
     const provider = env("AI_PROVIDER") ?? "openai";
     const apiKey = env("AI_API_KEY") ?? "";
     const model = env("AI_MODEL") ?? "";
-    const maxTokens = Number(env("AI_MAX_TOKENS") ?? 1500) || 1500;
+    // Per-round output cap. Generous by default: a compose_report tool call is
+    // one large JSON argument, and a truncated call is a wasted (billed) round.
+    const maxTokens = Number(env("AI_MAX_TOKENS") ?? 3000) || 3000;
     if (provider === "anthropic") {
       const base = (env("AI_BASE_URL") ?? "https://api.anthropic.com").replace(/\/+$/, "");
       return new AnthropicAdapter(base, apiKey, model, maxTokens);
@@ -310,20 +457,30 @@ export class AnalyticsAiService {
     return new OpenAiCompatAdapter(base, apiKey, model, maxTokens);
   }
 
-  private async systemPrompt(companyId: string, access: AnalyticsAccess, belt: AnalyticsTool[]): Promise<string> {
+  private async systemPrompt(companyId: string, access: AnalyticsAccess, beltSize: number): Promise<string> {
     const meta = await this.analyticsService.meta(companyId, access);
     const today = new Date().toISOString().slice(0, 10);
+    const restricted = beltSize < ANALYTICS_TOOLS.length;
     return [
-      "You are Lorelei, the resident analyst inside PrintExec, an operations platform for 3D-printing businesses.",
+      "You are Lorelei, the resident analyst inside PrintExec, an operations platform for 3D-printing businesses. You know this domain cold: print farms, filament economics, order pipelines, invoicing, double-entry books.",
       `Today is ${today}.${meta.currency_code ? ` Amounts are in ${meta.currency_code}.` : ""}`,
-      "You answer questions about THIS company's production and business performance.",
+      "You answer questions about THIS company's production and business performance, from their live data.",
       "",
-      "Rules:",
-      "- Every number you state MUST come from a tool result in this conversation. Never estimate, extrapolate beyond a regression a tool computed, or fill gaps from general knowledge.",
-      "- Call tools to get data; you may call several in one turn. Default period is the last 30 days — say which period you used.",
-      "- If the data is empty or too thin to answer, say so plainly instead of guessing.",
-      `- You only have the tools listed. ${belt.length < ANALYTICS_TOOLS.length ? "Some company data (financials) is outside this user's access — if the question needs it, say they lack finance access rather than approximating." : ""}`,
-      "- Answer in plain language, lead with the answer, keep it compact. Use short markdown lists or a small table when comparing items. No preamble."
+      "Evidence rules:",
+      "- Every number you state or present MUST come from a tool result in this conversation. Never estimate, extrapolate beyond a regression a tool computed, or fill gaps from general knowledge.",
+      "- Call query tools to get data; you may call several in one turn. Default period is the last 30 days — say which period you used.",
+      "- If the data is empty or too thin to answer, say so plainly, and say what would have to be recorded for the question to become answerable.",
+      `- You only have the tools listed.${restricted ? " Some company data (financials) is outside this user's access — if the question needs it, say they lack finance access rather than approximating." : ""}`,
+      "",
+      "Showing your work:",
+      "- You can render artifacts in the chat: present_chart when shape tells the story (trend, comparison, mix), present_table when exact per-row figures matter, compose_report only when the user asks for a report or briefing document.",
+      "- Prefer one good artifact over three thin ones. Never repeat in prose what an artifact already shows — state the takeaway and move on.",
+      "",
+      "Voice:",
+      "- You are a seasoned analyst, not a chat assistant. Direct, specific, numerate. Lead with the finding, then the why.",
+      "- No filler, no exclamation marks, no 'great question', no apologies unless something actually failed. Numbers carry their units and period.",
+      "- Keep prose compact: short paragraphs; markdown lists only when comparing items.",
+      "- When the data points at an obvious next cut — by printer, by customer, by month — close with one short offer to run it. One clause, not a pitch."
     ].join("\n");
   }
 
@@ -333,50 +490,106 @@ export class AnalyticsAiService {
     }
     await this.enforceBudget(companyId);
 
-    const belt = ANALYTICS_TOOLS.filter((t) => canUseTool(access, t));
-    const adapter = this.buildAdapter();
-    adapter.init(await this.systemPrompt(companyId, access, belt), body.history ?? [], body.question);
-
-    const steps: AskStep[] = [];
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let costUsd = 0;
+    const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    let result: { answer: string; steps: AskStep[]; artifacts: AskArtifact[] };
     try {
-      for (let round = 0; round < MAX_ROUNDS; round += 1) {
-        const turn = await adapter.call(belt);
-        if (turn.usage) {
-          inputTokens += turn.usage.inputTokens;
-          outputTokens += turn.usage.outputTokens;
-          // Prefer the provider's real cost; estimate from tokens otherwise.
-          costUsd += turn.usage.costUsd ?? this.estimateCostUsd(turn.usage.inputTokens, turn.usage.outputTokens);
-        }
-        if (turn.toolCalls.length === 0) {
-          return { answer: turn.text ?? "I could not produce an answer.", steps };
-        }
-        const results = await Promise.all(
-          turn.toolCalls.map(async (call) => {
-            try {
-              const data = await this.analyticsService.execute(call.name, call.args, companyId, access);
-              steps.push({ tool: call.name, params: call.args, ok: true });
-              return { call, content: truncate(JSON.stringify(data)) };
-            } catch (e) {
-              steps.push({ tool: call.name, params: call.args, ok: false });
-              return { call, content: JSON.stringify({ error: e instanceof Error ? e.message : "Tool failed." }) };
-            }
-          })
-        );
-        adapter.appendToolResults(results);
-      }
-      return {
-        answer: "I hit the tool-call limit before finishing. Try a narrower question.",
-        steps
-      };
+      result = await this.runAgentLoop(body, companyId, access, usage);
     } finally {
       // Record whatever was spent even if a round threw mid-loop.
-      if (inputTokens > 0 || outputTokens > 0 || costUsd > 0) {
-        await this.recordSpend(companyId, costUsd, inputTokens, outputTokens, env("AI_MODEL") ?? "");
+      if (usage.inputTokens > 0 || usage.outputTokens > 0 || usage.costUsd > 0) {
+        await this.recordSpend(companyId, usage.costUsd, usage.inputTokens, usage.outputTokens, env("AI_MODEL") ?? "");
       }
     }
+    return {
+      ...result,
+      usage: {
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cost_usd: Math.round(usage.costUsd * 1e6) / 1e6,
+        model: env("AI_MODEL") ?? ""
+      },
+      // Post-spend budget snapshot so the client meter updates without a
+      // second request.
+      budget: await this.budgetStatus(companyId)
+    };
+  }
+
+  private async runAgentLoop(
+    body: AskBody,
+    companyId: string,
+    access: AnalyticsAccess,
+    usage: { inputTokens: number; outputTokens: number; costUsd: number }
+  ): Promise<{ answer: string; steps: AskStep[]; artifacts: AskArtifact[] }> {
+    const belt = ANALYTICS_TOOLS.filter((t) => canUseTool(access, t));
+    const adapter = this.buildAdapter();
+    adapter.init(await this.systemPrompt(companyId, access, belt.length), body.history ?? [], body.question);
+
+    // Query tools + presentation tools, one belt as the model sees it.
+    const toolDefs: ToolDef[] = [...belt, ...PRESENTATION_TOOLS];
+    const steps: AskStep[] = [];
+    const artifacts: AskArtifact[] = [];
+
+    for (let round = 0; round < MAX_ROUNDS; round += 1) {
+      const turn = await adapter.call(toolDefs);
+      if (turn.usage) {
+        usage.inputTokens += turn.usage.inputTokens;
+        usage.outputTokens += turn.usage.outputTokens;
+        // Prefer the provider's real cost; estimate from tokens otherwise.
+        usage.costUsd += turn.usage.costUsd ?? this.estimateCostUsd(turn.usage.inputTokens, turn.usage.outputTokens);
+      }
+      if (turn.toolCalls.length === 0) {
+        return { answer: turn.text ?? "I could not produce an answer.", steps, artifacts };
+      }
+      const results = await Promise.all(
+        turn.toolCalls.map(async (call) => {
+          const presentation = PRESENTATION_BY_NAME.get(call.name);
+          if (presentation) {
+            return { call, content: this.executePresentation(presentation, call, steps, artifacts) };
+          }
+          try {
+            const data = await this.analyticsService.execute(call.name, call.args, companyId, access);
+            steps.push({ tool: call.name, params: call.args, ok: true });
+            return { call, content: truncate(JSON.stringify(data)) };
+          } catch (e) {
+            steps.push({ tool: call.name, params: call.args, ok: false });
+            return { call, content: JSON.stringify({ error: e instanceof Error ? e.message : "Tool failed." }) };
+          }
+        })
+      );
+      adapter.appendToolResults(results);
+    }
+    return {
+      answer: "I hit the tool-call limit before finishing. Try a narrower question.",
+      steps,
+      artifacts
+    };
+  }
+
+  /** Validate + collect a presentation tool call; returns the model-facing ack. */
+  private executePresentation(
+    tool: PresentationTool,
+    call: NeutralToolCall,
+    steps: AskStep[],
+    artifacts: AskArtifact[]
+  ): string {
+    if (artifacts.length >= MAX_ARTIFACTS) {
+      steps.push({ tool: call.name, params: {}, ok: false });
+      return JSON.stringify({ error: `Artifact limit (${MAX_ARTIFACTS}) reached for this answer — finish in prose.` });
+    }
+    const parsed = tool.schema.safeParse(call.args);
+    if (!parsed.success) {
+      steps.push({ tool: call.name, params: {}, ok: false });
+      const issues = parsed.error.issues
+        .slice(0, 3)
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return JSON.stringify({ error: `Invalid ${tool.name} payload — ${issues}` });
+    }
+    artifacts.push({ kind: tool.kind, ...(parsed.data as object) } as AskArtifact);
+    // Steps carry only the title — artifact bodies would bloat the evidence trail.
+    const title = (parsed.data as { title?: string }).title;
+    steps.push({ tool: call.name, params: title ? { title } : {}, ok: true });
+    return JSON.stringify({ ok: true, note: "Rendered to the user. Reference it briefly — do not repeat its data in prose." });
   }
 
   // ── Spend budget ──────────────────────────────────────────────────────────
@@ -411,26 +624,66 @@ export class AnalyticsAiService {
     return (inputTokens / 1_000_000) * i + (outputTokens / 1_000_000) * o;
   }
 
+  /** Rolling-window spend + the oldest event in the window (for the reset
+   *  date). Throws on DB errors (missing table included) — each caller picks
+   *  its own failure posture. */
+  private async windowSpend(companyId: string): Promise<{ spend: number; oldest: Date | null }> {
+    const where = ["created_at >= now() - make_interval(days => $1::int)"];
+    const params: unknown[] = [this.windowDays()];
+    if (this.budgetScope() === "company") {
+      where.push("company_id = $2");
+      params.push(companyId);
+    }
+    const { rows } = await this.databaseService.query<{ spend: string; oldest: Date | null }>(
+      `SELECT COALESCE(SUM(cost_usd), 0)::text AS spend, MIN(created_at) AS oldest
+         FROM ai_usage_events
+        WHERE ${where.join(" AND ")}`,
+      params
+    );
+    return { spend: Number(rows[0]?.spend ?? 0), oldest: rows[0]?.oldest ? new Date(rows[0].oldest) : null };
+  }
+
+  /** Live budget snapshot for the client's meter — also GET /analytics/ask/budget. */
+  async budgetStatus(companyId: string) {
+    const cap = this.budgetUsd();
+    const days = this.windowDays();
+    const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
+    try {
+      const { spend, oldest } = await this.windowSpend(companyId);
+      return {
+        tracked: true,
+        scope: this.budgetScope(),
+        cap_usd: cap,
+        window_days: days,
+        used_usd: round6(spend),
+        remaining_usd: cap > 0 ? round6(Math.max(0, cap - spend)) : null,
+        resets_at: oldest ? new Date(oldest.getTime() + days * 86_400_000).toISOString() : null
+      };
+    } catch (e) {
+      // Pre-migration (42P01) or a transient accounting error: nothing to meter.
+      const code = (e as { code?: string })?.code;
+      if (code !== "42P01") {
+        this.logger.warn(`AI budget status unavailable: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      return {
+        tracked: false,
+        scope: this.budgetScope(),
+        cap_usd: cap,
+        window_days: days,
+        used_usd: 0,
+        remaining_usd: cap > 0 ? cap : null,
+        resets_at: null
+      };
+    }
+  }
+
   private async enforceBudget(companyId: string): Promise<void> {
     const cap = this.budgetUsd();
     if (cap <= 0) return; // cap disabled
     const days = this.windowDays();
     try {
-      const where = ["created_at >= now() - make_interval(days => $1::int)"];
-      const params: unknown[] = [days];
-      if (this.budgetScope() === "company") {
-        where.push("company_id = $2");
-        params.push(companyId);
-      }
-      const { rows } = await this.databaseService.query<{ spend: string; oldest: Date | null }>(
-        `SELECT COALESCE(SUM(cost_usd), 0)::text AS spend, MIN(created_at) AS oldest
-           FROM ai_usage_events
-          WHERE ${where.join(" AND ")}`,
-        params
-      );
-      const spend = Number(rows[0]?.spend ?? 0);
+      const { spend, oldest } = await this.windowSpend(companyId);
       if (spend < cap) return;
-      const oldest = rows[0]?.oldest ? new Date(rows[0].oldest) : null;
       const resetAt = oldest ? new Date(oldest.getTime() + days * 86_400_000) : null;
       const tail = resetAt ? ` Earlier usage starts rolling off around ${resetAt.toISOString().slice(0, 10)}.` : "";
       throw new HttpException(

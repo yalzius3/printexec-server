@@ -58,3 +58,84 @@ export const askBodySchema = z.object({
     .optional()
 });
 export type AskBody = z.infer<typeof askBodySchema>;
+
+// ── Presentation artifacts ───────────────────────────────────────
+// Arguments of the AI's presentation tools (present_chart / present_table /
+// compose_report). These never touch SQL — the model calls them with data it
+// already fetched through registry tools, the server validates the shape here
+// and forwards the artifact to the client for rendering. Bounds are UI bounds:
+// what fits legibly in the Lorelei dock.
+
+const artifactTitle = z.string().trim().min(1).max(90);
+const artifactNote = z.string().trim().max(280).optional();
+
+export const chartArtifactSchema = z
+  .object({
+    chart: z.enum(["bar", "line", "donut"]),
+    title: artifactTitle,
+    /** Short unit suffix rendered next to values ("EGP", "g", "hours"). */
+    unit: z.string().trim().max(14).optional(),
+    labels: z.array(z.string().trim().min(1).max(44)).min(1).max(62),
+    series: z
+      .array(
+        z.object({
+          name: z.string().trim().min(1).max(44),
+          values: z.array(z.number().finite()).min(1).max(62)
+        })
+      )
+      .min(1)
+      .max(2),
+    note: artifactNote
+  })
+  .superRefine((v, ctx) => {
+    for (const s of v.series) {
+      if (s.values.length !== v.labels.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `series "${s.name}" has ${s.values.length} values but there are ${v.labels.length} labels — they must match 1:1`
+        });
+      }
+    }
+    if (v.chart !== "bar" && v.series.length !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${v.chart} charts take exactly one series (bar charts may compare two)`
+      });
+    }
+  });
+export type ChartArtifact = z.infer<typeof chartArtifactSchema>;
+
+export const tableArtifactSchema = z
+  .object({
+    title: artifactTitle,
+    columns: z.array(z.string().trim().min(1).max(40)).min(2).max(7),
+    rows: z.array(z.array(z.union([z.string().max(160), z.number(), z.null()]))).min(1).max(40),
+    note: artifactNote
+  })
+  .superRefine((v, ctx) => {
+    v.rows.forEach((row, i) => {
+      if (row.length !== v.columns.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `row ${i + 1} has ${row.length} cells but there are ${v.columns.length} columns`
+        });
+      }
+    });
+  });
+export type TableArtifact = z.infer<typeof tableArtifactSchema>;
+
+export const reportArtifactSchema = z.object({
+  title: artifactTitle,
+  subtitle: z.string().trim().max(140).optional(),
+  sections: z
+    .array(
+      z.object({
+        heading: z.string().trim().min(1).max(90),
+        /** Markdown-lite: paragraphs, **bold**, `code`, "- " lists. */
+        body: z.string().trim().min(1).max(5000)
+      })
+    )
+    .min(1)
+    .max(12)
+});
+export type ReportArtifact = z.infer<typeof reportArtifactSchema>;

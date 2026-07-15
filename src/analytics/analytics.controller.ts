@@ -54,4 +54,12 @@ export class AnalyticsController {
   ask(@Body() body: unknown, @Req() req: AuthRequest) {
     return this.aiService.ask(parseWithSchema(askBodySchema, body), req.companyId, req);
   }
+
+  // The Lorelei budget meter: rolling-window AI spend vs the configured cap.
+  // Fails soft pre-migration (tracked: false) — the meter just hides.
+  @Get("ask/budget")
+  @RequirePermission(DASH_PERMS)
+  askBudget(@Req() req: AuthRequest) {
+    return this.aiService.budgetStatus(req.companyId);
+  }
 }
