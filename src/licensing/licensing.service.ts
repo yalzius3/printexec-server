@@ -320,8 +320,35 @@ export class LicensingService {
    * Starts the company's trial if it has no licensing row yet. Safe to call
    * repeatedly (ON CONFLICT DO NOTHING) and safe pre-migration (the caller
    * swallows failures) — signup must never break on licensing.
+   *
+   * selectedPlanCode records which paid tier the owner picked at signup while
+   * payments are offline (checkout intent); the workspace still runs on the
+   * trial either way. NOTE for the fallback below: don't pass an executor
+   * from inside an open transaction together with selectedPlanCode — the
+   * failed first INSERT would abort the caller's transaction (both current
+   * callers run outside any transaction).
    */
-  async ensureTrial(companyId: string, executor?: SqlExecutor): Promise<void> {
+  async ensureTrial(
+    companyId: string,
+    executor?: SqlExecutor,
+    selectedPlanCode?: string | null
+  ): Promise<void> {
+    if (selectedPlanCode) {
+      try {
+        await this.db.query(
+          `INSERT INTO company_subscriptions (company_id, plan_code, status, source, current_period_end, selected_plan_code)
+           VALUES ($1, 'trial', 'trialing', 'trial', now() + make_interval(days => $2), $3)
+           ON CONFLICT (company_id) DO NOTHING`,
+          [companyId, this.trialDays, selectedPlanCode],
+          executor
+        );
+        return;
+      } catch (err) {
+        // selected_plan_code not migrated yet (undefined column) — fall
+        // through to the legacy shape; the intent just isn't persisted.
+        if ((err as { code?: string }).code !== "42703") throw err;
+      }
+    }
     await this.db.query(
       `INSERT INTO company_subscriptions (company_id, plan_code, status, source, current_period_end)
        VALUES ($1, 'trial', 'trialing', 'trial', now() + make_interval(days => $2))

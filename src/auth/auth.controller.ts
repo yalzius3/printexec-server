@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Post, Res, UnauthorizedException, BadRequestException, ConflictException, NotFoundException, GoneException, Headers } from "@nestjs/common";
+import { Body, Controller, Get, Ip, Logger, Post, Res, UnauthorizedException, BadRequestException, ConflictException, NotFoundException, GoneException, Headers } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import type { FastifyReply } from "fastify";
 import { DatabaseService } from "../database/database.service";
 import { LicenseExempt } from "../licensing/license-exempt.decorator";
 import { LicensingService } from "../licensing/licensing.service";
+import { TERMS_VERSION } from "../licensing/terms";
 import { CompanyId } from "../common/company-id.decorator";
 import { UserId } from "../common/user-id.decorator";
 import { UserRole } from "../common/user-role.decorator";
@@ -27,19 +28,28 @@ const ownerSetupSchema = z.object({
   company_size: z.string().max(20).optional(),
   tax_id: z.string().max(50).optional(),
   currency_default: z.string().max(10).optional(),
-  timezone: z.string().max(60).optional()
+  timezone: z.string().max(60).optional(),
+  // Terms of Use click-wrap (required true — enforced in setup(), not here,
+  // so the error carries exact copy) + the plan picked on the signup plan
+  // step. The enum mirrors the seeded self-serve catalogue; enterprise is
+  // contact-only and trial is the default, so nothing else is accepted.
+  terms_accepted: z.boolean().optional(),
+  plan_code: z.enum(["trial", "starter", "growth"]).optional()
 });
 
 const staffSetupSchema = z.object({
   role: z.literal("staff"),
   invite_token: z.string().max(120).optional(),
-  display_name: z.string().max(80).optional()
+  display_name: z.string().max(80).optional(),
+  terms_accepted: z.boolean().optional()
 });
 
 const setupSchema = z.discriminatedUnion("role", [ownerSetupSchema, staffSetupSchema]);
 
 @Controller("auth")
 export class AuthController {
+  private readonly logger = new Logger(AuthController.name);
+
   // Supabase project URL + a key for the verify-only client verifyToken uses to
   // reach the JWKS. Prefer the anon key (least privilege); fall back to the
   // service-role key, which is always configured — so a missing anon key never
@@ -56,6 +66,70 @@ export class AuthController {
     this.supabaseKey =
       config.get<string>("SUPABASE_ANON_KEY") ??
       config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  // Durable record that this person accepted the CURRENT Terms of Use: an
+  // append-only audit row (the legal artifact) + a fast current-version stamp
+  // on the users row (absent pre-setup — the audit row still lands). Both
+  // best-effort with warnings: the terms tables arrive in the 2026-07-17
+  // migration and signup/acceptance must never 500 on a pre-migration DB —
+  // the terms_accepted REQUIREMENT is enforced in code either way.
+  private async recordTermsAcceptance(
+    userId: string,
+    email: string | null,
+    ip: string | null,
+    userAgent: string | null
+  ): Promise<void> {
+    try {
+      await this.db.query(
+        `INSERT INTO terms_acceptances (user_id, email, terms_version, ip, user_agent)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [userId, email, TERMS_VERSION, ip, userAgent?.slice(0, 400) ?? null]
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not write terms_acceptances for ${userId} (migration pending?): ${err instanceof Error ? err.message : err}`
+      );
+    }
+    try {
+      await this.db.query(
+        "UPDATE users SET tos_accepted_at = now(), tos_version = $2 WHERE id = $1",
+        [userId, TERMS_VERSION]
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not stamp users.tos_version for ${userId} (migration pending?): ${err instanceof Error ? err.message : err}`
+      );
+    }
+  }
+
+  // Existing members accepting a new (or first) terms version — the client's
+  // re-accept interstitial posts here. @LicenseExempt: acceptance must work
+  // even when the workspace is read-only or on hold.
+  @LicenseExempt()
+  @Post("accept-terms")
+  async acceptTerms(
+    @UserId() userId: string,
+    @Ip() ip: string,
+    @Headers("user-agent") userAgent: string | undefined
+  ) {
+    let email: string | null = null;
+    try {
+      const { rows } = await this.db.query<{ email: string }>(
+        "SELECT email FROM users WHERE id = $1",
+        [userId]
+      );
+      email = rows[0]?.email ?? null;
+    } catch {
+      // best-effort context only
+    }
+    await this.recordTermsAcceptance(userId, email, ip ?? null, userAgent ?? null);
+    return {
+      ok: true,
+      terms_version: TERMS_VERSION,
+      tos_version: TERMS_VERSION,
+      tos_accepted_at: new Date().toISOString()
+    };
   }
 
   // Issue (or refresh) the HttpOnly upload-session cookie. Runs through the
@@ -122,6 +196,22 @@ export class AuthController {
       if (branding.rows[0]) Object.assign(profile, branding.rows[0]);
     } catch {
       // branding columns not migrated yet — profile still returns without them
+    }
+    // Best-effort terms state — drives the client's re-accept interstitial.
+    // Only attached when the tos columns exist (2026-07-17 migration), so a
+    // pre-migration DB simply doesn't gate anyone.
+    try {
+      const tos = await this.db.query<{ tos_accepted_at: string | null; tos_version: string | null }>(
+        "SELECT tos_accepted_at, tos_version FROM users WHERE id = $1",
+        [userId]
+      );
+      if (tos.rows[0]) {
+        profile.tos_accepted_at = tos.rows[0].tos_accepted_at;
+        profile.tos_version = tos.rows[0].tos_version;
+        profile.terms_current_version = TERMS_VERSION;
+      }
+    } catch {
+      // tos columns not migrated yet — profile returns without terms gating
     }
     // Best-effort license summary — getStatus fails open internally, so this
     // never blocks login; it just powers the client's plan screen + banners.
@@ -458,7 +548,9 @@ export class AuthController {
   @Post("setup")
   async setup(
     @Headers("authorization") authHeader: string,
-    @Body() body: unknown
+    @Body() body: unknown,
+    @Ip() ip: string,
+    @Headers("user-agent") userAgent: string | undefined
   ) {
     if (!authHeader?.startsWith("Bearer ")) {
       throw new UnauthorizedException("Missing token.");
@@ -486,6 +578,14 @@ export class AuthController {
         [userId]
       );
       return user.rows[0];
+    }
+
+    // Terms of Use click-wrap: hard requirement for every NEW account, owner
+    // and staff alike — the signup flow can't submit without the checkbox, so
+    // a missing flag means an out-of-band caller. Checked BEFORE any row is
+    // written; enforced in code (not the schema) so the copy is exact.
+    if (parsed.data.terms_accepted !== true) {
+      throw new BadRequestException("Please agree to the Terms of Use to continue.");
     }
 
     // Required display name (owner + staff). Empty → 400; single char → 400.
@@ -643,14 +743,25 @@ export class AuthController {
         return newCompanyId;
       });
 
-      // Start the new company's trial. Best-effort: signup must never break
-      // on licensing (e.g. the licensing migration not applied yet) — the
+      // Start the new company's trial, carrying the plan picked on the signup
+      // plan step (checkout intent while payments are offline — everyone runs
+      // on the trial regardless). Best-effort: signup must never break on
+      // licensing (e.g. the licensing migration not applied yet) — the
       // license resolver lazily provisions the trial row on first use anyway.
       try {
-        await this.licensing.ensureTrial(companyId);
+        await this.licensing.ensureTrial(
+          companyId,
+          undefined,
+          owner.plan_code && owner.plan_code !== "trial" ? owner.plan_code : null
+        );
       } catch {
         // licensing tables not migrated yet — resolver will self-heal
       }
+
+      // Durable click-wrap record (audit row + users stamp) — after the
+      // transaction so a pre-migration terms table can never roll back a
+      // finished signup.
+      await this.recordTermsAcceptance(userId, email, ip ?? null, userAgent ?? null);
 
       return { user_id: userId, company_id: companyId, company_name: companyName, role: "owner", permissions: ownerPerms, display_name: displayName, email };
     }
@@ -729,6 +840,9 @@ export class AuthController {
         client
       );
     });
+
+    // Same durable click-wrap record as the owner path (post-transaction).
+    await this.recordTermsAcceptance(userId, email, ip ?? null, userAgent ?? null);
 
     const { rows: companyRows } = await this.db.query<{ name: string }>(
       "SELECT name FROM companies WHERE company_id = $1",

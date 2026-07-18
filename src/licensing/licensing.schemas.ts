@@ -4,6 +4,11 @@ export const redeemGrantSchema = z.object({
   code: z.string().trim().min(4).max(40)
 });
 
+// Tenant: start checkout for (today: record intent to buy) a self-serve plan.
+export const checkoutSchema = z.object({
+  plan_code: z.string().trim().min(1).max(40)
+});
+
 // Admin: manually put a company on a plan (Enterprise deals, early customers,
 // support fixes). current_period_end null/omitted = access until changed.
 export const assignPlanSchema = z.object({
