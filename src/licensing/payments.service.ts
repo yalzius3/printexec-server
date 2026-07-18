@@ -17,6 +17,13 @@ import { ConfigService } from "@nestjs/config";
 //       status 'active', source = provider, current_period_end = period),
 //       then LicensingService.invalidate(companyId).
 //
+// BILLING RULE (founder-confirmed 2026-07-18): completing checkout starts
+// the paid period AT PAYMENT TIME — the payer gets no trial and no
+// trial-time credit; the free trial exists only for workspaces without a
+// paid plan. Webhook implementations must therefore set
+// current_period_end = payment time + billing interval and overwrite any
+// trial row outright (never extend or append to it).
+//
 // The DB is already shaped for this: selected_plan_code carries what to
 // charge for, and the provider-reference columns (stripe_customer_id /
 // stripe_subscription_id — provider-agnostic in practice) carry the
@@ -51,7 +58,7 @@ class NoPaymentProvider implements PaymentProvider {
       available: false,
       provider: this.name,
       message:
-        "Online payments aren't open yet — your plan choice is saved and your workspace keeps running on the free trial. We'll let you know the moment checkout opens."
+        "Online payments aren't open yet — your plan choice is saved and your workspace keeps running free. We'll let you know the moment checkout opens."
     };
   }
 
