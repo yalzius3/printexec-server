@@ -12,8 +12,7 @@
 --      in-app" — Enterprise becomes visible but contact-only; trial stays
 --      hidden machinery.
 --
---        !! The seeded price_monthly_usd values (Starter 29 / Growth 79)
---        !! are PLACEHOLDERS to make the page whole — set real prices with:
+--        !! Seeded prices: Starter 79 / Growth 200 (USD/mo). Change with:
 --        !!   UPDATE plans SET price_monthly_usd = <n> WHERE plan_code = '…';
 --
 --   2. company_subscriptions.selected_plan_code — the plan the owner picked
@@ -47,10 +46,12 @@ ALTER TABLE public.plans ADD COLUMN IF NOT EXISTS self_serve BOOLEAN NOT NULL DE
 UPDATE public.plans SET is_public = TRUE,  self_serve = FALSE WHERE plan_code = 'enterprise';
 UPDATE public.plans SET is_public = FALSE, self_serve = FALSE WHERE plan_code = 'trial';
 
--- Seed copy + placeholder prices ONLY where still unset, so re-runs and
--- founder edits both survive.
-UPDATE public.plans SET price_monthly_usd = 29 WHERE plan_code = 'starter' AND price_monthly_usd IS NULL;
-UPDATE public.plans SET price_monthly_usd = 79 WHERE plan_code = 'growth'  AND price_monthly_usd IS NULL;
+-- Seed copy + prices ONLY where still unset, so re-runs and founder edits
+-- both survive. Feature lists mirror the client fallback + website /pricing
+-- (three repos — keep in lockstep). Lorelei (the AI analyst) is a Growth+
+-- feature: Starter deliberately omits it.
+UPDATE public.plans SET price_monthly_usd = 79  WHERE plan_code = 'starter' AND price_monthly_usd IS NULL;
+UPDATE public.plans SET price_monthly_usd = 200 WHERE plan_code = 'growth'  AND price_monthly_usd IS NULL;
 
 UPDATE public.plans SET blurb = 'For small farms getting organized.'
   WHERE plan_code = 'starter' AND blurb IS NULL;
@@ -59,11 +60,11 @@ UPDATE public.plans SET blurb = 'For growing farms running at pace.'
 UPDATE public.plans SET blurb = 'For large fleets and custom requirements.'
   WHERE plan_code = 'enterprise' AND blurb IS NULL;
 
-UPDATE public.plans SET features = '["Up to 10 printers","Orders, jobs & scheduling","Assets, spools & maintenance","Invoicing & customer CRM","Finance & dashboards"]'::jsonb
+UPDATE public.plans SET features = '["Up to 10 printers","Orders, jobs & scheduling","Assets, spools & maintenance","Invoicing & customer CRM","Finance & analytics dashboards"]'::jsonb
   WHERE plan_code = 'starter' AND features = '[]'::jsonb;
-UPDATE public.plans SET features = '["Up to 25 printers","Everything in Starter","Priority support","Early access to new modules"]'::jsonb
+UPDATE public.plans SET features = '["Everything in Starter","Up to 25 printers","Lorelei AI analyst, in the dashboard","Priority support","Early access to new modules"]'::jsonb
   WHERE plan_code = 'growth' AND features = '[]'::jsonb;
-UPDATE public.plans SET features = '["Unlimited printers","Everything in Growth","Tailored onboarding","Dedicated support","Custom contract & billing"]'::jsonb
+UPDATE public.plans SET features = '["Everything in Growth","Unlimited printers","Tailored onboarding","Dedicated support","Custom contract & billing"]'::jsonb
   WHERE plan_code = 'enterprise' AND features = '[]'::jsonb;
 
 -- ---------------------------------------------------------------
