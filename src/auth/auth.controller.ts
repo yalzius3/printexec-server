@@ -694,9 +694,10 @@ export class AuthController {
              city, address_line_1, address_line_2, postal_code,
              website, industry, company_size, tax_id,
              currency_default, timezone,
-             owner_wrkxyz_id, owner_display_name, owner_email
+             owner_wrkxyz_id, owner_display_name, owner_email,
+             operation_mode
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'simple')
            RETURNING company_id`,
           [
             companyName, uniqueSlug, email, userId,
