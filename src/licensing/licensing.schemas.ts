@@ -48,5 +48,55 @@ export const sendMessageSchema = z.object({
 export const createGrantSchema = z.object({
   plan_code: z.string().trim().min(1).max(40),
   note: z.string().trim().max(500).optional(),
-  expires_at: z.string().datetime({ offset: true }).nullable().optional()
+  expires_at: z.string().datetime({ offset: true }).nullable().optional(),
+  // Bulk minting: how many codes to create in one go (default 1).
+  count: z.number().int().min(1).max(50).optional()
+});
+
+// ── Bulk admin operations ───────────────────────────────────────────────────
+// Every bulk endpoint takes an explicit id list (never "all matching") so the
+// blast radius is exactly what the admin selected on screen.
+const companyIds = z.array(z.string().uuid()).min(1).max(200);
+
+// Bulk: put many companies on a plan at once (same semantics as /assign).
+export const bulkAssignSchema = z.object({
+  company_ids: companyIds,
+  plan_code: z.string().trim().min(1).max(40),
+  current_period_end: z.string().datetime({ offset: true }).nullable().optional(),
+  status: z.enum(["active", "canceled"]).optional()
+});
+
+// Bulk: set or lift (hold=null) a moderation hold on many companies.
+export const bulkHoldSchema = z.object({
+  company_ids: companyIds,
+  hold: z.enum(["grace", "suspended", "banned"]).nullable(),
+  reason: z.string().trim().max(500).optional()
+});
+
+// Bulk: push each selected company's period end out by N days. Only rows that
+// HAVE a period end and aren't canceled/revoked are touched — indefinite
+// access can't be "extended" and a canceled plan needs /assign, not more days.
+export const bulkExtendSchema = z.object({
+  company_ids: companyIds,
+  days: z.number().int().min(1).max(365)
+});
+
+// Bulk: end every selected company's trial right now (non-trials are skipped).
+export const bulkEndTrialSchema = z.object({
+  company_ids: companyIds
+});
+
+// Bulk: send the same in-app message to many companies.
+export const bulkMessageSchema = z.object({
+  company_ids: companyIds,
+  body: z.string().trim().min(1).max(2000)
+});
+
+// Admin-composed email to the owner(s) of the selected companies. Subject and
+// body may use {{company}}, {{plan}}, {{owner_email}}, {{period_end}} and
+// {{days_left}} — substituted per company before sending.
+export const adminEmailSchema = z.object({
+  company_ids: companyIds,
+  subject: z.string().trim().min(1).max(200),
+  body: z.string().trim().min(1).max(5000)
 });

@@ -452,3 +452,234 @@ export function composeStaffInviteEmail(data: StaffInviteEmailData): ComposedEma
 
   return { subject, text, html };
 }
+
+// ════════════════════════════════════════════════════════════════
+// LICENSE / PLAN NOTICES (platform → workspace owner)
+//
+// The LicenseNotificationsService sweep composes these as a company's trial
+// or paid period approaches its end and again once it lapses. Platform mail,
+// not company mail: PRINTEXEC wordmark header (like the staff invite), no
+// per-company logo. Same table/inline-style discipline; pure composition.
+// ════════════════════════════════════════════════════════════════
+
+export type LicenseNoticeKind =
+  | "trial_ending"
+  | "trial_ended"
+  | "renewal_due"
+  | "plan_lapsed"
+  | "plan_readonly";
+
+export type LicenseNoticeEmailData = {
+  kind: LicenseNoticeKind;
+  companyName: string;
+  planName: string;
+  /** The trial/plan period end this notice is about. */
+  periodEnd: string | Date | null;
+  /** Whole days until periodEnd (for trial_ending / renewal_due). */
+  daysLeft: number | null;
+  /** When the grace window lapses into read-only (renewal_due / plan_lapsed). */
+  graceUntil: string | Date | null;
+  /** Length of the paid-plan grace window, for the explanatory copy. */
+  graceDays: number;
+  /** Absolute app origin the CTA links to. */
+  appUrl: string;
+};
+
+const dayWord = (n: number) => `${n} day${n === 1 ? "" : "s"}`;
+
+/** Shared wordmark header + rain footer wrapping for platform emails. */
+function platformShellHtml(preheader: string, innerRows: string[]): string {
+  return [
+    `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;opacity:0;">${esc(preheader)}</div>`,
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f5;margin:0;padding:0;">`,
+    `<tr><td align="center" style="padding:24px 12px;">`,
+    `<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background:${PAPER};border:1px solid ${INK};">`,
+    // ── Header: PRINTEXEC wordmark bar ──
+    `<tr><td style="background:${INK};padding:16px 24px;">` +
+      `<span style="font-family:${MONO};font-size:15px;font-weight:700;letter-spacing:0.2em;color:${PAPER};">PRINTEXEC</span>` +
+      `</td></tr>`,
+    ...innerRows,
+    // ── Footer: rain strip ──
+    `<tr><td bgcolor="${INK}" style="background:${INK};font-size:0;line-height:0;padding:0;">` +
+      `<a href="${SITE_URL}" target="_blank" rel="noopener" style="display:block;text-decoration:none;">` +
+        `<img src="${FOOTER_IMG_URL}" alt="PrintExec — printexec.xyz" width="600" height="77" ` +
+          `style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none;" />` +
+      `</a>` +
+      `</td></tr>`,
+    `</table>`,
+    `</td></tr>`,
+    `</table>`
+  ].join("");
+}
+
+/** Ink-filled CTA button (email-safe: a padded anchor, no CSS classes). */
+function ctaButtonHtml(label: string, href: string): string {
+  return (
+    `<a href="${href}" target="_blank" rel="noopener" ` +
+    `style="display:inline-block;background:${INK};color:${PAPER};font-family:${SANS};` +
+    `font-size:14px;font-weight:700;text-decoration:none;padding:12px 26px;">${esc(label)}</a>`
+  );
+}
+
+/** Per-kind subject, headline and explanation copy. */
+function licenseNoticeCopy(data: LicenseNoticeEmailData): {
+  subject: string;
+  headline: string;
+  paragraphs: string[];
+  cta: string;
+} {
+  const end = formatDate(data.periodEnd) ?? "soon";
+  const grace = formatDate(data.graceUntil);
+  const days = data.daysLeft;
+
+  switch (data.kind) {
+    case "trial_ending": {
+      const when = days !== null && days > 0 ? `in ${dayWord(days)}` : "today";
+      return {
+        subject: `Your PrintExec trial ends ${when}`,
+        headline: `Your free trial ends ${when} — on ${end}.`,
+        paragraphs: [
+          `When the trial ends, the ${data.companyName} workspace becomes read-only: all your data stays exactly where it is, but new work is paused until a plan is active.`,
+          `Pick a plan (or redeem a grant code) in Plan & billing to keep everything running without interruption.`
+        ],
+        cta: "Choose your plan"
+      };
+    }
+    case "trial_ended":
+      return {
+        subject: "Your PrintExec trial has ended — pick a plan to keep working",
+        headline: `Your free trial ended on ${end}.`,
+        paragraphs: [
+          `The ${data.companyName} workspace is now read-only. Nothing has been deleted — every order, job and asset is safe — but new work is paused until a plan is active.`,
+          `Choose a plan (or redeem a grant code) in Plan & billing and you'll be back to work in minutes.`
+        ],
+        cta: "Choose your plan"
+      };
+    case "renewal_due": {
+      const when = days !== null && days > 0 ? `in ${dayWord(days)}` : "today";
+      return {
+        subject: `Your ${data.planName} plan period ends ${when}`,
+        headline: `Your ${data.planName} plan runs to ${end}.`,
+        paragraphs: [
+          `To keep the ${data.companyName} workspace uninterrupted, renew before then. If the period lapses, you'll have a ${data.graceDays}-day grace window${grace ? ` (until ${grace})` : ""} before the workspace goes read-only.`,
+          `You can review or change your plan any time in Plan & billing.`
+        ],
+        cta: "Review your plan"
+      };
+    }
+    case "plan_lapsed":
+      return {
+        subject: `Your ${data.planName} plan has lapsed — grace window running`,
+        headline: `Your ${data.planName} plan lapsed on ${end}.`,
+        paragraphs: [
+          `The ${data.companyName} workspace is in its grace window${grace ? ` until ${grace}` : ""}: day-to-day work continues, but adding printers is paused. After that, the workspace goes read-only until the plan is renewed.`,
+          `Renew in Plan & billing to clear this — it takes a minute.`
+        ],
+        cta: "Renew your plan"
+      };
+    case "plan_readonly":
+      return {
+        subject: "Your PrintExec workspace is now read-only",
+        headline: `The grace window has ended — your workspace is read-only.`,
+        paragraphs: [
+          `Your ${data.planName} plan lapsed on ${end} and the grace window has now run out, so the ${data.companyName} workspace is read-only. All your data is safe and waiting.`,
+          `Renew your plan (or redeem a grant code) in Plan & billing to unlock the workspace immediately.`
+        ],
+        cta: "Renew your plan"
+      };
+  }
+}
+
+export function composeLicenseNoticeEmail(data: LicenseNoticeEmailData): ComposedEmail {
+  const copy = licenseNoticeCopy(data);
+
+  const text = [
+    `PRINTEXEC`,
+    ``,
+    `Hi,`,
+    ``,
+    copy.headline,
+    ``,
+    ...copy.paragraphs.flatMap((p) => [p, ``]),
+    `${copy.cta}: ${data.appUrl} → account menu → Plan & billing`,
+    ``,
+    `Need a hand? Reach us at support@printexec.app.`,
+    ``,
+    `This is an automated notice from an unmonitored address — please don't reply.`,
+    `— The PrintExec team · ${SITE_URL}`
+  ].join("\n");
+
+  const inner = [
+    `<tr><td style="padding:30px 28px 6px;font-family:${SANS};color:${INK};">` +
+      `<p style="margin:0 0 14px;font-size:15px;">Hi,</p>` +
+      `<p style="margin:0 0 18px;font-size:20px;font-weight:700;line-height:1.3;">${esc(copy.headline)}</p>` +
+      copy.paragraphs
+        .map((p) => `<p style="margin:0 0 14px;font-size:14px;line-height:1.65;">${esc(p)}</p>`)
+        .join("") +
+      `</td></tr>`,
+    `<tr><td style="padding:8px 28px 10px;">${ctaButtonHtml(copy.cta, data.appUrl)}` +
+      `<div style="margin-top:10px;font-family:${MONO};font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:${SUBTLE};">` +
+      `Open PrintExec → account menu → Plan &amp; billing</div>` +
+      `</td></tr>`,
+    `<tr><td style="padding:16px 28px 24px;font-family:${SANS};font-size:12.5px;color:${SUBTLE};line-height:1.6;">` +
+      `Need a hand? Reach us at <a href="mailto:support@printexec.app" style="color:${INK};font-weight:700;">support@printexec.app</a>.<br/>` +
+      `This is an automated notice from an unmonitored address — please don't reply.` +
+      `</td></tr>`
+  ];
+
+  return { subject: copy.subject, text, html: platformShellHtml(copy.headline, inner) };
+}
+
+// ════════════════════════════════════════════════════════════════
+// PLATFORM CUSTOM EMAIL (admin → workspace owner)
+//
+// A platform admin writes subject + body in the licensing admin area (single
+// or bulk, with {{variables}} already substituted by the caller). The body is
+// plain text; blank lines split paragraphs.
+// ════════════════════════════════════════════════════════════════
+
+export type PlatformEmailData = {
+  subject: string;
+  /** Plain-text body; blank lines separate paragraphs. */
+  body: string;
+  companyName: string;
+  appUrl: string;
+};
+
+export function composePlatformEmail(data: PlatformEmailData): ComposedEmail {
+  const paragraphs = data.body
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  const text = [
+    `PRINTEXEC`,
+    ``,
+    ...paragraphs.flatMap((p) => [p, ``]),
+    `Sent to the owner of ${data.companyName} · ${data.appUrl}`,
+    `This address is unmonitored — to get in touch, write to support@printexec.app.`,
+    `— The PrintExec team · ${SITE_URL}`
+  ].join("\n");
+
+  const inner = [
+    `<tr><td style="padding:30px 28px 12px;font-family:${SANS};color:${INK};">` +
+      paragraphs
+        .map(
+          (p) =>
+            `<p style="margin:0 0 14px;font-size:14.5px;line-height:1.7;">${esc(p).replace(/\n/g, "<br/>")}</p>`
+        )
+        .join("") +
+      `</td></tr>`,
+    `<tr><td style="padding:4px 28px 24px;font-family:${SANS};font-size:12.5px;color:${SUBTLE};line-height:1.6;">` +
+      `Sent to the owner of ${esc(data.companyName)} · <a href="${data.appUrl}" target="_blank" rel="noopener" style="color:${INK};font-weight:700;">${esc(data.appUrl.replace(/^https?:\/\//, ""))}</a><br/>` +
+      `This address is unmonitored — to get in touch, write to ` +
+      `<a href="mailto:support@printexec.app" style="color:${INK};font-weight:700;">support@printexec.app</a>.` +
+      `</td></tr>`
+  ];
+
+  return {
+    subject: data.subject,
+    text,
+    html: platformShellHtml(paragraphs[0] ?? data.subject, inner)
+  };
+}
