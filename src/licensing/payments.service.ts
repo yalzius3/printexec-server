@@ -15,7 +15,10 @@ import { ConfigService } from "@nestjs/config";
 //     → webhook handler verifies the signature and flips
 //       company_subscriptions to (plan_code = selected_plan_code,
 //       status 'active', source = provider, current_period_end = period),
-//       then LicensingService.invalidate(companyId).
+//       then LicensingService.invalidate(companyId), then issues the invoice:
+//       SubscriptionInvoiceService.issueForSubscription({ companyId,
+//       source: 'stripe' | 'payoneer', amountUsd: <settled amount> }) — this
+//       emails the owner their PrintExec invoice (same path grant/assign use).
 //
 // BILLING RULE (founder-confirmed 2026-07-18): completing checkout starts
 // the paid period AT PAYMENT TIME — the payer gets no trial and no

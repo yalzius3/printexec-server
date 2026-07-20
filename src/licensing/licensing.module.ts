@@ -5,16 +5,23 @@ import { LicensingAdminController } from "./licensing-admin.controller";
 import { LicensingController } from "./licensing.controller";
 import { LicensingService } from "./licensing.service";
 import { PaymentsService } from "./payments.service";
+import { SubscriptionInvoiceService } from "./subscription-invoice.service";
 
 // Global: the LicenseGuard is an APP_GUARD and PrintersService/AuthController
 // consume LicensingService directly, so every module gets it without imports.
 // EmailModule supplies the transport for owner license notices (the
-// LicenseNotificationsService sweep) and admin-composed emails.
+// LicenseNotificationsService sweep), admin-composed emails, and the
+// subscription invoices issued on plan activation.
 @Global()
 @Module({
   imports: [EmailModule],
   controllers: [LicensingController, LicensingAdminController],
-  providers: [LicensingService, PaymentsService, LicenseNotificationsService],
-  exports: [LicensingService, PaymentsService]
+  providers: [
+    LicensingService,
+    PaymentsService,
+    LicenseNotificationsService,
+    SubscriptionInvoiceService
+  ],
+  exports: [LicensingService, PaymentsService, SubscriptionInvoiceService]
 })
 export class LicensingModule {}

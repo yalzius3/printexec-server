@@ -54,8 +54,10 @@ import type { ZodType } from "zod";
 //   AI_MODEL=…                               required to enable (never hardcoded)
 //   AI_MAX_TOKENS=…                          default 3000 (per round)
 //
-// Spend budget (rolling-window USD cap, metered from provider cost / tokens):
-//   AI_BUDGET_USD=2  AI_BUDGET_WINDOW_DAYS=14  AI_BUDGET_SCOPE=global|company
+// Spend budget (per-CALENDAR-MONTH USD cap, metered from provider cost /
+// tokens). The cap is internal only — the client is shown a percentage, never
+// the dollar figure:
+//   AI_BUDGET_USD=1  AI_BUDGET_SCOPE=global|company
 // Needs migrations/2026-07-15_ai_usage_budget.sql; fails OPEN until applied.
 // ════════════════════════════════════════════════════════════════
 
@@ -593,22 +595,19 @@ export class AnalyticsAiService {
   }
 
   // ── Spend budget ──────────────────────────────────────────────────────────
-  // Rolling-window cap on real model cost (USD), metered from the provider's
-  // reported per-call cost (OpenRouter usage.cost) or a token-price estimate.
-  // Default: ~$2 / 14 days GLOBAL across the deployment — it guards the owner's
-  // provider key, not per-tenant fairness. AI_BUDGET_SCOPE=company meters each
-  // tenant separately; AI_BUDGET_USD=0 disables the cap.
+  // Per-CALENDAR-MONTH cap on real model cost (USD), metered from the
+  // provider's reported per-call cost (OpenRouter usage.cost) or a token-price
+  // estimate, and resetting at the start of each month. Default: $1/month
+  // GLOBAL across the deployment — it guards the owner's provider key, not
+  // per-tenant fairness. AI_BUDGET_SCOPE=company meters each tenant separately;
+  // AI_BUDGET_USD=0 disables the cap. The dollar figure is internal: callers
+  // surface only a 0–100 percentage (used_pct) to the user, never the amount.
 
   private budgetUsd(): number {
     const raw = env("AI_BUDGET_USD");
-    if (raw === undefined) return 2;
+    if (raw === undefined) return 1;
     const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? v : 2;
-  }
-
-  private windowDays(): number {
-    const v = Math.floor(Number(env("AI_BUDGET_WINDOW_DAYS") ?? 14));
-    return Number.isFinite(v) && v > 0 ? v : 14;
+    return Number.isFinite(v) && v >= 0 ? v : 1;
   }
 
   private budgetScope(): "global" | "company" {
@@ -624,40 +623,60 @@ export class AnalyticsAiService {
     return (inputTokens / 1_000_000) * i + (outputTokens / 1_000_000) * o;
   }
 
-  /** Rolling-window spend + the oldest event in the window (for the reset
-   *  date). Throws on DB errors (missing table included) — each caller picks
-   *  its own failure posture. */
-  private async windowSpend(companyId: string): Promise<{ spend: number; oldest: Date | null }> {
-    const where = ["created_at >= now() - make_interval(days => $1::int)"];
-    const params: unknown[] = [this.windowDays()];
+  /** Spend since the start of the current calendar month, plus when the meter
+   *  resets (the start of next month). Both the sum window and the reset
+   *  boundary are computed in SQL so they share the DB's clock/timezone.
+   *  Throws on DB errors (missing table included) — each caller picks its own
+   *  failure posture. */
+  private async monthSpend(companyId: string): Promise<{ spend: number; resetsAt: Date }> {
+    const where = ["created_at >= date_trunc('month', now())"];
+    const params: unknown[] = [];
     if (this.budgetScope() === "company") {
-      where.push("company_id = $2");
+      where.push("company_id = $1");
       params.push(companyId);
     }
-    const { rows } = await this.databaseService.query<{ spend: string; oldest: Date | null }>(
-      `SELECT COALESCE(SUM(cost_usd), 0)::text AS spend, MIN(created_at) AS oldest
+    const { rows } = await this.databaseService.query<{ spend: string; resets_at: Date }>(
+      `SELECT COALESCE(SUM(cost_usd), 0)::text AS spend,
+              (date_trunc('month', now()) + interval '1 month') AS resets_at
          FROM ai_usage_events
         WHERE ${where.join(" AND ")}`,
       params
     );
-    return { spend: Number(rows[0]?.spend ?? 0), oldest: rows[0]?.oldest ? new Date(rows[0].oldest) : null };
+    return {
+      spend: Number(rows[0]?.spend ?? 0),
+      resetsAt: rows[0]?.resets_at ? new Date(rows[0].resets_at) : this.nextMonthStart()
+    };
   }
 
-  /** Live budget snapshot for the client's meter — also GET /analytics/ask/budget. */
+  /** Start of next calendar month (UTC) — the fallback reset when no rows. */
+  private nextMonthStart(): Date {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+  }
+
+  /** Used share of the cap, clamped to 0–100 (integer). The ONLY budget number
+   *  meant for the user — the dollar cap/spend stay server-side. */
+  private usedPct(spend: number, cap: number): number {
+    if (cap <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round((spend / cap) * 100)));
+  }
+
+  /** Live budget snapshot for the client's meter — also GET /analytics/ask/budget.
+   *  used_pct is what the UI renders; the *_usd fields are internal detail. */
   async budgetStatus(companyId: string) {
     const cap = this.budgetUsd();
-    const days = this.windowDays();
     const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
     try {
-      const { spend, oldest } = await this.windowSpend(companyId);
+      const { spend, resetsAt } = await this.monthSpend(companyId);
       return {
         tracked: true,
         scope: this.budgetScope(),
+        period: "month" as const,
         cap_usd: cap,
-        window_days: days,
         used_usd: round6(spend),
         remaining_usd: cap > 0 ? round6(Math.max(0, cap - spend)) : null,
-        resets_at: oldest ? new Date(oldest.getTime() + days * 86_400_000).toISOString() : null
+        used_pct: this.usedPct(spend, cap),
+        resets_at: resetsAt.toISOString()
       };
     } catch (e) {
       // Pre-migration (42P01) or a transient accounting error: nothing to meter.
@@ -668,11 +687,12 @@ export class AnalyticsAiService {
       return {
         tracked: false,
         scope: this.budgetScope(),
+        period: "month" as const,
         cap_usd: cap,
-        window_days: days,
         used_usd: 0,
         remaining_usd: cap > 0 ? cap : null,
-        resets_at: null
+        used_pct: 0,
+        resets_at: this.nextMonthStart().toISOString()
       };
     }
   }
@@ -680,14 +700,13 @@ export class AnalyticsAiService {
   private async enforceBudget(companyId: string): Promise<void> {
     const cap = this.budgetUsd();
     if (cap <= 0) return; // cap disabled
-    const days = this.windowDays();
     try {
-      const { spend, oldest } = await this.windowSpend(companyId);
+      const { spend, resetsAt } = await this.monthSpend(companyId);
       if (spend < cap) return;
-      const resetAt = oldest ? new Date(oldest.getTime() + days * 86_400_000) : null;
-      const tail = resetAt ? ` Earlier usage starts rolling off around ${resetAt.toISOString().slice(0, 10)}.` : "";
+      // User-facing copy carries NO currency — just the monthly reset date.
+      const tail = ` Her allowance resets on ${resetsAt.toISOString().slice(0, 10)}.`;
       throw new HttpException(
-        `Lorelei has reached her AI budget (about $${cap.toFixed(2)} every ${days} days) and is resting for now.${tail}`,
+        `Lorelei has reached her monthly usage limit and is resting for now.${tail}`,
         HttpStatus.TOO_MANY_REQUESTS
       );
     } catch (e) {

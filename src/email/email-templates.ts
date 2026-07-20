@@ -690,3 +690,190 @@ export function composePlatformEmail(data: PlatformEmailData): ComposedEmail {
     html: platformShellHtml(paragraphs[0] ?? data.subject, inner)
   };
 }
+
+// ════════════════════════════════════════════════════════════════
+// SUBSCRIPTION INVOICE (platform → workspace owner)
+//
+// Issued by PrintExec when a company's subscription is activated onto a plan
+// (grant redeemed, plan assigned, payment settled). A proper invoice: number,
+// issue date, issued-by / billed-to, a line item for the plan + period, the
+// total, and the subscription details. Same platform chrome + table/inline
+// discipline as the notices above; pure composition.
+// ════════════════════════════════════════════════════════════════
+
+export type SubscriptionInvoiceEmailData = {
+  invoiceNumber: string;
+  issuedAt: string | Date;
+  company: {
+    name: string;
+    ownerEmail: string | null;
+    city?: string | null;
+    countryCode?: string | null;
+  };
+  plan: { name: string; maxPrinters: number | null };
+  amountUsd: number;
+  currency: string;
+  /** How the subscription was obtained: grant_code | manual | stripe | payoneer. */
+  source: string;
+  periodStart: string | Date | null;
+  periodEnd: string | Date | null;
+  /** Raw subscription status (active | trialing | …) for the details block. */
+  status: string;
+  /** Free-text ("Complimentary access", "Billed per agreement", …) or null. */
+  note: string | null;
+  /** App origin for the "view billing" link. */
+  appUrl: string;
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  grant_code: "Grant code",
+  manual: "Assigned by PrintExec",
+  stripe: "Card payment",
+  payoneer: "Payoneer",
+  trial: "Trial"
+};
+const sourceLabel = (s: string) => SOURCE_LABELS[s] ?? s;
+
+/** "June 1, 2026 – July 1, 2026" / "through July 1, 2026" / "Ongoing". */
+function billingPeriodText(start: string | Date | null, end: string | Date | null): string {
+  const s = formatDate(start);
+  const e = formatDate(end);
+  if (s && e) return `${s} – ${e}`;
+  if (e) return `Through ${e}`;
+  if (s) return `From ${s}`;
+  return "Ongoing";
+}
+
+const capText = (cap: number | null) => (cap === null ? "Unlimited printers" : `Up to ${cap} printers`);
+
+export function composeSubscriptionInvoiceEmail(data: SubscriptionInvoiceEmailData): ComposedEmail {
+  const issued = formatDate(data.issuedAt) ?? "";
+  const amount = formatMoney(data.amountUsd, data.currency) ?? `${data.currency} 0.00`;
+  const period = billingPeriodText(data.periodStart, data.periodEnd);
+  const lineDesc = `PrintExec ${data.plan.name} plan`;
+  const subject = `Your PrintExec invoice ${data.invoiceNumber} — ${data.plan.name} plan`;
+
+  const billedTo: string[] = [data.company.name];
+  if (data.company.ownerEmail) billedTo.push(data.company.ownerEmail);
+  const loc = [data.company.city, data.company.countryCode].filter(Boolean).join(", ");
+  if (loc) billedTo.push(loc);
+
+  // ── Plain text ──
+  const text = [
+    `PRINTEXEC`,
+    ``,
+    `INVOICE ${data.invoiceNumber}`,
+    `Issued ${issued}`,
+    ``,
+    `Issued by`,
+    `  PrintExec`,
+    `  ${SITE_URL.replace(/^https?:\/\//, "")}`,
+    `  ${SUPPORT_EMAIL}`,
+    ``,
+    `Billed to`,
+    ...billedTo.map((l) => `  ${l}`),
+    ``,
+    `Description                              Amount`,
+    `${lineDesc.padEnd(40, " ").slice(0, 40)} ${amount}`,
+    `  Billing period: ${period}`,
+    `${"".padEnd(40, " ")} ─────────`,
+    `${"Total".padEnd(40, " ")} ${amount}`,
+    ...(data.note ? [``, data.note] : []),
+    ``,
+    `Subscription`,
+    `  Plan:     ${data.plan.name} (${capText(data.plan.maxPrinters)})`,
+    `  Status:   ${data.status}`,
+    `  Obtained: ${sourceLabel(data.source)}`,
+    `  Renews:   ${formatDate(data.periodEnd) ?? "Ongoing (until changed)"}`,
+    ``,
+    `View your plan & billing: ${data.appUrl} → account menu → Plan & billing`,
+    ``,
+    `This is an automated invoice from an unmonitored address — please don't reply.`,
+    `Questions about billing? ${SUPPORT_EMAIL}`,
+    `— PrintExec · ${SITE_URL}`
+  ].join("\n");
+
+  // ── HTML ──
+  const label = (t: string) =>
+    `<div style="font-family:${MONO};font-size:10px;font-weight:700;letter-spacing:0.14em;` +
+    `text-transform:uppercase;color:${SUBTLE};margin-bottom:5px;">${esc(t)}</div>`;
+
+  const detailRow = (k: string, v: string) =>
+    `<tr>` +
+    `<td style="padding:5px 0;font-family:${MONO};font-size:11px;color:${SUBTLE};` +
+    `text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;vertical-align:top;">${esc(k)}</td>` +
+    `<td style="padding:5px 0 5px 16px;font-family:${SANS};font-size:13.5px;color:${INK};vertical-align:top;">${esc(v)}</td>` +
+    `</tr>`;
+
+  const inner = [
+    // ── Invoice heading: number + issue date ──
+    `<tr><td style="padding:28px 28px 6px;font-family:${SANS};color:${INK};">` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>` +
+        `<td style="vertical-align:top;">` +
+          `<div style="font-family:${MONO};font-size:12px;font-weight:700;letter-spacing:0.22em;text-transform:uppercase;color:${INK};">Invoice</div>` +
+          `<div style="font-family:${MONO};font-size:15px;font-weight:700;margin-top:3px;">${esc(data.invoiceNumber)}</div>` +
+        `</td>` +
+        `<td align="right" style="vertical-align:top;font-family:${SANS};font-size:12px;color:${SUBTLE};">` +
+          `Issued<br/><span style="color:${INK};font-weight:700;font-size:13.5px;">${esc(issued)}</span>` +
+        `</td>` +
+      `</tr></table>` +
+      `</td></tr>`,
+
+    // ── Issued by / Billed to ──
+    `<tr><td style="padding:16px 28px 6px;font-family:${SANS};">` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>` +
+        `<td style="vertical-align:top;width:50%;">` +
+          label("Issued by") +
+          `<div style="font-size:13.5px;color:${INK};font-weight:700;">PrintExec</div>` +
+          `<div style="font-size:12.5px;color:${SUBTLE};line-height:1.5;">${esc(SITE_URL.replace(/^https?:\/\//, ""))}<br/>${SUPPORT_EMAIL}</div>` +
+        `</td>` +
+        `<td style="vertical-align:top;width:50%;">` +
+          label("Billed to") +
+          `<div style="font-size:13.5px;color:${INK};font-weight:700;">${esc(data.company.name)}</div>` +
+          `<div style="font-size:12.5px;color:${SUBTLE};line-height:1.5;">${billedTo.slice(1).map(esc).join("<br/>")}</div>` +
+        `</td>` +
+      `</tr></table>` +
+      `</td></tr>`,
+
+    // ── Line items + total ──
+    `<tr><td style="padding:20px 28px 6px;font-family:${SANS};">` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:2px solid ${INK};border-bottom:1px solid ${INK};">` +
+        `<tr>` +
+          `<td style="padding:10px 0 6px;font-family:${MONO};font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:${SUBTLE};">Description</td>` +
+          `<td align="right" style="padding:10px 0 6px;font-family:${MONO};font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:${SUBTLE};">Amount</td>` +
+        `</tr>` +
+        `<tr>` +
+          `<td style="padding:4px 0 12px;font-family:${SANS};font-size:14px;color:${INK};">` +
+            `${esc(lineDesc)}<br/><span style="font-size:12px;color:${SUBTLE};">Billing period: ${esc(period)}</span>` +
+          `</td>` +
+          `<td align="right" style="padding:4px 0 12px;font-family:${SANS};font-size:14px;color:${INK};white-space:nowrap;vertical-align:top;">${esc(amount)}</td>` +
+        `</tr>` +
+      `</table>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>` +
+        `<td style="padding:10px 0;font-family:${SANS};font-size:13px;font-weight:700;color:${INK};text-transform:uppercase;letter-spacing:0.04em;">Total</td>` +
+        `<td align="right" style="padding:10px 0;font-family:${SANS};font-size:17px;font-weight:800;color:${INK};white-space:nowrap;">${esc(amount)}</td>` +
+      `</tr></table>` +
+      (data.note ? `<div style="font-family:${SANS};font-size:12px;color:${SUBTLE};margin-top:2px;">${esc(data.note)}</div>` : ``) +
+      `</td></tr>`,
+
+    // ── Subscription details ──
+    `<tr><td style="padding:14px 28px 6px;font-family:${SANS};">` +
+      `<div style="font-family:${MONO};font-size:11px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:${INK};border-bottom:1px solid ${INK};padding-bottom:8px;margin-bottom:6px;">Subscription</div>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">` +
+        detailRow("Plan", `${data.plan.name} · ${capText(data.plan.maxPrinters)}`) +
+        detailRow("Status", data.status) +
+        detailRow("Obtained", sourceLabel(data.source)) +
+        detailRow("Renews", formatDate(data.periodEnd) ?? "Ongoing (until changed)") +
+      `</table>` +
+      `</td></tr>`,
+
+    // ── CTA + no-reply ──
+    `<tr><td style="padding:18px 28px 8px;">${ctaButtonHtml("View plan & billing", data.appUrl)}</td></tr>`,
+    `<tr><td style="padding:8px 28px 24px;font-family:${SANS};font-size:12.5px;color:${SUBTLE};line-height:1.6;">` +
+      `This is an automated invoice from an unmonitored address — please don't reply.<br/>` +
+      `Questions about billing? <a href="mailto:${SUPPORT_EMAIL}" style="color:${INK};font-weight:700;">${SUPPORT_EMAIL}</a>.` +
+      `</td></tr>`
+  ];
+
+  return { subject, text, html: platformShellHtml(subject, inner) };
+}

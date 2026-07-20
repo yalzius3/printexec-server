@@ -29,6 +29,7 @@ import {
   setHoldSchema
 } from "./licensing.schemas";
 import { LicensingService } from "./licensing.service";
+import { SubscriptionInvoiceService } from "./subscription-invoice.service";
 
 // ════════════════════════════════════════════════════════════════
 // Platform-owner licensing admin. NOT tenant-scoped: these endpoints see and
@@ -49,7 +50,8 @@ export class LicensingAdminController {
   constructor(
     private readonly licensing: LicensingService,
     private readonly db: DatabaseService,
-    private readonly email: EmailService
+    private readonly email: EmailService,
+    private readonly invoices: SubscriptionInvoiceService
   ) {}
 
   // Every company with its plan, state anchors, printer count, and any grant
@@ -174,7 +176,7 @@ export class LicensingAdminController {
   // the over-limit clock; a null/omitted end date means access until changed.
   @Post("assign")
   async assignPlan(@UserId() userId: string, @Body() body: unknown) {
-    await this.assertPlatformAdmin(userId);
+    const adminEmail = await this.assertPlatformAdmin(userId);
     const input = parseWithSchema(assignPlanSchema, body);
 
     const plan = await this.db.query(
@@ -210,6 +212,16 @@ export class LicensingAdminController {
     );
 
     this.licensing.invalidate(input.company_id);
+    // Issue an invoice for the assigned plan (best-effort; skipped for a
+    // 'canceled' assignment and deduped against re-saves). issued_by records
+    // the admin who assigned it.
+    if (status !== "canceled") {
+      await this.invoices.issueForSubscription({
+        companyId: input.company_id,
+        source: "manual",
+        issuedBy: adminEmail
+      });
+    }
     return this.licensing.getStatus(input.company_id, true);
   }
 
@@ -258,7 +270,7 @@ export class LicensingAdminController {
 
   @Post("bulk/assign")
   async bulkAssign(@UserId() userId: string, @Body() body: unknown) {
-    await this.assertPlatformAdmin(userId);
+    const adminEmail = await this.assertPlatformAdmin(userId);
     const input = parseWithSchema(bulkAssignSchema, body);
 
     const plan = await this.db.query("SELECT 1 FROM plans WHERE plan_code = $1", [input.plan_code]);
@@ -297,6 +309,13 @@ export class LicensingAdminController {
     });
 
     for (const companyId of input.company_ids) this.licensing.invalidate(companyId);
+    // Invoice each company for the assigned plan (best-effort, deduped, skipped
+    // for a 'canceled' assignment). Sequential to keep invoice numbers ordered.
+    if (status !== "canceled") {
+      for (const companyId of input.company_ids) {
+        await this.invoices.issueForSubscription({ companyId, source: "manual", issuedBy: adminEmail });
+      }
+    }
     return { ok: true, updated: input.company_ids.length };
   }
 
@@ -580,6 +599,29 @@ export class LicensingAdminController {
         `SELECT license_email_id, email_type, period_anchor, recipient_email,
                 subject, body, status, error, created_by, created_at
            FROM license_emails
+          WHERE company_id = $1
+          ORDER BY created_at DESC
+          LIMIT 100`,
+        [companyId]
+      );
+      return rows;
+    } catch (err) {
+      if ((err as { code?: string }).code === "42P01") return [];
+      throw err;
+    }
+  }
+
+  // Subscription invoices issued to one company (the admin drawer's "Invoices"
+  // panel). Empty pre-migration rather than erroring.
+  @Get("invoices/:companyId")
+  async listCompanyInvoices(@UserId() userId: string, @Param("companyId") companyId: string) {
+    await this.assertPlatformAdmin(userId);
+    try {
+      const { rows } = await this.db.query(
+        `SELECT invoice_number, plan_name, amount_usd, currency, source,
+                period_start, period_end, status, recipient_email, email_status,
+                email_error, note, issued_by, created_at
+           FROM subscription_invoices
           WHERE company_id = $1
           ORDER BY created_at DESC
           LIMIT 100`,

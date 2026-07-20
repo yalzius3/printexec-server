@@ -20,6 +20,7 @@ import { LicenseExempt } from "./license-exempt.decorator";
 import { checkoutSchema, redeemGrantSchema } from "./licensing.schemas";
 import { LicensingService, type LicenseStatus } from "./licensing.service";
 import { PaymentsService, type CheckoutResult } from "./payments.service";
+import { SubscriptionInvoiceService } from "./subscription-invoice.service";
 import { TERMS_VERSION } from "./terms";
 
 interface PlanRow {
@@ -53,7 +54,8 @@ export class LicensingController {
   constructor(
     private readonly licensing: LicensingService,
     private readonly db: DatabaseService,
-    private readonly payments: PaymentsService
+    private readonly payments: PaymentsService,
+    private readonly invoices: SubscriptionInvoiceService
   ) {}
 
   // Plan catalogue with the pricing columns; falls back to the pre-2026-07-17
@@ -249,7 +251,31 @@ export class LicensingController {
     });
 
     this.licensing.invalidate(companyId);
+    // Issue a complimentary invoice for the granted plan (best-effort — never
+    // fails the redemption). Deduped, so re-redeeming the same code is a no-op.
+    await this.invoices.issueForSubscription({ companyId, source: "grant_code" });
     return this.licensing.getStatus(companyId, true);
+  }
+
+  // The company's own subscription invoices (billing history). @LicenseExempt
+  // (class-level) so a lapsed/read-only workspace can still see its billing.
+  @Get("invoices")
+  async listInvoices(@CompanyId() companyId: string) {
+    try {
+      const { rows } = await this.db.query(
+        `SELECT invoice_number, plan_name, amount_usd, currency, source,
+                period_start, period_end, status, created_at
+           FROM subscription_invoices
+          WHERE company_id = $1 AND status = 'issued'
+          ORDER BY created_at DESC
+          LIMIT 50`,
+        [companyId]
+      );
+      return rows;
+    } catch {
+      // subscription_invoices not migrated yet — nothing to show.
+      return [];
+    }
   }
 
   // In-app messages the platform sent this company. @LicenseExempt (class-level)
