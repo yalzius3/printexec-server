@@ -409,9 +409,10 @@ export class LicenseNotificationsService implements OnModuleInit, OnModuleDestro
     }
   }
 
-  /** Public app origin for CTA links (same resolution as the order emails). */
+  /** Platform origin the notice CTA links to (same resolution as the other
+   *  emails). Falls back to the app's production domain, NOT the marketing site. */
   private appUrl(): string {
-    return (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec-client.pages.dev")
+    return (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
       .split(",")[0]!
       .trim()
       .replace(/\/+$/, "");

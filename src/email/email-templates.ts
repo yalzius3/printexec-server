@@ -91,8 +91,12 @@ const SANS = "'DM Sans','Helvetica Neue',Arial,sans-serif";
 const INK = "#000000";
 const PAPER = "#ffffff";
 const SUBTLE = "#57534e";
-// Public site — the footer wordmark links here.
+// Public marketing site — the footer wordmark and every "learn more" link
+// point here. NOT the app: the platform lives at its own origin (the CTA
+// appUrl, e.g. https://solution.printexec.xyz).
 const SITE_URL = "https://printexec.xyz";
+// Where recipients are told to reach a human. One place to change it.
+const SUPPORT_EMAIL = "support@printexec.xyz";
 // Hosted footer image (coordinate-rain + PrintExec wordmark), served from the
 // marketing site's static assets (website/public/email-footer.png). A PNG renders
 // in every mail client, unlike the inline SVG rain that Gmail/Outlook strip.
@@ -345,7 +349,7 @@ export type StaffInviteEmailData = {
   expiresAt: string | Date;
   /** Display name of whoever created the invite (best-effort). */
   invitedByName: string | null;
-  /** Absolute app origin the CTA links to, e.g. https://printexec-client.pages.dev */
+  /** Absolute app origin the CTA links to, e.g. https://solution.printexec.xyz */
   appUrl: string;
 };
 
@@ -603,7 +607,7 @@ export function composeLicenseNoticeEmail(data: LicenseNoticeEmailData): Compose
     ...copy.paragraphs.flatMap((p) => [p, ``]),
     `${copy.cta}: ${data.appUrl} → account menu → Plan & billing`,
     ``,
-    `Need a hand? Reach us at support@printexec.app.`,
+    `Need a hand? Reach us at ${SUPPORT_EMAIL}.`,
     ``,
     `This is an automated notice from an unmonitored address — please don't reply.`,
     `— The PrintExec team · ${SITE_URL}`
@@ -622,7 +626,7 @@ export function composeLicenseNoticeEmail(data: LicenseNoticeEmailData): Compose
       `Open PrintExec → account menu → Plan &amp; billing</div>` +
       `</td></tr>`,
     `<tr><td style="padding:16px 28px 24px;font-family:${SANS};font-size:12.5px;color:${SUBTLE};line-height:1.6;">` +
-      `Need a hand? Reach us at <a href="mailto:support@printexec.app" style="color:${INK};font-weight:700;">support@printexec.app</a>.<br/>` +
+      `Need a hand? Reach us at <a href="mailto:${SUPPORT_EMAIL}" style="color:${INK};font-weight:700;">${SUPPORT_EMAIL}</a>.<br/>` +
       `This is an automated notice from an unmonitored address — please don't reply.` +
       `</td></tr>`
   ];
@@ -643,7 +647,6 @@ export type PlatformEmailData = {
   /** Plain-text body; blank lines separate paragraphs. */
   body: string;
   companyName: string;
-  appUrl: string;
 };
 
 export function composePlatformEmail(data: PlatformEmailData): ComposedEmail {
@@ -652,13 +655,16 @@ export function composePlatformEmail(data: PlatformEmailData): ComposedEmail {
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
 
+  // The signature links to the marketing site (printexec.xyz), never the app —
+  // recipients reach a human at SUPPORT_EMAIL, not by replying.
+  const siteHost = SITE_URL.replace(/^https?:\/\//, "");
   const text = [
     `PRINTEXEC`,
     ``,
     ...paragraphs.flatMap((p) => [p, ``]),
-    `Sent to the owner of ${data.companyName} · ${data.appUrl}`,
-    `This address is unmonitored — to get in touch, write to support@printexec.app.`,
-    `— The PrintExec team · ${SITE_URL}`
+    `Sent to the owner of ${data.companyName}. Learn more at ${SITE_URL}.`,
+    `This address is unmonitored — to get in touch, write to ${SUPPORT_EMAIL}.`,
+    `— The PrintExec team`
   ].join("\n");
 
   const inner = [
@@ -671,9 +677,10 @@ export function composePlatformEmail(data: PlatformEmailData): ComposedEmail {
         .join("") +
       `</td></tr>`,
     `<tr><td style="padding:4px 28px 24px;font-family:${SANS};font-size:12.5px;color:${SUBTLE};line-height:1.6;">` +
-      `Sent to the owner of ${esc(data.companyName)} · <a href="${data.appUrl}" target="_blank" rel="noopener" style="color:${INK};font-weight:700;">${esc(data.appUrl.replace(/^https?:\/\//, ""))}</a><br/>` +
+      `Sent to the owner of ${esc(data.companyName)} · ` +
+      `<a href="${SITE_URL}" target="_blank" rel="noopener" style="color:${INK};font-weight:700;">${esc(siteHost)}</a><br/>` +
       `This address is unmonitored — to get in touch, write to ` +
-      `<a href="mailto:support@printexec.app" style="color:${INK};font-weight:700;">support@printexec.app</a>.` +
+      `<a href="mailto:${SUPPORT_EMAIL}" style="color:${INK};font-weight:700;">${SUPPORT_EMAIL}</a>.` +
       `</td></tr>`
   ];
 

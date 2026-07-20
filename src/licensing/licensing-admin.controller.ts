@@ -531,7 +531,6 @@ export class LicensingAdminController {
     );
     if (targets.length === 0) throw new NotFoundException("None of the selected companies exist.");
 
-    const appUrl = this.appUrl();
     let sent = 0;
     let dryRun = 0;
     const skipped: { company_id: string; company: string; reason: string }[] = [];
@@ -547,7 +546,7 @@ export class LicensingAdminController {
       const vars = this.emailVars(target.name, target.plan_name, target.current_period_end, recipient);
       const subject = substituteVars(input.subject, vars);
       const bodyText = substituteVars(input.body, vars);
-      const message = composePlatformEmail({ subject, body: bodyText, companyName: target.name, appUrl });
+      const message = composePlatformEmail({ subject, body: bodyText, companyName: target.name });
 
       try {
         const result = await this.email.send({
@@ -754,14 +753,6 @@ export class LicensingAdminController {
       // license_emails not migrated yet — the send still happened; only the
       // audit row is lost.
     }
-  }
-
-  /** Public app origin for links in owner emails (same as the notice sweep). */
-  private appUrl(): string {
-    return (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec-client.pages.dev")
-      .split(",")[0]!
-      .trim()
-      .replace(/\/+$/, "");
   }
 
   // Allowlist check; returns the admin's email for audit columns.

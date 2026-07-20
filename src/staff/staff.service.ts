@@ -216,7 +216,7 @@ export class StaffService {
 
     // Same public-origin resolution as the customer-email logo URL: the invite
     // CTA must open the APP (join flow), not the marketing site.
-    const appUrl = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec-client.pages.dev")
+    const appUrl = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
       .split(",")[0]!
       .trim()
       .replace(/\/+$/, "");

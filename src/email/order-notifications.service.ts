@@ -284,7 +284,7 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       // origin, then the deployed APP origin. NEVER the marketing site — it has
       // no /api proxy, so a logo URL built on it 404s and the email header
       // silently renders blank. Trailing slashes trimmed.
-      const origin = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://printexec-client.pages.dev")
+      const origin = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
         .split(",")[0]!
         .trim()
         .replace(/\/+$/, "");
