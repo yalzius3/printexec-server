@@ -289,7 +289,9 @@ export class SubscriptionInvoiceService {
       const { rows } = await this.db.query<SubRow>(
         `SELECT ${base},
                 cs.custom_max_printers, cs.custom_price_model, cs.custom_price_amount,
-                cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label
+                cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label,
+                cs.custom_base_amount, cs.custom_included_printers, cs.custom_overage_model,
+                cs.custom_min_monthly
          ${from}`,
         [companyId]
       );

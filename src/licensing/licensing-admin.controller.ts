@@ -132,7 +132,9 @@ export class LicensingAdminController {
     try {
       const { rows: custom } = await this.db.query<{ company_id: string } & CustomPlanRow>(
         `SELECT company_id, custom_max_printers, custom_price_model, custom_price_amount,
-                custom_bundle_size, custom_billing_basis, custom_label, custom_note
+                custom_bundle_size, custom_billing_basis, custom_label, custom_note,
+                custom_base_amount, custom_included_printers, custom_overage_model,
+                custom_min_monthly
            FROM company_subscriptions
           WHERE custom_max_printers IS NOT NULL OR custom_price_model IS NOT NULL`
       );
@@ -363,6 +365,10 @@ export class LicensingAdminController {
                 custom_price_amount = NULL,
                 custom_bundle_size = NULL,
                 custom_billing_basis = NULL,
+                custom_base_amount = NULL,
+                custom_included_printers = NULL,
+                custom_overage_model = NULL,
+                custom_min_monthly = NULL,
                 custom_label = NULL,
                 custom_note = NULL,
                 limit_exceeded_since = NULL,
@@ -375,44 +381,67 @@ export class LicensingAdminController {
     }
 
     // Read the current overrides so an omitted field keeps its value.
-    const { rows: currentRows } = await this.db.query<{
-      custom_max_printers: number | null;
-      custom_price_model: "flat" | "per_printer" | "bundle" | null;
-      custom_price_amount: string | null;
-      custom_bundle_size: number | null;
-      custom_billing_basis: "cap" | "actual" | null;
-      custom_label: string | null;
-      custom_note: string | null;
-    }>(
+    const { rows: currentRows } = await this.db.query<CustomPlanRow>(
       `SELECT custom_max_printers, custom_price_model, custom_price_amount,
-              custom_bundle_size, custom_billing_basis, custom_label, custom_note
+              custom_bundle_size, custom_billing_basis, custom_label, custom_note,
+              custom_base_amount, custom_included_printers, custom_overage_model,
+              custom_min_monthly
          FROM company_subscriptions WHERE company_id = $1`,
       [input.company_id]
     );
     const cur = currentRows[0];
     const pick = <T>(next: T | undefined, fallback: T): T => (next === undefined ? fallback : next);
+    const curNum = (v: string | number | null | undefined) => (v == null ? null : Number(v));
 
     const maxPrinters = pick(input.max_printers, cur?.custom_max_printers ?? null);
     const priceModel = pick(input.price_model, cur?.custom_price_model ?? null);
-    const priceAmount = pick(
-      input.price_amount,
-      cur?.custom_price_amount != null ? Number(cur.custom_price_amount) : null
-    );
+    const priceAmount = pick(input.price_amount, curNum(cur?.custom_price_amount));
     const bundleSize = pick(input.bundle_size, cur?.custom_bundle_size ?? null);
     const billingBasis = pick(input.billing_basis, cur?.custom_billing_basis ?? "cap");
+    const baseAmount = pick(input.base_amount, curNum(cur?.custom_base_amount));
+    const includedPrinters = pick(input.included_printers, cur?.custom_included_printers ?? null);
+    const overageModel = pick(input.overage_model, cur?.custom_overage_model ?? null);
+    const minMonthly = pick(input.min_monthly, curNum(cur?.custom_min_monthly));
     const label = pick(input.label, cur?.custom_label ?? null);
     const note = pick(input.note, cur?.custom_note ?? null);
 
+    // A bundle size is needed by the bundle model AND by bundle overage.
+    const usesBundleSize = priceModel === "bundle" || overageModel === "bundle";
+
     // Mirror the DB CHECK constraints with copy the admin can act on.
-    if (priceModel !== null && (priceAmount === null || !Number.isFinite(priceAmount))) {
-      throw new BadRequestException("Set a price amount for the chosen pricing model.");
-    }
-    if (priceModel === "bundle" && (bundleSize === null || bundleSize < 1)) {
-      throw new BadRequestException("Bundle pricing needs a bundle size (printers per bundle).");
+    if (priceModel === "base_plus_overage") {
+      if (baseAmount === null || !Number.isFinite(baseAmount)) {
+        throw new BadRequestException("Set the fixed monthly base for a base + overage plan.");
+      }
+      if (overageModel !== null && (priceAmount === null || !Number.isFinite(priceAmount))) {
+        throw new BadRequestException("Set the price charged for each printer (or bundle) above the included allowance.");
+      }
+      if (overageModel === "bundle" && (bundleSize === null || bundleSize < 1)) {
+        throw new BadRequestException("Bundle overage needs a bundle size (printers per bundle).");
+      }
+    } else if (priceModel !== null) {
+      if (priceAmount === null || !Number.isFinite(priceAmount)) {
+        throw new BadRequestException("Set a price amount for the chosen pricing model.");
+      }
+      if (priceModel === "bundle" && (bundleSize === null || bundleSize < 1)) {
+        throw new BadRequestException("Bundle pricing needs a bundle size (printers per bundle).");
+      }
     }
     if (maxPrinters === null && priceModel === null) {
       throw new BadRequestException(
         "Nothing to save — set a custom printer cap, a custom price, or use Clear."
+      );
+    }
+    // A cap below the included allowance can never be reached — almost always
+    // a typo, and it silently makes the allowance meaningless.
+    if (
+      priceModel === "base_plus_overage" &&
+      maxPrinters !== null &&
+      includedPrinters !== null &&
+      maxPrinters < includedPrinters
+    ) {
+      throw new BadRequestException(
+        `The printer cap (${maxPrinters}) is below the included allowance (${includedPrinters}) — raise the cap or lower the allowance.`
       );
     }
 
@@ -425,6 +454,10 @@ export class LicensingAdminController {
               custom_billing_basis = $6,
               custom_label = $7,
               custom_note = $8,
+              custom_base_amount = $9,
+              custom_included_printers = $10,
+              custom_overage_model = $11,
+              custom_min_monthly = $12,
               limit_exceeded_since = NULL,
               updated_at = now()
         WHERE company_id = $1`,
@@ -433,12 +466,16 @@ export class LicensingAdminController {
         maxPrinters,
         priceModel,
         priceAmount,
-        // Only the bundle model uses a size; drop it otherwise so the row
+        // Only the models that actually meter bundles keep a size, so the row
         // never carries a stale, meaningless value.
-        priceModel === "bundle" ? bundleSize : null,
+        usesBundleSize ? bundleSize : null,
         billingBasis,
         label && label.trim() ? label.trim() : null,
-        note && note.trim() ? note.trim() : null
+        note && note.trim() ? note.trim() : null,
+        priceModel === "base_plus_overage" ? baseAmount : null,
+        priceModel === "base_plus_overage" ? includedPrinters : null,
+        priceModel === "base_plus_overage" ? overageModel : null,
+        minMonthly
       ]
     );
 
@@ -464,6 +501,10 @@ export class LicensingAdminController {
       priceAmount: input.price_amount ?? null,
       bundleSize: input.bundle_size ?? null,
       billingBasis: input.billing_basis ?? "cap",
+      baseAmount: input.base_amount ?? null,
+      includedPrinters: input.included_printers ?? null,
+      overageModel: input.overage_model ?? null,
+      minMonthly: input.min_monthly ?? null,
       label: input.label ?? null,
       note: null
     };

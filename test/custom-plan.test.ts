@@ -16,6 +16,10 @@ const terms = (over: Partial<CustomPlanTerms> = {}): CustomPlanTerms => ({
   priceAmount: null,
   bundleSize: null,
   billingBasis: "cap",
+  baseAmount: null,
+  includedPrinters: null,
+  overageModel: null,
+  minMonthly: null,
   label: null,
   note: null,
   ...over
@@ -90,6 +94,106 @@ test("termsFromRow: only a cap, only a price, or neither", () => {
   assert.equal(computeCustomMonthlyUsd(priced, 10), 90.8);
 });
 
+// ── base + overage: "$500 covers 50 printers, extras are metered" ──────────
+
+test("base + overage, per printer: base alone until the allowance is exceeded", () => {
+  const t = terms({
+    priceModel: "base_plus_overage",
+    baseAmount: 500,
+    includedPrinters: 50,
+    overageModel: "per_printer",
+    priceAmount: 9.08,
+    billingBasis: "actual"
+  });
+  assert.equal(computeCustomMonthlyUsd(t, 0), 500, "no printers → base only");
+  assert.equal(computeCustomMonthlyUsd(t, 50), 500, "exactly the allowance → base only");
+  assert.equal(computeCustomMonthlyUsd(t, 51), 509.08, "one over → base + one printer");
+  assert.equal(computeCustomMonthlyUsd(t, 60), 590.8, "ten over");
+});
+
+test("base + overage, per bundle: extras round up to whole blocks", () => {
+  const t = terms({
+    priceModel: "base_plus_overage",
+    baseAmount: 500,
+    includedPrinters: 50,
+    overageModel: "bundle",
+    priceAmount: 69,
+    bundleSize: 10,
+    billingBasis: "actual"
+  });
+  assert.equal(computeCustomMonthlyUsd(t, 50), 500, "at the allowance → base only");
+  assert.equal(computeCustomMonthlyUsd(t, 51), 569, "1 over → a whole block of 10");
+  assert.equal(computeCustomMonthlyUsd(t, 60), 569, "10 over → still one block");
+  assert.equal(computeCustomMonthlyUsd(t, 61), 638, "11 over → two blocks");
+});
+
+test("base + overage on the committed cap bills the slots, not usage", () => {
+  const t = terms({
+    priceModel: "base_plus_overage",
+    baseAmount: 500,
+    includedPrinters: 50,
+    overageModel: "per_printer",
+    priceAmount: 10,
+    maxPrinters: 60,
+    billingBasis: "cap"
+  });
+  // They committed to 60 slots; 10 of them are beyond the allowance.
+  assert.equal(computeCustomMonthlyUsd(t, 0), 600);
+  assert.equal(computeCustomMonthlyUsd(t, 55), 600, "usage doesn't change a committed deal");
+});
+
+test("base + overage with no overage model is a hard-capped flat base", () => {
+  const t = terms({
+    priceModel: "base_plus_overage",
+    baseAmount: 500,
+    includedPrinters: 50,
+    overageModel: null,
+    billingBasis: "actual"
+  });
+  assert.equal(computeCustomMonthlyUsd(t, 80), 500, "extras aren't metered");
+});
+
+test("base + overage needs a base, and a metered overage needs a rate", () => {
+  assert.equal(
+    computeCustomMonthlyUsd(terms({ priceModel: "base_plus_overage", baseAmount: null }), 10),
+    null
+  );
+  const noRate = terms({
+    priceModel: "base_plus_overage",
+    baseAmount: 500,
+    includedPrinters: 5,
+    overageModel: "per_printer",
+    priceAmount: null,
+    billingBasis: "actual"
+  });
+  assert.equal(computeCustomMonthlyUsd(noRate, 10), null, "over the allowance with no rate");
+  assert.equal(computeCustomMonthlyUsd(noRate, 3), 500, "under it, the rate is irrelevant");
+});
+
+// ── minimum monthly floor (composes with every model) ──────────────────────
+
+test("the minimum floor raises a small month but never discounts a big one", () => {
+  const t = terms({
+    priceModel: "per_printer",
+    priceAmount: 9.08,
+    minMonthly: 500,
+    billingBasis: "actual"
+  });
+  assert.equal(computeCustomMonthlyUsd(t, 10), 500, "90.80 → floored to 500");
+  assert.equal(computeCustomMonthlyUsd(t, 100), 908, "above the floor, unchanged");
+
+  const withBase = terms({
+    priceModel: "base_plus_overage",
+    baseAmount: 100,
+    includedPrinters: 50,
+    overageModel: "per_printer",
+    priceAmount: 9.08,
+    minMonthly: 250,
+    billingBasis: "actual"
+  });
+  assert.equal(computeCustomMonthlyUsd(withBase, 10), 250, "floor applies to base+overage too");
+});
+
 test("describeCustomPlan reads back the deal in plain words", () => {
   assert.equal(
     describeCustomPlan(terms({ priceModel: "per_printer", priceAmount: 9.08, maxPrinters: 100, billingBasis: "cap" }), 63),
@@ -100,4 +204,27 @@ test("describeCustomPlan reads back the deal in plain words", () => {
     "$69 per 10 printers × 2 (11 in use)"
   );
   assert.equal(describeCustomPlan(terms({ maxPrinters: 100 }), 5), null, "cap-only has no price to describe");
+
+  assert.equal(
+    describeCustomPlan(
+      terms({
+        priceModel: "base_plus_overage",
+        baseAmount: 500,
+        includedPrinters: 50,
+        overageModel: "per_printer",
+        priceAmount: 9.08,
+        billingBasis: "actual"
+      }),
+      60
+    ),
+    "$500 base covers 50 printers + 10 over × $9.08 (60 in use)"
+  );
+
+  assert.equal(
+    describeCustomPlan(
+      terms({ priceModel: "per_printer", priceAmount: 9.08, minMonthly: 500, billingBasis: "actual" }),
+      10
+    ),
+    "$9.08 per printer × 10 in use, min $500"
+  );
 });

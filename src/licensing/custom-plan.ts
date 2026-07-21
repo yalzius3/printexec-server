@@ -11,7 +11,10 @@
 // writable ONLY by an unlocked platform admin.
 // ════════════════════════════════════════════════════════════════
 
-export type CustomPriceModel = "flat" | "per_printer" | "bundle";
+export type CustomPriceModel = "flat" | "per_printer" | "bundle" | "base_plus_overage";
+
+/** How printers ABOVE the included allowance are billed (base_plus_overage). */
+export type CustomOverageModel = "per_printer" | "bundle";
 
 /**
  * What the price is multiplied by:
@@ -25,10 +28,20 @@ export interface CustomPlanTerms {
   maxPrinters: number | null;
   /** null = no custom pricing (fall back to the plan's list price). */
   priceModel: CustomPriceModel | null;
+  /** The per-unit money input for the VARIABLE part of the price: the
+   *  per-printer/per-bundle rate, or the overage rate under base_plus_overage. */
   priceAmount: number | null;
-  /** Printers per bundle — required by, and only used by, the bundle model. */
+  /** Printers per bundle — used by the bundle model and by bundle overage. */
   bundleSize: number | null;
   billingBasis: CustomBillingBasis;
+  /** base_plus_overage: the fixed monthly base. */
+  baseAmount: number | null;
+  /** base_plus_overage: how many printers that base already covers. */
+  includedPrinters: number | null;
+  /** base_plus_overage: how the excess is billed. null = no overage at all. */
+  overageModel: CustomOverageModel | null;
+  /** Optional floor applied to ANY model — only ever raises the total. */
+  minMonthly: number | null;
   /** Tenant-facing name for the deal, e.g. "Enterprise — 100 printers". */
   label: string | null;
   /** Internal-only context; never sent to the tenant. */
@@ -53,28 +66,50 @@ export function computeCustomMonthlyUsd(
   terms: CustomPlanTerms | null,
   printerCount: number
 ): number | null {
-  if (!terms || terms.priceModel === null || terms.priceAmount === null) return null;
-
-  const amount = Number(terms.priceAmount);
-  if (!Number.isFinite(amount) || amount < 0) return null;
+  if (!terms || terms.priceModel === null) return null;
 
   const live = Math.max(0, Math.floor(printerCount) || 0);
   // "cap" bills the committed slots; with no cap (unlimited) there are no
   // slots to bill, so fall back to actual usage.
   const units = terms.billingBasis === "cap" ? terms.maxPrinters ?? live : live;
 
+  const rate = Number(terms.priceAmount);
+  const hasRate = terms.priceAmount !== null && Number.isFinite(rate) && rate >= 0;
+  const size = terms.bundleSize && terms.bundleSize >= 1 ? Math.floor(terms.bundleSize) : null;
+
   let total: number;
   switch (terms.priceModel) {
     case "flat":
-      total = amount;
+      if (!hasRate) return null;
+      total = rate;
       break;
     case "per_printer":
-      total = amount * units;
+      if (!hasRate) return null;
+      total = rate * units;
       break;
     case "bundle": {
-      const size = terms.bundleSize && terms.bundleSize >= 1 ? Math.floor(terms.bundleSize) : null;
+      if (!hasRate) return null;
       if (size === null) return null; // bundle model without a size is unpriceable
-      total = Math.ceil(units / size) * amount;
+      total = Math.ceil(units / size) * rate;
+      break;
+    }
+    case "base_plus_overage": {
+      const base = Number(terms.baseAmount);
+      if (terms.baseAmount === null || !Number.isFinite(base) || base < 0) return null;
+      const included = Math.max(0, Math.floor(terms.includedPrinters ?? 0));
+      // Only printers beyond the allowance are metered.
+      const extra = Math.max(0, units - included);
+      let overage = 0;
+      if (extra > 0 && terms.overageModel !== null) {
+        if (!hasRate) return null; // an overage model with no rate is unpriceable
+        if (terms.overageModel === "per_printer") {
+          overage = rate * extra;
+        } else {
+          if (size === null) return null;
+          overage = Math.ceil(extra / size) * rate;
+        }
+      }
+      total = base + overage;
       break;
     }
     default:
@@ -82,6 +117,12 @@ export function computeCustomMonthlyUsd(
   }
 
   if (!Number.isFinite(total)) return null;
+  // An optional contractual floor — raises a small month up to the minimum,
+  // never discounts a large one.
+  const floor = Number(terms.minMonthly);
+  if (terms.minMonthly !== null && Number.isFinite(floor) && floor > total) {
+    total = floor;
+  }
   return Math.max(0, Math.round(total * 100) / 100);
 }
 
@@ -90,24 +131,57 @@ export function describeCustomPlan(
   terms: CustomPlanTerms | null,
   printerCount: number
 ): string | null {
-  if (terms === null || terms.priceModel === null || terms.priceAmount === null) return null;
+  if (terms === null || terms.priceModel === null) return null;
   const money = (n: number) => `$${n % 1 === 0 ? n.toFixed(0) : n.toFixed(2)}`;
   const units = terms.billingBasis === "cap" ? terms.maxPrinters ?? printerCount : printerCount;
   const basisWord = terms.billingBasis === "cap" ? "slots" : "in use";
-  switch (terms.priceModel) {
-    case "flat":
-      return `${money(Number(terms.priceAmount))} per month, flat`;
-    case "per_printer":
-      return `${money(Number(terms.priceAmount))} per printer × ${units} ${basisWord}`;
-    case "bundle": {
+  const floorNote =
+    terms.minMonthly !== null && Number(terms.minMonthly) > 0
+      ? `, min ${money(Number(terms.minMonthly))}`
+      : "";
+
+  const body = ((): string | null => {
+    if (terms.priceModel === "base_plus_overage") {
+      if (terms.baseAmount === null) return null;
+      const included = Math.max(0, Math.floor(terms.includedPrinters ?? 0));
+      const extra = Math.max(0, units - included);
+      const head = `${money(Number(terms.baseAmount))} base covers ${included} printers`;
+      if (terms.overageModel === null) return `${head} (no overage)`;
+      if (terms.priceAmount === null) return head;
+      if (extra === 0) {
+        const per =
+          terms.overageModel === "per_printer"
+            ? `${money(Number(terms.priceAmount))} per extra printer`
+            : `${money(Number(terms.priceAmount))} per extra ${terms.bundleSize ?? 0}`;
+        return `${head} — ${per}, none used (${units} ${basisWord})`;
+      }
+      if (terms.overageModel === "per_printer") {
+        return `${head} + ${extra} over × ${money(Number(terms.priceAmount))} (${units} ${basisWord})`;
+      }
       const size = terms.bundleSize ?? 0;
       if (size < 1) return null;
-      const bundles = Math.ceil(units / size);
-      return `${money(Number(terms.priceAmount))} per ${size} printers × ${bundles} (${units} ${basisWord})`;
+      const blocks = Math.ceil(extra / size);
+      return `${head} + ${blocks} × ${money(Number(terms.priceAmount))} per ${size} (${extra} over, ${units} ${basisWord})`;
     }
-    default:
-      return null;
-  }
+
+    if (terms.priceAmount === null) return null;
+    switch (terms.priceModel) {
+      case "flat":
+        return `${money(Number(terms.priceAmount))} per month, flat`;
+      case "per_printer":
+        return `${money(Number(terms.priceAmount))} per printer × ${units} ${basisWord}`;
+      case "bundle": {
+        const size = terms.bundleSize ?? 0;
+        if (size < 1) return null;
+        const bundles = Math.ceil(units / size);
+        return `${money(Number(terms.priceAmount))} per ${size} printers × ${bundles} (${units} ${basisWord})`;
+      }
+      default:
+        return null;
+    }
+  })();
+
+  return body === null ? null : `${body}${floorNote}`;
 }
 
 /** Row shape as selected from company_subscriptions (pg returns NUMERIC as text). */
@@ -119,7 +193,15 @@ export interface CustomPlanRow {
   custom_billing_basis: CustomBillingBasis | null;
   custom_label: string | null;
   custom_note: string | null;
+  // Added 2026-07-22 (overage migration); absent on older reads.
+  custom_base_amount?: string | number | null;
+  custom_included_printers?: number | null;
+  custom_overage_model?: CustomOverageModel | null;
+  custom_min_monthly?: string | number | null;
 }
+
+const num = (v: string | number | null | undefined): number | null =>
+  v === null || v === undefined ? null : Number(v);
 
 /** Map a DB row's custom_* columns into CustomPlanTerms (null when unset). */
 export function termsFromRow(row: Partial<CustomPlanRow> | null | undefined): CustomPlanTerms | null {
@@ -127,15 +209,18 @@ export function termsFromRow(row: Partial<CustomPlanRow> | null | undefined): Cu
   const maxPrinters = row.custom_max_printers ?? null;
   const priceModel = row.custom_price_model ?? null;
   if (maxPrinters === null && priceModel === null) return null;
-  const rawAmount = row.custom_price_amount;
   return {
     maxPrinters,
     priceModel,
-    priceAmount: rawAmount === null || rawAmount === undefined ? null : Number(rawAmount),
+    priceAmount: num(row.custom_price_amount),
     bundleSize: row.custom_bundle_size ?? null,
     // Default to committed-cap billing: an admin who set a cap but no basis
     // was selling slots.
     billingBasis: row.custom_billing_basis ?? "cap",
+    baseAmount: num(row.custom_base_amount),
+    includedPrinters: row.custom_included_printers ?? null,
+    overageModel: row.custom_overage_model ?? null,
+    minMonthly: num(row.custom_min_monthly),
     label: row.custom_label ?? null,
     note: row.custom_note ?? null
   };

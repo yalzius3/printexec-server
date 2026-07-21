@@ -41,10 +41,17 @@ export type LicenseReason =
 export interface CustomPlanSummary {
   /** Custom cap, or null when only the price is customized. */
   max_printers: number | null;
-  price_model: "flat" | "per_printer" | "bundle" | null;
+  price_model: "flat" | "per_printer" | "bundle" | "base_plus_overage" | null;
   price_amount: number | null;
   bundle_size: number | null;
   billing_basis: "cap" | "actual";
+  /** base_plus_overage: fixed base, the allowance it covers, and how the
+   *  excess is metered. */
+  base_amount: number | null;
+  included_printers: number | null;
+  overage_model: "per_printer" | "bundle" | null;
+  /** Optional contractual floor applied to any model. */
+  min_monthly: number | null;
   /** Tenant-facing deal name, e.g. "Enterprise — 100 printers". */
   label: string | null;
   /** Computed monthly price in USD (null when only the cap is customized). */
@@ -344,6 +351,10 @@ export class LicensingService {
             price_amount: customTerms.priceAmount,
             bundle_size: customTerms.bundleSize,
             billing_basis: customTerms.billingBasis,
+            base_amount: customTerms.baseAmount,
+            included_printers: customTerms.includedPrinters,
+            overage_model: customTerms.overageModel,
+            min_monthly: customTerms.minMonthly,
             label: customTerms.label,
             monthly_usd: computeCustomMonthlyUsd(customTerms, printerCount),
             summary: describeCustomPlan(customTerms, printerCount)
@@ -360,7 +371,9 @@ export class LicensingService {
       const { rows } = await this.db.query<SubscriptionRow>(
         `SELECT ${base},
                 cs.custom_max_printers, cs.custom_price_model, cs.custom_price_amount,
-                cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label, cs.custom_note
+                cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label, cs.custom_note,
+                cs.custom_base_amount, cs.custom_included_printers, cs.custom_overage_model,
+                cs.custom_min_monthly
          FROM company_subscriptions cs
          JOIN plans p ON p.plan_code = cs.plan_code
          WHERE cs.company_id = $1`,

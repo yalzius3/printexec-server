@@ -22,10 +22,18 @@ export const customPlanSchema = z.object({
   company_id: z.string().uuid(),
   clear: z.boolean().optional(),
   max_printers: z.coerce.number().int().min(0).max(1_000_000).nullable().optional(),
-  price_model: z.enum(["flat", "per_printer", "bundle"]).nullable().optional(),
+  price_model: z.enum(["flat", "per_printer", "bundle", "base_plus_overage"]).nullable().optional(),
+  // The VARIABLE rate: per-printer/per-bundle price, or the overage rate
+  // under base_plus_overage.
   price_amount: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
   bundle_size: z.coerce.number().int().min(1).max(1_000_000).nullable().optional(),
   billing_basis: z.enum(["cap", "actual"]).optional(),
+  // base_plus_overage: fixed base, what it covers, and how the excess bills.
+  base_amount: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
+  included_printers: z.coerce.number().int().min(0).max(1_000_000).nullable().optional(),
+  overage_model: z.enum(["per_printer", "bundle"]).nullable().optional(),
+  // Optional floor applied to any model.
+  min_monthly: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
   label: z.string().trim().max(120).nullable().optional(),
   note: z.string().trim().max(1000).nullable().optional()
 });
