@@ -9,6 +9,27 @@ export const checkoutSchema = z.object({
   plan_code: z.string().trim().min(1).max(40)
 });
 
+// Admin step-up: exchange PLATFORM_ADMIN_SECRET for a short-lived session.
+export const adminUnlockSchema = z.object({
+  secret: z.string().min(1).max(500)
+});
+
+// Admin: per-company custom plan overrides (cap and/or pricing) layered on top
+// of the assigned catalogue plan. `clear: true` wipes every override back to
+// the plan's own terms. Omitted fields are left untouched, so a partial edit
+// (e.g. bumping just the cap) doesn't blank the pricing.
+export const customPlanSchema = z.object({
+  company_id: z.string().uuid(),
+  clear: z.boolean().optional(),
+  max_printers: z.coerce.number().int().min(0).max(1_000_000).nullable().optional(),
+  price_model: z.enum(["flat", "per_printer", "bundle"]).nullable().optional(),
+  price_amount: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
+  bundle_size: z.coerce.number().int().min(1).max(1_000_000).nullable().optional(),
+  billing_basis: z.enum(["cap", "actual"]).optional(),
+  label: z.string().trim().max(120).nullable().optional(),
+  note: z.string().trim().max(1000).nullable().optional()
+});
+
 // Admin: manually put a company on a plan (Enterprise deals, early customers,
 // support fixes). current_period_end null/omitted = access until changed.
 export const assignPlanSchema = z.object({

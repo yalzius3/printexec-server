@@ -1,5 +1,8 @@
 import { Global, Module } from "@nestjs/common";
 import { EmailModule } from "../email/email.module";
+import { AdminAuditInterceptor } from "./admin-audit.interceptor";
+import { AdminSessionService } from "./admin-session.service";
+import { PlatformAdminGuard } from "./platform-admin.guard";
 import { CompanyPurgeService } from "./company-purge.service";
 import { DiscountService } from "./discount.service";
 import { LicenseNotificationsService } from "./license-notifications.service";
@@ -24,7 +27,12 @@ import { SubscriptionInvoiceService } from "./subscription-invoice.service";
     LicenseNotificationsService,
     SubscriptionInvoiceService,
     CompanyPurgeService,
-    DiscountService
+    DiscountService,
+    // Platform-admin step-up auth + its audit trail. Registered here (not as
+    // APP_GUARD) because they gate ONLY the admin controller.
+    AdminSessionService,
+    PlatformAdminGuard,
+    AdminAuditInterceptor
   ],
   exports: [LicensingService, PaymentsService, SubscriptionInvoiceService]
 })

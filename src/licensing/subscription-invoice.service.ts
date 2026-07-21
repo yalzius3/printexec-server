@@ -4,6 +4,12 @@ import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
 import { composeSubscriptionInvoiceEmail } from "../email/email-templates";
 import { renderInvoicePdf } from "../email/invoice-pdf";
+import {
+  computeCustomMonthlyUsd,
+  describeCustomPlan,
+  termsFromRow,
+  type CustomPlanRow
+} from "./custom-plan";
 import { DiscountService } from "./discount.service";
 
 // ════════════════════════════════════════════════════════════════
@@ -44,7 +50,7 @@ export interface IssueInvoiceInput {
   discountCode?: string;
 }
 
-interface SubRow {
+interface SubRow extends Partial<CustomPlanRow> {
   plan_code: string;
   plan_name: string | null;
   max_printers: number | null;
@@ -56,6 +62,8 @@ interface SubRow {
   owner_email: string | null;
   city: string | null;
   country_code: string | null;
+  /** Live printer count — what an "actual usage" custom basis bills on. */
+  printer_count?: number | null;
 }
 
 @Injectable()
@@ -112,8 +120,13 @@ export class SubscriptionInvoiceService {
     );
     if (existing.rowCount) return existing.rows[0]!.invoice_number;
 
-    // Amount: explicit override → grant is complimentary → plan list price.
+    // Amount: explicit override → grant is complimentary → NEGOTIATED custom
+    // price → plan list price. The custom price is computed by the same helper
+    // the resolver and the admin preview use, so the invoice always matches
+    // the deal the admin saw when they set it up.
     const listPrice = sub.price_monthly_usd != null ? Number(sub.price_monthly_usd) : null;
+    const customTerms = termsFromRow(sub);
+    const customPrice = computeCustomMonthlyUsd(customTerms, Number(sub.printer_count ?? 0));
     let amountUsd: number;
     let note: string | null = null;
     if (input.amountUsd != null) {
@@ -121,6 +134,10 @@ export class SubscriptionInvoiceService {
     } else if (input.source === "grant_code") {
       amountUsd = 0;
       note = "Complimentary access — no charge (grant code).";
+    } else if (customPrice != null) {
+      amountUsd = customPrice;
+      const summary = describeCustomPlan(customTerms, Number(sub.printer_count ?? 0));
+      note = summary ? `Agreed plan — ${summary}.` : "Agreed plan pricing.";
     } else if (listPrice != null && Number.isFinite(listPrice)) {
       amountUsd = listPrice;
     } else {
@@ -259,17 +276,30 @@ export class SubscriptionInvoiceService {
 
   /** Company + its subscription + the plan's list price, in one read. */
   private async loadSubscription(companyId: string): Promise<SubRow | null> {
-    const { rows } = await this.db.query<SubRow>(
-      `SELECT cs.plan_code, cs.status, cs.current_period_end, cs.created_at,
+    const base = `cs.plan_code, cs.status, cs.current_period_end, cs.created_at,
               p.display_name AS plan_name, p.max_printers, p.price_monthly_usd,
-              c.name AS company_name, c.owner_email, c.city, c.country_code
-         FROM company_subscriptions cs
+              c.name AS company_name, c.owner_email, c.city, c.country_code,
+              (SELECT count(*)::int FROM printer_instances pi
+                WHERE pi.company_id = cs.company_id) AS printer_count`;
+    const from = `FROM company_subscriptions cs
          JOIN plans p ON p.plan_code = cs.plan_code
          JOIN companies c ON c.company_id = cs.company_id
-        WHERE cs.company_id = $1`,
-      [companyId]
-    );
-    return rows[0] ?? null;
+        WHERE cs.company_id = $1`;
+    try {
+      const { rows } = await this.db.query<SubRow>(
+        `SELECT ${base},
+                cs.custom_max_printers, cs.custom_price_model, cs.custom_price_amount,
+                cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label
+         ${from}`,
+        [companyId]
+      );
+      return rows[0] ?? null;
+    } catch (err) {
+      // custom_* columns not migrated yet — invoice at the plan's list price.
+      if ((err as { code?: string }).code !== "42703") throw err;
+      const { rows } = await this.db.query<SubRow>(`SELECT ${base} ${from}`, [companyId]);
+      return rows[0] ?? null;
+    }
   }
 
   /**

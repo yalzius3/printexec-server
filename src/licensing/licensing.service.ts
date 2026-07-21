@@ -2,6 +2,12 @@ import { ForbiddenException, Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { randomBytes } from "node:crypto";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
+import {
+  computeCustomMonthlyUsd,
+  describeCustomPlan,
+  termsFromRow,
+  type CustomPlanRow
+} from "./custom-plan";
 
 // ════════════════════════════════════════════════════════════════
 // Licensing — resolves every company to one effective state:
@@ -31,10 +37,27 @@ export type LicenseReason =
   | "admin_hold"
   | null;
 
+/** Custom per-company terms, surfaced to the tenant and the admin UI. */
+export interface CustomPlanSummary {
+  /** Custom cap, or null when only the price is customized. */
+  max_printers: number | null;
+  price_model: "flat" | "per_printer" | "bundle" | null;
+  price_amount: number | null;
+  bundle_size: number | null;
+  billing_basis: "cap" | "actual";
+  /** Tenant-facing deal name, e.g. "Enterprise — 100 printers". */
+  label: string | null;
+  /** Computed monthly price in USD (null when only the cap is customized). */
+  monthly_usd: number | null;
+  /** One-line human summary of how that price is derived. */
+  summary: string | null;
+}
+
 export interface LicenseStatus {
   plan_code: string;
   plan_name: string;
-  /** NULL = unlimited printers. */
+  /** Effective cap: the company's custom override when set, else the plan's.
+   *  NULL = unlimited printers. */
   max_printers: number | null;
   printer_count: number;
   /** Raw subscription status: trialing | active | canceled | revoked. */
@@ -57,9 +80,11 @@ export interface LicenseStatus {
   admin_hold_reason: string | null;
   /** Soft-deleted by a platform admin: full lockout + hidden from the list. */
   deleted: boolean;
+  /** Negotiated per-company terms layered on the plan (null = plain plan). */
+  custom_plan: CustomPlanSummary | null;
 }
 
-interface SubscriptionRow {
+interface SubscriptionRow extends Partial<CustomPlanRow> {
   company_id: string;
   plan_code: string;
   status: string;
@@ -68,6 +93,7 @@ interface SubscriptionRow {
   limit_exceeded_since: string | Date | null;
   updated_at: string | Date;
   plan_name: string;
+  /** The PLAN's cap — the effective cap folds in any custom override. */
   max_printers: number | null;
 }
 
@@ -153,7 +179,8 @@ export class LicensingService {
         enforced: this.enforced,
         admin_hold: null,
         admin_hold_reason: null,
-        deleted: false
+        deleted: false,
+        custom_plan: null
       };
     }
   }
@@ -174,6 +201,15 @@ export class LicensingService {
     );
     const printerCount = Number(countResult.rows[0]?.count ?? 0);
 
+    // Negotiated per-company terms (2026-07-22). The custom cap REPLACES the
+    // plan's for every downstream decision — over-limit, printer adds, the
+    // tenant's usage bar — so the rest of this method reads effectiveMax.
+    const customTerms = termsFromRow(sub);
+    const effectiveMax =
+      customTerms?.maxPrinters !== undefined && customTerms?.maxPrinters !== null
+        ? customTerms.maxPrinters
+        : sub.max_printers;
+
     const now = Date.now();
     const periodEnd = sub.current_period_end ? new Date(sub.current_period_end).getTime() : null;
 
@@ -190,7 +226,7 @@ export class LicensingService {
     // Condition 2 — over the printer cap (downgrade landed a company above
     // its new limit). The first resolution that sees it stamps
     // limit_exceeded_since; dropping back under clears it.
-    const overLimit = sub.max_printers !== null && printerCount > sub.max_printers;
+    const overLimit = effectiveMax !== null && printerCount > effectiveMax;
     let overSince = sub.limit_exceeded_since
       ? new Date(sub.limit_exceeded_since).getTime()
       : null;
@@ -285,8 +321,9 @@ export class LicensingService {
 
     return {
       plan_code: sub.plan_code,
-      plan_name: sub.plan_name,
-      max_printers: sub.max_printers,
+      // A negotiated deal shows its own name when the admin gave it one.
+      plan_name: customTerms?.label?.trim() || sub.plan_name,
+      max_printers: effectiveMax,
       printer_count: printerCount,
       status: sub.status,
       source: sub.source,
@@ -299,21 +336,50 @@ export class LicensingService {
       enforced: this.enforced,
       admin_hold: adminHold,
       admin_hold_reason: adminHoldReason,
-      deleted
+      deleted,
+      custom_plan: customTerms
+        ? {
+            max_printers: customTerms.maxPrinters,
+            price_model: customTerms.priceModel,
+            price_amount: customTerms.priceAmount,
+            bundle_size: customTerms.bundleSize,
+            billing_basis: customTerms.billingBasis,
+            label: customTerms.label,
+            monthly_usd: computeCustomMonthlyUsd(customTerms, printerCount),
+            summary: describeCustomPlan(customTerms, printerCount)
+          }
+        : null
     };
   }
 
   private async loadSubscription(companyId: string): Promise<SubscriptionRow | null> {
-    const { rows } = await this.db.query<SubscriptionRow>(
-      `SELECT cs.company_id, cs.plan_code, cs.status, cs.source,
+    const base = `cs.company_id, cs.plan_code, cs.status, cs.source,
               cs.current_period_end, cs.limit_exceeded_since, cs.updated_at,
-              p.display_name AS plan_name, p.max_printers
-       FROM company_subscriptions cs
-       JOIN plans p ON p.plan_code = cs.plan_code
-       WHERE cs.company_id = $1`,
-      [companyId]
-    );
-    return rows[0] ?? null;
+              p.display_name AS plan_name, p.max_printers`;
+    try {
+      const { rows } = await this.db.query<SubscriptionRow>(
+        `SELECT ${base},
+                cs.custom_max_printers, cs.custom_price_model, cs.custom_price_amount,
+                cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label, cs.custom_note
+         FROM company_subscriptions cs
+         JOIN plans p ON p.plan_code = cs.plan_code
+         WHERE cs.company_id = $1`,
+        [companyId]
+      );
+      return rows[0] ?? null;
+    } catch (err) {
+      // custom_* columns not migrated yet (2026-07-22) — fall back to the
+      // plain shape so licensing keeps resolving without them.
+      if ((err as { code?: string }).code !== "42703") throw err;
+      const { rows } = await this.db.query<SubscriptionRow>(
+        `SELECT ${base}
+         FROM company_subscriptions cs
+         JOIN plans p ON p.plan_code = cs.plan_code
+         WHERE cs.company_id = $1`,
+        [companyId]
+      );
+      return rows[0] ?? null;
+    }
   }
 
   /**

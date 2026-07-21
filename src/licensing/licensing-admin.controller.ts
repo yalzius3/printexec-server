@@ -7,7 +7,9 @@ import {
   Logger,
   NotFoundException,
   Param,
-  Post
+  Post,
+  UseGuards,
+  UseInterceptors
 } from "@nestjs/common";
 import { UserId } from "../common/user-id.decorator";
 import { parseWithSchema } from "../common/zod";
@@ -17,6 +19,7 @@ import { composePlatformEmail } from "../email/email-templates";
 import { LicenseExempt } from "./license-exempt.decorator";
 import {
   adminEmailSchema,
+  adminUnlockSchema,
   assignPlanSchema,
   bulkAssignSchema,
   bulkEndTrialSchema,
@@ -26,20 +29,37 @@ import {
   companyRefSchema,
   createDiscountSchema,
   createGrantSchema,
+  customPlanSchema,
   endTrialSchema,
   sendMessageSchema,
   setDiscountActiveSchema,
   setHoldSchema
 } from "./licensing.schemas";
+import { AdminAuditInterceptor } from "./admin-audit.interceptor";
+import { AdminSessionService } from "./admin-session.service";
 import { CompanyPurgeService } from "./company-purge.service";
+import {
+  computeCustomMonthlyUsd,
+  describeCustomPlan,
+  termsFromRow,
+  type CustomPlanRow,
+  type CustomPlanTerms
+} from "./custom-plan";
 import { LicensingService } from "./licensing.service";
+import { PlatformAdminGuard, SkipAdminSession } from "./platform-admin.guard";
 import { SubscriptionInvoiceService } from "./subscription-invoice.service";
 
 // ════════════════════════════════════════════════════════════════
 // Platform-owner licensing admin. NOT tenant-scoped: these endpoints see and
-// modify every company's plan, so access is limited to the email allowlist
-// in PLATFORM_ADMIN_EMAILS (asserted per-request against the authenticated
-// user — there is no platform-admin role in the tenant model).
+// modify every company's plan, price and access, so they are the monetization
+// surface and are gated by TWO factors (PlatformAdminGuard):
+//
+//   1. the account's email is on PLATFORM_ADMIN_EMAILS, and
+//   2. the request carries an x-admin-session token minted by entering
+//      PLATFORM_ADMIN_SECRET (short-lived, bound to that admin).
+//
+// A stolen Supabase session alone therefore buys nothing here. Every mutation
+// is additionally written to platform_admin_audit by AdminAuditInterceptor.
 // @LicenseExempt so an admin is never blocked by their own company's state.
 // ════════════════════════════════════════════════════════════════
 
@@ -49,6 +69,8 @@ function substituteVars(template: string, vars: Record<string, string>): string 
 }
 
 @LicenseExempt()
+@UseGuards(PlatformAdminGuard)
+@UseInterceptors(AdminAuditInterceptor)
 @Controller("licensing/admin")
 export class LicensingAdminController {
   private readonly logger = new Logger(LicensingAdminController.name);
@@ -58,8 +80,34 @@ export class LicensingAdminController {
     private readonly db: DatabaseService,
     private readonly email: EmailService,
     private readonly invoices: SubscriptionInvoiceService,
-    private readonly purge: CompanyPurgeService
+    private readonly purge: CompanyPurgeService,
+    private readonly sessions: AdminSessionService
   ) {}
+
+  // ── Step-up unlock ───────────────────────────────────────────────────────
+  // Exchanges PLATFORM_ADMIN_SECRET for a short-lived session token. The guard
+  // still enforces the email allowlist here (@SkipAdminSession only waives the
+  // session factor — this route is what issues it). Failed attempts lock the
+  // admin out for a cooling-off period.
+  @SkipAdminSession()
+  @Post("session")
+  async unlock(@UserId() userId: string, @Body() body: unknown) {
+    const { secret } = parseWithSchema(adminUnlockSchema, body);
+    const { token, expiresAt } = this.sessions.unlock(userId, secret);
+    this.logger.log(`Admin area unlocked for user ${userId}.`);
+    return { token, expires_at: expiresAt, ttl_minutes: Math.round(this.sessions.ttlMs / 60_000) };
+  }
+
+  // Whether the caller currently holds a valid session — lets the client show
+  // the unlock prompt without firing a doomed data request first.
+  @SkipAdminSession()
+  @Get("session")
+  session() {
+    return {
+      configured: this.sessions.enabled,
+      ttl_minutes: Math.round(this.sessions.ttlMs / 60_000)
+    };
+  }
 
   // Every company with its plan, state anchors, printer count, and any grant
   // code backing its access. Three query tiers so the area loads on any
@@ -68,7 +116,57 @@ export class LicensingAdminController {
   @Get("overview")
   async overview(@UserId() userId: string) {
     await this.assertPlatformAdmin(userId);
+    return this.withCustomPlans(await this.overviewRows());
+  }
 
+  /**
+   * Attach negotiated custom terms to the overview rows. Done as a separate
+   * lightweight pass rather than a fourth query tier: only companies that
+   * actually have an override are fetched, and a pre-migration DB simply
+   * yields no overrides instead of degrading the whole overview.
+   */
+  private async withCustomPlans(
+    rows: Record<string, unknown>[]
+  ): Promise<Record<string, unknown>[]> {
+    let byCompany = new Map<string, CustomPlanTerms>();
+    try {
+      const { rows: custom } = await this.db.query<{ company_id: string } & CustomPlanRow>(
+        `SELECT company_id, custom_max_printers, custom_price_model, custom_price_amount,
+                custom_bundle_size, custom_billing_basis, custom_label, custom_note
+           FROM company_subscriptions
+          WHERE custom_max_printers IS NOT NULL OR custom_price_model IS NOT NULL`
+      );
+      byCompany = new Map(
+        custom
+          .map((c) => [c.company_id, termsFromRow(c)] as const)
+          .filter((e): e is readonly [string, CustomPlanTerms] => e[1] !== null)
+      );
+    } catch {
+      // custom_* columns not migrated yet — no company has an override.
+    }
+
+    return rows.map((r) => {
+      const terms = byCompany.get(String(r["company_id"]));
+      if (!terms) return { ...r, custom_plan: null };
+      const printerCount = Number(r["printer_count"] ?? 0);
+      return {
+        ...r,
+        custom_plan: {
+          max_printers: terms.maxPrinters,
+          price_model: terms.priceModel,
+          price_amount: terms.priceAmount,
+          bundle_size: terms.bundleSize,
+          billing_basis: terms.billingBasis,
+          label: terms.label,
+          note: terms.note,
+          monthly_usd: computeCustomMonthlyUsd(terms, printerCount),
+          summary: describeCustomPlan(terms, printerCount)
+        }
+      };
+    });
+  }
+
+  private async overviewRows(): Promise<Record<string, unknown>[]> {
     const errCode = (err: unknown) =>
       typeof err === "object" && err !== null ? (err as { code?: string }).code : undefined;
 
@@ -231,6 +329,149 @@ export class LicensingAdminController {
       });
     }
     return this.licensing.getStatus(input.company_id, true);
+  }
+
+  // ── Custom per-company plan ──────────────────────────────────────────────
+  // Layers a bespoke printer cap and/or price on top of whatever catalogue
+  // plan the company is on — the mechanism behind negotiated Enterprise deals
+  // ("Enterprise, capped at 100 printers, $9.08 per printer" or "$69 per
+  // bundle of 10"). Omitted fields are left as they are, so a partial edit
+  // doesn't blank the rest; `clear: true` removes every override and returns
+  // the company to its plan's own terms.
+  //
+  // The price is never computed on the client: the same server-side helper
+  // (custom-plan.ts) that answers this preview also prices the invoice and
+  // resolves the effective cap.
+  @Post("custom-plan")
+  async setCustomPlan(@Body() body: unknown) {
+    const input = parseWithSchema(customPlanSchema, body);
+
+    const company = await this.db.query<{ name: string }>(
+      "SELECT name FROM companies WHERE company_id = $1",
+      [input.company_id]
+    );
+    if (!company.rowCount) throw new NotFoundException("Company not found.");
+
+    // A company that predates licensing may have no subscription row yet.
+    await this.licensing.ensureTrial(input.company_id);
+
+    if (input.clear) {
+      await this.db.query(
+        `UPDATE company_subscriptions
+            SET custom_max_printers = NULL,
+                custom_price_model = NULL,
+                custom_price_amount = NULL,
+                custom_bundle_size = NULL,
+                custom_billing_basis = NULL,
+                custom_label = NULL,
+                custom_note = NULL,
+                limit_exceeded_since = NULL,
+                updated_at = now()
+          WHERE company_id = $1`,
+        [input.company_id]
+      );
+      this.licensing.invalidate(input.company_id);
+      return this.licensing.getStatus(input.company_id, true);
+    }
+
+    // Read the current overrides so an omitted field keeps its value.
+    const { rows: currentRows } = await this.db.query<{
+      custom_max_printers: number | null;
+      custom_price_model: "flat" | "per_printer" | "bundle" | null;
+      custom_price_amount: string | null;
+      custom_bundle_size: number | null;
+      custom_billing_basis: "cap" | "actual" | null;
+      custom_label: string | null;
+      custom_note: string | null;
+    }>(
+      `SELECT custom_max_printers, custom_price_model, custom_price_amount,
+              custom_bundle_size, custom_billing_basis, custom_label, custom_note
+         FROM company_subscriptions WHERE company_id = $1`,
+      [input.company_id]
+    );
+    const cur = currentRows[0];
+    const pick = <T>(next: T | undefined, fallback: T): T => (next === undefined ? fallback : next);
+
+    const maxPrinters = pick(input.max_printers, cur?.custom_max_printers ?? null);
+    const priceModel = pick(input.price_model, cur?.custom_price_model ?? null);
+    const priceAmount = pick(
+      input.price_amount,
+      cur?.custom_price_amount != null ? Number(cur.custom_price_amount) : null
+    );
+    const bundleSize = pick(input.bundle_size, cur?.custom_bundle_size ?? null);
+    const billingBasis = pick(input.billing_basis, cur?.custom_billing_basis ?? "cap");
+    const label = pick(input.label, cur?.custom_label ?? null);
+    const note = pick(input.note, cur?.custom_note ?? null);
+
+    // Mirror the DB CHECK constraints with copy the admin can act on.
+    if (priceModel !== null && (priceAmount === null || !Number.isFinite(priceAmount))) {
+      throw new BadRequestException("Set a price amount for the chosen pricing model.");
+    }
+    if (priceModel === "bundle" && (bundleSize === null || bundleSize < 1)) {
+      throw new BadRequestException("Bundle pricing needs a bundle size (printers per bundle).");
+    }
+    if (maxPrinters === null && priceModel === null) {
+      throw new BadRequestException(
+        "Nothing to save — set a custom printer cap, a custom price, or use Clear."
+      );
+    }
+
+    await this.db.query(
+      `UPDATE company_subscriptions
+          SET custom_max_printers = $2,
+              custom_price_model = $3,
+              custom_price_amount = $4,
+              custom_bundle_size = $5,
+              custom_billing_basis = $6,
+              custom_label = $7,
+              custom_note = $8,
+              limit_exceeded_since = NULL,
+              updated_at = now()
+        WHERE company_id = $1`,
+      [
+        input.company_id,
+        maxPrinters,
+        priceModel,
+        priceAmount,
+        // Only the bundle model uses a size; drop it otherwise so the row
+        // never carries a stale, meaningless value.
+        priceModel === "bundle" ? bundleSize : null,
+        billingBasis,
+        label && label.trim() ? label.trim() : null,
+        note && note.trim() ? note.trim() : null
+      ]
+    );
+
+    this.licensing.invalidate(input.company_id);
+    return this.licensing.getStatus(input.company_id, true);
+  }
+
+  // Live price preview for the custom-plan editor — same math as the invoice,
+  // so what the admin sees while negotiating is exactly what gets billed. Uses
+  // the company's real printer count, which is what an "actual usage" basis
+  // bills on.
+  @Post("custom-plan/preview")
+  async previewCustomPlan(@Body() body: unknown) {
+    const input = parseWithSchema(customPlanSchema, body);
+    const { rows } = await this.db.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM printer_instances WHERE company_id = $1",
+      [input.company_id]
+    );
+    const printerCount = Number(rows[0]?.count ?? 0);
+    const terms: CustomPlanTerms = {
+      maxPrinters: input.max_printers ?? null,
+      priceModel: input.price_model ?? null,
+      priceAmount: input.price_amount ?? null,
+      bundleSize: input.bundle_size ?? null,
+      billingBasis: input.billing_basis ?? "cap",
+      label: input.label ?? null,
+      note: null
+    };
+    return {
+      monthly_usd: computeCustomMonthlyUsd(terms, printerCount),
+      summary: describeCustomPlan(terms, printerCount),
+      printer_count: printerCount
+    };
   }
 
   // Stop a company's trial right now. Trials carry no grace (see
