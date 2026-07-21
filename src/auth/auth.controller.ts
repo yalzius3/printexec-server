@@ -46,6 +46,38 @@ const staffSetupSchema = z.object({
 
 const setupSchema = z.discriminatedUnion("role", [ownerSetupSchema, staffSetupSchema]);
 
+// The engine's canonical IANA zone list (Node 18+). Used to accept a timezone
+// case-insensitively — mirrors the client's canonicalTimezone().
+const IANA_TIMEZONES: string[] = (() => {
+  try {
+    const fn = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf;
+    if (typeof fn === "function") return fn("timeZone");
+  } catch {
+    /* fall through */
+  }
+  return [];
+})();
+
+// Resolve a user-entered timezone to its canonical IANA form, tolerating case
+// and whitespace. Returns null for a missing/blank value OR one that isn't a
+// real zone (the caller distinguishes the two: blank input is allowed, a
+// non-empty value that fails to normalize is a 400).
+function normalizeTimezone(input: string | undefined | null): string | null {
+  const raw = (input ?? "").trim();
+  if (!raw) return null;
+  try {
+    // resolvedOptions().timeZone validates AND canonicalizes: modern engines
+    // accept loose casing and return the proper zone here, throwing only for a
+    // non-zone. (Mirrors the client's canonicalTimezone.)
+    return new Intl.DateTimeFormat(undefined, { timeZone: raw }).resolvedOptions().timeZone;
+  } catch {
+    // Stricter engines throw on bad casing — fall back to a case-insensitive
+    // match against the known zone list.
+    const lower = raw.toLowerCase();
+    return IANA_TIMEZONES.find((z) => z.toLowerCase() === lower) ?? null;
+  }
+}
+
 @Controller("auth")
 export class AuthController {
   private readonly logger = new Logger(AuthController.name);
@@ -642,14 +674,13 @@ export class AuthController {
         throw new BadRequestException("Currency must be a 3-letter ISO code (e.g. EGP, USD, EUR).");
       }
 
-      // (6) timezone must be a valid IANA zone when provided
-      const tz = parsed.data.timezone;
-      if (tz !== undefined && tz !== "") {
-        try {
-          new Intl.DateTimeFormat(undefined, { timeZone: tz });
-        } catch {
-          throw new BadRequestException("Please enter a valid timezone (e.g. Africa/Cairo, Europe/London).");
-        }
+      // (6) timezone must resolve to a real IANA zone when provided — but
+      // leniently: the value is normalized case-insensitively to its canonical
+      // form ("africa/cairo" → "Africa/Cairo") and the canonical form is what
+      // gets stored, so a direct API caller isn't held to exact casing either.
+      const normalizedTimezone = normalizeTimezone(parsed.data.timezone);
+      if (parsed.data.timezone && normalizedTimezone === null) {
+        throw new BadRequestException("Please enter a valid timezone (e.g. Africa/Cairo, Europe/London).");
       }
 
       // (7) company size must be one of the known buckets when provided
@@ -710,7 +741,7 @@ export class AuthController {
             owner.company_size     ?? null,
             owner.tax_id           ?? null,
             owner.currency_default ?? null,
-            owner.timezone         ?? null,
+            normalizedTimezone,
             userId,
             displayName,
             email
