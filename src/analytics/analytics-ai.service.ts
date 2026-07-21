@@ -54,10 +54,10 @@ import type { ZodType } from "zod";
 //   AI_MODEL=…                               required to enable (never hardcoded)
 //   AI_MAX_TOKENS=…                          default 3000 (per round)
 //
-// Spend budget (per-CALENDAR-MONTH USD cap, metered from provider cost /
-// tokens). The cap is internal only — the client is shown a percentage, never
-// the dollar figure:
-//   AI_BUDGET_USD=1  AI_BUDGET_SCOPE=global|company
+// Spend budget (per-CALENDAR-MONTH USD cap PER TENANT, metered from provider
+// cost / tokens). The cap is internal only — the client is shown a percentage,
+// never the dollar figure:
+//   AI_BUDGET_USD=1  AI_BUDGET_SCOPE=company(default)|global
 // Needs migrations/2026-07-15_ai_usage_budget.sql; fails OPEN until applied.
 // ════════════════════════════════════════════════════════════════
 
@@ -597,9 +597,12 @@ export class AnalyticsAiService {
   // ── Spend budget ──────────────────────────────────────────────────────────
   // Per-CALENDAR-MONTH cap on real model cost (USD), metered from the
   // provider's reported per-call cost (OpenRouter usage.cost) or a token-price
-  // estimate, and resetting at the start of each month. Default: $1/month
-  // GLOBAL across the deployment — it guards the owner's provider key, not
-  // per-tenant fairness. AI_BUDGET_SCOPE=company meters each tenant separately;
+  // estimate, and resetting at the start of each month.
+  //
+  // Default: $1/month PER TENANT — every company gets its own independent
+  // allowance, so one heavy workspace can never exhaust everyone else's
+  // Lorelei. AI_BUDGET_SCOPE=global opts into a single shared cap across the
+  // whole deployment (guards the provider key at the cost of fairness);
   // AI_BUDGET_USD=0 disables the cap. The dollar figure is internal: callers
   // surface only a 0–100 percentage (used_pct) to the user, never the amount.
 
@@ -611,7 +614,7 @@ export class AnalyticsAiService {
   }
 
   private budgetScope(): "global" | "company" {
-    return env("AI_BUDGET_SCOPE") === "company" ? "company" : "global";
+    return env("AI_BUDGET_SCOPE") === "global" ? "global" : "company";
   }
 
   /** Token-price fallback; defaults are Claude Sonnet 5 list price ($/1M). */

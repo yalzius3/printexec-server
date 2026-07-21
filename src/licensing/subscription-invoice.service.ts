@@ -1,7 +1,10 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
 import { composeSubscriptionInvoiceEmail } from "../email/email-templates";
+import { renderInvoicePdf } from "../email/invoice-pdf";
+import { DiscountService } from "./discount.service";
 
 // ════════════════════════════════════════════════════════════════
 // SUBSCRIPTION INVOICES
@@ -37,6 +40,8 @@ export interface IssueInvoiceInput {
   amountUsd?: number;
   /** Platform-admin email when an admin triggered it; defaults to 'system'. */
   issuedBy?: string;
+  /** Discount code to apply to this invoice's amount (admin assignment). */
+  discountCode?: string;
 }
 
 interface SubRow {
@@ -59,7 +64,8 @@ export class SubscriptionInvoiceService {
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly email: EmailService
+    private readonly email: EmailService,
+    private readonly discounts: DiscountService
   ) {}
 
   /**
@@ -124,6 +130,31 @@ export class SubscriptionInvoiceService {
     }
     amountUsd = Math.max(0, Math.round(amountUsd * 100) / 100);
 
+    // Apply a discount code, if the admin supplied one. A code that doesn't
+    // apply is reported in the note — never a reason to skip the invoice.
+    let discountCode: string | null = null;
+    let discountAmount: number | null = null;
+    if (input.discountCode && amountUsd > 0) {
+      const { discount, reason } = await this.discounts.resolve(
+        input.discountCode,
+        sub.plan_code,
+        amountUsd,
+        input.companyId
+      );
+      if (discount) {
+        discountCode = discount.code;
+        discountAmount = discount.amountOff;
+        amountUsd = discount.finalAmount;
+        const off =
+          discount.kind === "percent" ? `${discount.value}% off` : `USD ${discount.amountOff.toFixed(2)} off`;
+        note = `Discount ${discount.code} applied — ${off}.`;
+        await this.discounts.recordRedemption(discount.discountId, input.companyId, discount.amountOff);
+      } else if (reason) {
+        this.logger.warn(`invoice for ${input.companyId}: discount not applied — ${reason}`);
+        note = note ? `${note} ${reason}` : reason;
+      }
+    }
+
     const invoiceNumber = await this.mintInvoiceNumber();
     const periodStart = sub.created_at ? new Date(sub.created_at).toISOString() : new Date().toISOString();
     const recipient = (sub.owner_email ?? "").trim() || null;
@@ -134,7 +165,7 @@ export class SubscriptionInvoiceService {
     let emailError: string | null = recipient ? null : "company has no owner email on file";
 
     if (recipient) {
-      const message = composeSubscriptionInvoiceEmail({
+      const invoiceData = {
         invoiceNumber,
         issuedAt: new Date().toISOString(),
         company: {
@@ -152,13 +183,31 @@ export class SubscriptionInvoiceService {
         status: sub.status,
         note,
         appUrl: this.appUrl()
-      });
+      };
+      const message = composeSubscriptionInvoiceEmail(invoiceData);
+
+      // Attach the invoice as a real PDF document. Best-effort: if rendering
+      // fails we still send the email (the HTML invoice is the same content),
+      // because a missing attachment is far better than a missing invoice.
+      let attachments: { filename: string; content: Buffer; contentType: string }[] | undefined;
+      try {
+        const pdf = await renderInvoicePdf(invoiceData);
+        attachments = [
+          { filename: `${invoiceNumber}.pdf`, content: pdf, contentType: "application/pdf" }
+        ];
+      } catch (e) {
+        this.logger.warn(
+          `invoice ${invoiceNumber}: PDF render failed, sending without attachment: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+
       try {
         emailStatus = await this.email.send({
           to: recipient,
           subject: message.subject,
           text: message.text,
-          html: message.html
+          html: message.html,
+          ...(attachments ? { attachments } : {})
         });
       } catch (e) {
         emailStatus = "failed";
@@ -167,28 +216,43 @@ export class SubscriptionInvoiceService {
       }
     }
 
-    // Persist the invoice regardless of email outcome — it's the billing record.
-    await this.db.query(
-      `INSERT INTO subscription_invoices
-         (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
-          source, period_start, period_end, recipient_email, email_status, email_error, note, issued_by)
-       VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [
-        input.companyId,
-        invoiceNumber,
-        sub.plan_code,
-        sub.plan_name ?? sub.plan_code,
-        amountUsd,
-        input.source,
-        periodStart,
-        periodEnd,
-        recipient,
-        emailStatus,
-        emailError,
-        note,
-        input.issuedBy ?? "system"
-      ]
-    );
+    // Persist the invoice regardless of email outcome — it's the billing
+    // record. The discount columns arrive with the 2026-07-21 migration, so a
+    // pre-migration DB falls back to the original column set.
+    const baseValues = [
+      input.companyId,
+      invoiceNumber,
+      sub.plan_code,
+      sub.plan_name ?? sub.plan_code,
+      amountUsd,
+      input.source,
+      periodStart,
+      periodEnd,
+      recipient,
+      emailStatus,
+      emailError,
+      note,
+      input.issuedBy ?? "system"
+    ];
+    try {
+      await this.db.query(
+        `INSERT INTO subscription_invoices
+           (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
+            source, period_start, period_end, recipient_email, email_status, email_error,
+            note, issued_by, discount_code, discount_amount)
+         VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [...baseValues, discountCode, discountAmount]
+      );
+    } catch (e) {
+      if ((e as { code?: string }).code !== "42703") throw e;
+      await this.db.query(
+        `INSERT INTO subscription_invoices
+           (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
+            source, period_start, period_end, recipient_email, email_status, email_error, note, issued_by)
+         VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13)`,
+        baseValues
+      );
+    }
 
     return invoiceNumber;
   }
@@ -230,11 +294,9 @@ export class SubscriptionInvoiceService {
     return `PX-INV-${year}-${String(seq).padStart(5, "0")}`;
   }
 
-  /** App origin for the "view billing" link (same resolution as the notices). */
+  /** App origin for the "view billing" link — the one canonical public app
+   *  address (see email/app-url.ts; never a CORS/preview origin). */
   private appUrl(): string {
-    return (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
-      .split(",")[0]!
-      .trim()
-      .replace(/\/+$/, "");
+    return emailAppUrl();
   }
 }

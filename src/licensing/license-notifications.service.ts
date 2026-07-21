@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
 import {
   composeLicenseNoticeEmail,
@@ -409,13 +410,10 @@ export class LicenseNotificationsService implements OnModuleInit, OnModuleDestro
     }
   }
 
-  /** Platform origin the notice CTA links to (same resolution as the other
-   *  emails). Falls back to the app's production domain, NOT the marketing site. */
+  /** Platform origin the notice CTA links to — the one canonical public app
+   *  address (see email/app-url.ts; never a CORS/preview origin). */
   private appUrl(): string {
-    return (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
-      .split(",")[0]!
-      .trim()
-      .replace(/\/+$/, "");
+    return emailAppUrl();
   }
 
   private readPositiveInt(raw: string | undefined, fallback: number): number {

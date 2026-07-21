@@ -15,7 +15,9 @@ export const assignPlanSchema = z.object({
   company_id: z.string().uuid(),
   plan_code: z.string().trim().min(1).max(40),
   current_period_end: z.string().datetime({ offset: true }).nullable().optional(),
-  status: z.enum(["active", "canceled"]).optional()
+  status: z.enum(["active", "canceled"]).optional(),
+  // Optional discount applied to the invoice this assignment issues.
+  discount_code: z.string().trim().min(3).max(40).optional()
 });
 
 // Admin: stop a company's trial right now. Trials get no grace, so this drops
@@ -63,7 +65,9 @@ export const bulkAssignSchema = z.object({
   company_ids: companyIds,
   plan_code: z.string().trim().min(1).max(40),
   current_period_end: z.string().datetime({ offset: true }).nullable().optional(),
-  status: z.enum(["active", "canceled"]).optional()
+  status: z.enum(["active", "canceled"]).optional(),
+  // Optional discount applied to each invoice this assignment issues.
+  discount_code: z.string().trim().min(3).max(40).optional()
 });
 
 // Bulk: set or lift (hold=null) a moderation hold on many companies.
@@ -99,4 +103,33 @@ export const adminEmailSchema = z.object({
   company_ids: companyIds,
   subject: z.string().trim().min(1).max(200),
   body: z.string().trim().min(1).max(5000)
+});
+
+// ── Discount codes ──────────────────────────────────────────────────────────
+// percent → N% off (0–100); fixed → N USD off. plan_code null = any plan.
+// Codes are stored uppercase and matched case-insensitively.
+export const createDiscountSchema = z
+  .object({
+    code: z
+      .string()
+      .trim()
+      .min(3)
+      .max(40)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9-_]*$/, "Use letters, numbers, - or _ only."),
+    kind: z.enum(["percent", "fixed"]),
+    value: z.number().min(0).max(100000),
+    plan_code: z.string().trim().min(1).max(40).nullable().optional(),
+    description: z.string().trim().max(300).optional(),
+    max_redemptions: z.number().int().min(1).max(100000).nullable().optional(),
+    expires_at: z.string().datetime({ offset: true }).nullable().optional()
+  })
+  .refine((d) => d.kind !== "percent" || d.value <= 100, {
+    message: "A percent discount can't exceed 100.",
+    path: ["value"]
+  });
+
+// Flip a code on/off without losing it or its redemption history.
+export const setDiscountActiveSchema = z.object({
+  discount_id: z.string().uuid(),
+  active: z.boolean()
 });

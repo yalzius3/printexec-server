@@ -4,6 +4,7 @@ import {
   Controller,
   ForbiddenException,
   Get,
+  Logger,
   NotFoundException,
   Param,
   Post
@@ -23,11 +24,14 @@ import {
   bulkHoldSchema,
   bulkMessageSchema,
   companyRefSchema,
+  createDiscountSchema,
   createGrantSchema,
   endTrialSchema,
   sendMessageSchema,
+  setDiscountActiveSchema,
   setHoldSchema
 } from "./licensing.schemas";
+import { CompanyPurgeService } from "./company-purge.service";
 import { LicensingService } from "./licensing.service";
 import { SubscriptionInvoiceService } from "./subscription-invoice.service";
 
@@ -47,11 +51,14 @@ function substituteVars(template: string, vars: Record<string, string>): string 
 @LicenseExempt()
 @Controller("licensing/admin")
 export class LicensingAdminController {
+  private readonly logger = new Logger(LicensingAdminController.name);
+
   constructor(
     private readonly licensing: LicensingService,
     private readonly db: DatabaseService,
     private readonly email: EmailService,
-    private readonly invoices: SubscriptionInvoiceService
+    private readonly invoices: SubscriptionInvoiceService,
+    private readonly purge: CompanyPurgeService
   ) {}
 
   // Every company with its plan, state anchors, printer count, and any grant
@@ -219,7 +226,8 @@ export class LicensingAdminController {
       await this.invoices.issueForSubscription({
         companyId: input.company_id,
         source: "manual",
-        issuedBy: adminEmail
+        issuedBy: adminEmail,
+        ...(input.discount_code ? { discountCode: input.discount_code } : {})
       });
     }
     return this.licensing.getStatus(input.company_id, true);
@@ -313,7 +321,12 @@ export class LicensingAdminController {
     // for a 'canceled' assignment). Sequential to keep invoice numbers ordered.
     if (status !== "canceled") {
       for (const companyId of input.company_ids) {
-        await this.invoices.issueForSubscription({ companyId, source: "manual", issuedBy: adminEmail });
+        await this.invoices.issueForSubscription({
+          companyId,
+          source: "manual",
+          issuedBy: adminEmail,
+          ...(input.discount_code ? { discountCode: input.discount_code } : {})
+        });
       }
     }
     return { ok: true, updated: input.company_ids.length };
@@ -426,26 +439,25 @@ export class LicensingAdminController {
     return { ok: true, updated: res.rowCount };
   }
 
-  // Soft-delete: full lockout + hidden by default, all data retained. Reversible
-  // via /restore. current_period_end is left untouched so restore returns the
-  // company to exactly its prior billing state.
+  // PERMANENT delete. Removes the company and every row belonging to it, plus
+  // the sign-in account of any member left with no other workspace — so the
+  // tenant stops appearing in this console and a re-signup on the same email
+  // is a clean new company instead of a duplicate. Irreversible; the UI gates
+  // it behind a type-the-name confirmation.
   @Post("delete")
-  async softDelete(@UserId() userId: string, @Body() body: unknown) {
+  async deleteCompany(@UserId() userId: string, @Body() body: unknown) {
     const adminEmail = await this.assertPlatformAdmin(userId);
     const input = parseWithSchema(companyRefSchema, body);
 
-    const res = await this.db.query(
-      `UPDATE companies
-         SET deleted_at = COALESCE(deleted_at, now()),
-             deleted_by = $2,
-             admin_hold_reason = COALESCE($3, admin_hold_reason)
-       WHERE company_id = $1`,
-      [input.company_id, adminEmail, input.reason ?? null]
-    );
-    if (!res.rowCount) throw new NotFoundException("Company not found.");
+    const result = await this.purge.purge(input.company_id);
+    if (!result) throw new NotFoundException("Company not found.");
 
     this.licensing.invalidate(input.company_id);
-    return { ok: true };
+    this.logger.warn(
+      `platform admin ${adminEmail} permanently deleted company ${input.company_id} ("${result.company_name}")` +
+        (input.reason ? ` — reason: ${input.reason}` : "")
+    );
+    return result;
   }
 
   // Restore a soft-deleted company.
@@ -737,6 +749,87 @@ export class LicensingAdminController {
 
     if (affectedCompany) this.licensing.invalidate(affectedCompany);
     return { ok: true };
+  }
+
+  // ── Discount codes ───────────────────────────────────────────────────────
+  // Unlike grant codes (which hand over a plan for free), a discount only
+  // reduces the amount billed on the invoice an activation issues.
+
+  @Get("discounts")
+  async listDiscounts(@UserId() userId: string) {
+    await this.assertPlatformAdmin(userId);
+    try {
+      const { rows } = await this.db.query(
+        `SELECT d.discount_id, d.code, d.kind, d.value, d.plan_code,
+                p.display_name AS plan_name, d.description, d.max_redemptions,
+                d.expires_at, d.active, d.created_by, d.created_at,
+                (SELECT count(*)::int FROM discount_redemptions r
+                  WHERE r.discount_id = d.discount_id) AS redemptions
+           FROM discount_codes d
+           LEFT JOIN plans p ON p.plan_code = d.plan_code
+          ORDER BY d.created_at DESC`
+      );
+      return rows;
+    } catch (err) {
+      // discount_codes not migrated yet — the tab renders empty, not broken.
+      if ((err as { code?: string }).code === "42P01") return [];
+      throw err;
+    }
+  }
+
+  @Post("discounts")
+  async createDiscount(@UserId() userId: string, @Body() body: unknown) {
+    const adminEmail = await this.assertPlatformAdmin(userId);
+    const input = parseWithSchema(createDiscountSchema, body);
+
+    if (input.plan_code) {
+      const plan = await this.db.query("SELECT 1 FROM plans WHERE plan_code = $1", [input.plan_code]);
+      if (!plan.rowCount) throw new BadRequestException("Unknown plan code.");
+    }
+
+    try {
+      const { rows } = await this.db.query(
+        `INSERT INTO discount_codes
+           (code, kind, value, plan_code, description, max_redemptions, expires_at, created_by)
+         VALUES (upper($1), $2, $3, $4, $5, $6, $7, $8)
+         RETURNING discount_id, code, kind, value, plan_code, description,
+                   max_redemptions, expires_at, active, created_by, created_at`,
+        [
+          input.code,
+          input.kind,
+          input.value,
+          input.plan_code ?? null,
+          input.description ?? null,
+          input.max_redemptions ?? null,
+          input.expires_at ?? null,
+          adminEmail
+        ]
+      );
+      return { ...rows[0], redemptions: 0 };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "23505") throw new BadRequestException("That discount code already exists.");
+      if (code === "42P01") {
+        throw new BadRequestException(
+          "Discount codes need migrations/2026-07-21_discount_codes.sql applied first."
+        );
+      }
+      throw err;
+    }
+  }
+
+  // Switch a code on/off. Kept rather than deleted so past redemptions stay
+  // explainable on the invoices that used them.
+  @Post("discounts/active")
+  async setDiscountActive(@UserId() userId: string, @Body() body: unknown) {
+    await this.assertPlatformAdmin(userId);
+    const input = parseWithSchema(setDiscountActiveSchema, body);
+    const res = await this.db.query(
+      "UPDATE discount_codes SET active = $2 WHERE discount_id = $1",
+      [input.discount_id, input.active]
+    );
+    if (!res.rowCount) throw new NotFoundException("Discount code not found.");
+    return { ok: true, active: input.active };
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────

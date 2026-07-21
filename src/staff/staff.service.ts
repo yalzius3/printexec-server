@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
 import { composeStaffInviteEmail } from "../email/email-templates";
 
@@ -214,12 +215,9 @@ export class StaffService {
       throw new BadRequestException("This invite code has expired — create a new one.");
     }
 
-    // Same public-origin resolution as the customer-email logo URL: the invite
-    // CTA must open the APP (join flow), not the marketing site.
-    const appUrl = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
-      .split(",")[0]!
-      .trim()
-      .replace(/\/+$/, "");
+    // The invite CTA must open the APP (join flow), not the marketing site —
+    // and never a CORS/preview origin. See email/app-url.ts.
+    const appUrl = emailAppUrl();
 
     const message = composeStaffInviteEmail({
       companyName: invite.company_name,

@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { emailAppUrl } from "./app-url";
 import { EmailService } from "./email.service";
 import {
   composeOrderCompletionEmail,
@@ -280,14 +281,11 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
       );
       const stored = res.rows[0]?.logo_url;
       if (!stored) return null;
-      // Prefer an explicit public app origin; fall back to the (first) CORS
-      // origin, then the deployed APP origin. NEVER the marketing site — it has
-      // no /api proxy, so a logo URL built on it 404s and the email header
-      // silently renders blank. Trailing slashes trimmed.
-      const origin = (process.env.PUBLIC_APP_URL || process.env.ALLOWED_ORIGIN || "https://solution.printexec.xyz")
-        .split(",")[0]!
-        .trim()
-        .replace(/\/+$/, "");
+      // The one canonical public app origin (see email/app-url.ts). NEVER the
+      // marketing site — it has no /api proxy, so a logo URL built on it 404s
+      // and the email header silently renders blank — and never a pinned
+      // preview origin, which goes stale.
+      const origin = emailAppUrl();
       // Cache-bust on the stored filename so a logo change is picked up despite
       // the stable /logo/:id path (email clients cache images hard).
       const filename = stored.split("/").pop() ?? "";

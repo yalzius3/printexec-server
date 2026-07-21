@@ -23,6 +23,15 @@ import { Resend } from "resend";
 // send() returns the outcome the caller records; a thrown error from deliver()
 // is surfaced so the caller can leave the order un-recorded and retry next sweep.
 // ════════════════════════════════════════════════════════════════
+/** A file to ride along with the message (e.g. an invoice PDF). */
+export type EmailAttachment = {
+  /** Filename the recipient sees, e.g. "PX-INV-2026-00042.pdf". */
+  filename: string;
+  content: Buffer;
+  /** MIME type; defaults to application/octet-stream at the provider. */
+  contentType?: string;
+};
+
 export type EmailMessage = {
   to: string;
   subject: string;
@@ -30,6 +39,8 @@ export type EmailMessage = {
   text: string;
   /** Optional branded HTML body. When present it's the primary rendering. */
   html?: string;
+  /** Optional file attachments. */
+  attachments?: EmailAttachment[];
 };
 
 export type EmailSendResult = "sent" | "dry_run";
@@ -66,8 +77,13 @@ export class EmailService {
    */
   async send(message: EmailMessage): Promise<EmailSendResult> {
     if (!this.enabled) {
+      const files = message.attachments?.length
+        ? ` [+${message.attachments.length} attachment(s): ${message.attachments
+            .map((a) => `${a.filename} ${(a.content.length / 1024).toFixed(1)}KB`)
+            .join(", ")}]`
+        : "";
       this.logger.log(
-        `[dry-run] would email (from ${this.from}) → ${message.to} — "${message.subject}"\n${message.text}`
+        `[dry-run] would email (from ${this.from}) → ${message.to} — "${message.subject}"${files}\n${message.text}`
       );
       return "dry_run";
     }
@@ -97,7 +113,17 @@ export class EmailService {
       subject: message.subject,
       // Both parts: branded HTML when present, plain text always as fallback.
       ...(message.html ? { html: message.html } : {}),
-      text: message.text
+      text: message.text,
+      // Resend takes attachment bytes as `content` (Buffer or base64 string).
+      ...(message.attachments?.length
+        ? {
+            attachments: message.attachments.map((a) => ({
+              filename: a.filename,
+              content: a.content,
+              ...(a.contentType ? { contentType: a.contentType } : {})
+            }))
+          }
+        : {})
     });
 
     if (error) {

@@ -1,5 +1,7 @@
 import { Global, Module } from "@nestjs/common";
 import { EmailModule } from "../email/email.module";
+import { CompanyPurgeService } from "./company-purge.service";
+import { DiscountService } from "./discount.service";
 import { LicenseNotificationsService } from "./license-notifications.service";
 import { LicensingAdminController } from "./licensing-admin.controller";
 import { LicensingController } from "./licensing.controller";
@@ -20,7 +22,9 @@ import { SubscriptionInvoiceService } from "./subscription-invoice.service";
     LicensingService,
     PaymentsService,
     LicenseNotificationsService,
-    SubscriptionInvoiceService
+    SubscriptionInvoiceService,
+    CompanyPurgeService,
+    DiscountService
   ],
   exports: [LicensingService, PaymentsService, SubscriptionInvoiceService]
 })
