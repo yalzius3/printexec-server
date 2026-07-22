@@ -49,6 +49,7 @@ import {
   updateVendorSchema,
   vendorIdParamSchema
 } from "./finance.schemas";
+import { InvoiceNotificationsService } from "../email/invoice-notifications.service";
 import { FinanceService } from "./finance.service";
 import { FinanceReportsService } from "./finance-reports.service";
 import { FinanceCostingService } from "./finance-costing.service";
@@ -58,7 +59,8 @@ export class FinanceController {
   constructor(
     private readonly financeService: FinanceService,
     private readonly reportsService: FinanceReportsService,
-    private readonly costingService: FinanceCostingService
+    private readonly costingService: FinanceCostingService,
+    private readonly invoiceEmails: InvoiceNotificationsService
   ) {}
 
   // ── Dashboard ──────────────────────────────────────────────────────────────
@@ -354,6 +356,30 @@ export class FinanceController {
   ) {
     const { invoiceId } = parseWithSchema(invoiceIdParamSchema, params);
     return this.financeService.voidInvoice(companyId, userId, invoiceId);
+  }
+
+  // ── Invoice → customer email ───────────────────────────────────────────────
+  // Issuing an invoice emails it automatically (FinanceService.issueInvoice).
+  // These two exist for what automation can't decide: showing the operator
+  // whether it actually reached the customer, and sending it again.
+
+  // Readable by anyone who can see finance — it's delivery status, not money.
+  @Get("invoices/:invoiceId/email")
+  @RequirePermission("view_finance")
+  getInvoiceEmailState(@CompanyId() companyId: string, @Param() params: unknown) {
+    const { invoiceId } = parseWithSchema(invoiceIdParamSchema, params);
+    return this.invoiceEmails.getEmailState(companyId, invoiceId);
+  }
+
+  // Cross-module flow, same reasoning as invoices/from-order: order staff who
+  // raised the bill need to be able to re-send it without finance rights.
+  @Post("invoices/:invoiceId/email")
+  @RequirePermission(["action_finance", "action_orders"])
+  async resendInvoiceEmail(@CompanyId() companyId: string, @Param() params: unknown) {
+    const { invoiceId } = parseWithSchema(invoiceIdParamSchema, params);
+    const outcome = await this.invoiceEmails.resendForInvoice(companyId, invoiceId);
+    // Reflect the stored row back, so the UI updates from one source of truth.
+    return { outcome, ...(await this.invoiceEmails.getEmailState(companyId, invoiceId)) };
   }
 
   // ── Bills ──────────────────────────────────────────────────────────────────

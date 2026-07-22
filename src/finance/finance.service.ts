@@ -8,6 +8,12 @@ import type { PoolClient } from "pg";
 import type { z } from "zod";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService } from "../database/database.service";
+import { InvoiceNotificationsService } from "../email/invoice-notifications.service";
+import {
+  BUMP_DOC_SEQUENCE_SQL,
+  type DocType,
+  formatDocNumber
+} from "../numbering/document-number";
 import { OrderCostingService } from "../orders/order-costing";
 import { buildOrderInvoiceLines } from "../orders/order-invoice-lines";
 import type {
@@ -62,14 +68,6 @@ function fromCents(c: number): number {
   return Math.round(c) / 100;
 }
 
-const DOC_PREFIX: Record<string, string> = {
-  invoice: "INV",
-  bill: "BILL",
-  payment: "PAY",
-  expense: "EXP",
-  journal: "JE"
-};
-
 type JournalLineSpec = {
   accountId: string;
   debit: number; // cents
@@ -84,33 +82,32 @@ export class FinanceService {
     // Prices an order exactly as the Orders UI does, so an invoice generated
     // from an order matches the quoted total and its COGS basis is the order's
     // real cost.
-    private readonly orderCosting: OrderCostingService
+    private readonly orderCosting: OrderCostingService,
+    // Emails the customer their invoice once it's issued. Called AFTER the
+    // issuing transaction commits and it never throws — a mail problem must
+    // never roll back a posted journal entry.
+    private readonly invoiceEmails: InvoiceNotificationsService
   ) {}
 
   // ── Numbering + posting primitives ────────────────────────────────────────
 
   // Mint the next business number for a document type: INV-2026-00042.
-  // Same atomic upsert-counter pattern as order numbers.
+  // The counter SQL and the format both come from numbering/document-number.ts,
+  // which NumberingService also previews and repositions from — so "the next
+  // invoice will be X" in Company settings is the string minted here.
   private async nextDocNumber(
     client: PoolClient,
     companyId: string,
-    docType: keyof typeof DOC_PREFIX,
+    docType: DocType,
     onDate: string
   ): Promise<string> {
     const year = Number(onDate.slice(0, 4));
     const result = await this.databaseService.query<{ last_value: string }>(
-      `
-        INSERT INTO finance_doc_sequences (company_id, doc_type, year, last_value)
-        VALUES ($1, $2, $3, 1)
-        ON CONFLICT (company_id, doc_type, year)
-        DO UPDATE SET last_value = finance_doc_sequences.last_value + 1
-        RETURNING last_value
-      `,
+      BUMP_DOC_SEQUENCE_SQL,
       [companyId, docType, year],
       client
     );
-    const seq = String(result.rows[0]!.last_value).padStart(5, "0");
-    return `${DOC_PREFIX[docType]}-${year}-${seq}`;
+    return formatDocNumber(docType, year, Number(result.rows[0]!.last_value));
   }
 
   // Resolve the tenant's system account for a posting role (e.g. "the" A/R).
@@ -1219,7 +1216,31 @@ export class FinanceService {
 
   // Issue = post to the ledger: DR A/R total, CR revenue per line account,
   // CR sales-tax payable. The invoice becomes collectible (open).
+  //
+  // Issuing is also what sends the customer their bill: once posted, the
+  // document is immutable (void + reissue is the only way back), so it's the
+  // first moment the numbers are final. The send happens AFTER commit and
+  // cannot throw — see the note on the emailInvoiceAfterIssue call below.
   async issueInvoice(companyId: string, userId: string, invoiceId: string) {
+    const issued = await this.postIssue(companyId, userId, invoiceId);
+    await this.emailInvoiceAfterIssue(companyId, invoiceId);
+    return issued;
+  }
+
+  /**
+   * Email the freshly issued invoice to the customer.
+   *
+   * Deliberately awaited rather than fired-and-forgotten: an unawaited promise
+   * here would let the request finish (and, on a scale-to-zero host, the
+   * process idle out) mid-send. sendForInvoice never throws and never opens a
+   * transaction, so the only cost is the request waiting on the transport —
+   * and if it does fail, InvoiceNotificationsService's sweep retries it.
+   */
+  private async emailInvoiceAfterIssue(companyId: string, invoiceId: string): Promise<void> {
+    await this.invoiceEmails.sendForInvoice(companyId, invoiceId, "invoice_issued");
+  }
+
+  private async postIssue(companyId: string, userId: string, invoiceId: string) {
     return this.databaseService.transaction(async (client) => {
       const invoice = await this.databaseService.query<{
         status: string;

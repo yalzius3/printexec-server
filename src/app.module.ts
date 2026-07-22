@@ -13,6 +13,7 @@ import { BedsModule } from "./beds/beds.module";
 import { JobsModule } from "./jobs/jobs.module";
 import { LicensingModule } from "./licensing/licensing.module";
 import { MaintenanceModule } from "./maintenance/maintenance.module";
+import { NumberingModule } from "./numbering/numbering.module";
 import { OrderAttachmentsModule } from "./order-attachments/order-attachments.module";
 import { OrderPiecesModule } from "./order-pieces/order-pieces.module";
 import { OrdersModule } from "./orders/orders.module";
@@ -38,6 +39,7 @@ import { LicenseGuard } from "./licensing/license.guard";
     JobsModule,
     LicensingModule,
     MaintenanceModule,
+    NumberingModule,
     OrderAttachmentsModule,
     OrderPiecesModule,
     OrdersModule,

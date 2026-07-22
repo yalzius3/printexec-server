@@ -877,3 +877,282 @@ export function composeSubscriptionInvoiceEmail(data: SubscriptionInvoiceEmailDa
 
   return { subject, text, html: platformShellHtml(subject, inner) };
 }
+
+// ════════════════════════════════════════════════════════════════
+// CUSTOMER INVOICE — the tenant bills THEIR customer
+//
+// Sent when a shop issues an invoice (see invoice-notifications.service.ts).
+// The issuer is the SHOP, not PrintExec: it uses the same tenant-branded shell
+// as the order-completion email (company logo header, PrintExec only in the
+// footer strip), never the platform shell that composeSubscriptionInvoiceEmail
+// uses for PrintExec's own billing.
+//
+// The lines and totals are repeated in the body rather than left to the PDF
+// alone: plenty of people read the mail on a phone and never open an
+// attachment, and a bill they can't read is a bill they don't pay.
+// ════════════════════════════════════════════════════════════════
+
+export type CustomerInvoiceLine = {
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+};
+
+export type CustomerInvoiceEmailData = {
+  company: {
+    name: string;
+    slogan: string | null;
+    phone: string | null;
+    email: string | null;
+    website: string | null;
+    city: string | null;
+    countryCode: string | null;
+    logoUrl: string | null;
+  };
+  customer: {
+    displayName: string;
+    contactName: string | null;
+    email: string | null;
+    phone: string | null;
+    isBusiness: boolean;
+  };
+  invoice: {
+    number: string;
+    issueDate: string | Date | null;
+    dueDate: string | Date | null;
+    currency: string | null;
+    lines: CustomerInvoiceLine[];
+    subtotal: number;
+    taxTotal: number;
+    total: number;
+    amountPaid: number;
+    balanceDue: number;
+    memo: string | null;
+    terms: string | null;
+    orderNumber: string | null;
+    orderTitle: string | null;
+  };
+};
+
+/** Quantities are NUMERIC(12,3) — hide the decimals when they say nothing. */
+function formatQuantity(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Math.round(value * 1000) / 1000);
+}
+
+function invoiceLineRowHtml(line: CustomerInvoiceLine, currency: string | null): string {
+  const qty = formatQuantity(line.quantity);
+  const unit = formatMoney(line.unitPrice, null) ?? "";
+  return (
+    `<tr>` +
+    `<td style="padding:9px 0;border-bottom:1px solid #e7e5e4;font-family:${SANS};font-size:13.5px;color:${INK};vertical-align:top;">` +
+      `${esc(line.description)}` +
+      `<br/><span style="font-family:${MONO};font-size:11px;color:${SUBTLE};">${esc(qty)} × ${esc(unit)}</span>` +
+    `</td>` +
+    `<td align="right" style="padding:9px 0 9px 14px;border-bottom:1px solid #e7e5e4;font-family:${SANS};` +
+      `font-size:13.5px;color:${INK};white-space:nowrap;vertical-align:top;">` +
+      `${esc(formatMoney(line.amount, currency) ?? "")}</td>` +
+    `</tr>`
+  );
+}
+
+function invoiceTotalRowHtml(label: string, value: string, strong: boolean): string {
+  const weight = strong ? "800" : "400";
+  const size = strong ? "16px" : "13.5px";
+  const color = strong ? INK : SUBTLE;
+  const border = strong ? `border-top:1px solid ${INK};` : "";
+  return (
+    `<tr>` +
+    `<td style="padding:8px 0;${border}font-family:${SANS};font-size:13px;font-weight:${strong ? "700" : "400"};` +
+      `color:${color};text-transform:uppercase;letter-spacing:0.04em;">${esc(label)}</td>` +
+    `<td align="right" style="padding:8px 0 8px 14px;${border}font-family:${SANS};font-size:${size};` +
+      `font-weight:${weight};color:${INK};white-space:nowrap;">${esc(value)}</td>` +
+    `</tr>`
+  );
+}
+
+function buildCustomerInvoiceText(data: CustomerInvoiceEmailData): string {
+  const { company, customer, invoice } = data;
+  const greetingName = customer.contactName || customer.displayName || "there";
+  const money = (v: number) => formatMoney(v, invoice.currency) ?? String(v);
+
+  const header: string[] = [row("Invoice", invoice.number)];
+  const issued = formatDate(invoice.issueDate);
+  if (issued) header.push(row("Issued", issued));
+  const due = formatDate(invoice.dueDate);
+  if (due) header.push(row("Due", due));
+  if (invoice.orderNumber) header.push(row("Order", invoice.orderNumber));
+  if (invoice.orderTitle) header.push(row("Job", invoice.orderTitle));
+
+  const items = invoice.lines.map(
+    (l) =>
+      `  ${l.description}\n` +
+      `    ${formatQuantity(l.quantity)} × ${formatMoney(l.unitPrice, null)}` +
+      `   =   ${formatMoney(l.amount, invoice.currency)}`
+  );
+
+  const totals: string[] = [row("Subtotal", money(invoice.subtotal))];
+  if (invoice.taxTotal > 0) totals.push(row("Tax", money(invoice.taxTotal)));
+  totals.push(row("Total", money(invoice.total)));
+  if (invoice.amountPaid > 0) {
+    totals.push(row("Paid", `- ${money(invoice.amountPaid)}`));
+    totals.push(row("Balance due", money(invoice.balanceDue)));
+  }
+
+  const notes = [invoice.terms, invoice.memo].filter(
+    (n): n is string => !!n && n.trim().length > 0
+  );
+
+  const contactLines: string[] = [`  ${company.name}`];
+  if (company.phone) contactLines.push(`  ${company.phone}`);
+  if (company.email) contactLines.push(`  ${company.email}`);
+  if (company.website) contactLines.push(`  ${company.website}`);
+
+  return [
+    company.name.toUpperCase(),
+    ``,
+    `Hi ${greetingName},`,
+    ``,
+    `Here is your invoice from ${company.name}. The full document is attached as a PDF.`,
+    ``,
+    `Invoice`,
+    `───────`,
+    ...header,
+    ``,
+    `Items`,
+    `─────`,
+    ...items,
+    ``,
+    ...totals,
+    ...(notes.length > 0 ? [``, `Notes`, `─────`, ...notes.map((n) => `  ${n}`)] : []),
+    ``,
+    `This invoice was sent from an unmonitored address — please don't reply.`,
+    `For anything about this invoice, contact us directly:`,
+    ...contactLines,
+    ``,
+    `Thank you for your business.`,
+    ``,
+    `—`,
+    `Sent with PrintExec · ${SITE_URL}`
+  ].join("\n");
+}
+
+function buildCustomerInvoiceHtml(data: CustomerInvoiceEmailData): string {
+  const { company, customer, invoice } = data;
+  const greetingName = customer.contactName || customer.displayName || "there";
+  const money = (v: number) => formatMoney(v, invoice.currency) ?? String(v);
+
+  const meta: string[] = [summaryRowHtml("Invoice", invoice.number)];
+  const issued = formatDate(invoice.issueDate);
+  if (issued) meta.push(summaryRowHtml("Issued", issued));
+  const due = formatDate(invoice.dueDate);
+  if (due) meta.push(summaryRowHtml("Due", due));
+  if (invoice.orderNumber) meta.push(summaryRowHtml("Order", invoice.orderNumber));
+  if (invoice.orderTitle) meta.push(summaryRowHtml("Job", invoice.orderTitle));
+  meta.push(summaryRowHtml("Billed to", customer.displayName));
+
+  const totals: string[] = [invoiceTotalRowHtml("Subtotal", money(invoice.subtotal), false)];
+  if (invoice.taxTotal > 0) totals.push(invoiceTotalRowHtml("Tax", money(invoice.taxTotal), false));
+  totals.push(invoiceTotalRowHtml("Total", money(invoice.total), true));
+  if (invoice.amountPaid > 0) {
+    totals.push(invoiceTotalRowHtml("Paid", `- ${money(invoice.amountPaid)}`, false));
+    totals.push(invoiceTotalRowHtml("Balance due", money(invoice.balanceDue), true));
+  }
+
+  const notes = [invoice.terms, invoice.memo].filter(
+    (n): n is string => !!n && n.trim().length > 0
+  );
+
+  const contactBits: string[] = [];
+  if (company.phone) contactBits.push(esc(company.phone));
+  if (company.email) contactBits.push(esc(company.email));
+  if (company.website) contactBits.push(esc(company.website));
+  const contactLine = contactBits.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
+
+  // The headline figure: what they still owe if partly paid, else the total.
+  const headline = invoice.amountPaid > 0 ? money(invoice.balanceDue) : money(invoice.total);
+  const headlineLabel = invoice.amountPaid > 0 ? "Balance due" : "Amount due";
+
+  return [
+    `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;opacity:0;">` +
+      `Invoice ${esc(invoice.number)} from ${esc(company.name)} — ${esc(headline)}</div>`,
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f5;margin:0;padding:0;">`,
+    `<tr><td align="center" style="padding:24px 12px;">`,
+    `<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background:${PAPER};border:1px solid ${INK};">`,
+
+    // ── Header: same fixed-height logo bar as the order emails ──
+    `<tr><td style="background:${PAPER};border-bottom:2px solid ${INK};padding:18px 24px;" align="right">` +
+      (company.logoUrl
+        ? `<img src="${company.logoUrl}" alt="${esc(company.name)}" height="28" ` +
+            `style="display:inline-block;height:28px;max-height:28px;width:auto;max-width:200px;border:0;outline:none;" />`
+        : `<div style="height:28px;line-height:28px;">&nbsp;</div>`) +
+      `</td></tr>`,
+
+    // ── Headline: who it's from, and the one number that matters ──
+    `<tr><td style="padding:30px 28px 6px;font-family:${SANS};color:${INK};">` +
+      `<p style="margin:0 0 14px;font-size:15px;">Hi ${esc(greetingName)},</p>` +
+      `<p style="margin:0 0 18px;font-size:20px;font-weight:700;line-height:1.3;">` +
+        `Your invoice from ${esc(company.name)}.</p>` +
+      `<div style="font-family:${MONO};font-size:11px;font-weight:700;letter-spacing:0.14em;` +
+        `text-transform:uppercase;color:${SUBTLE};">${esc(headlineLabel)}</div>` +
+      `<div style="font-family:${SANS};font-size:30px;font-weight:800;letter-spacing:-0.02em;color:${INK};` +
+        `line-height:1.15;margin-top:4px;">${esc(headline)}</div>` +
+      `</td></tr>`,
+
+    // ── Invoice meta ──
+    `<tr><td style="padding:22px 28px 4px;font-family:${SANS};">` +
+      `<div style="font-family:${MONO};font-size:11px;font-weight:700;letter-spacing:0.16em;` +
+        `text-transform:uppercase;color:${INK};border-bottom:1px solid ${INK};padding-bottom:8px;margin-bottom:6px;">Invoice</div>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${meta.join("")}</table>` +
+      `</td></tr>`,
+
+    // ── Line items + totals ──
+    `<tr><td style="padding:18px 28px 6px;font-family:${SANS};">` +
+      `<div style="font-family:${MONO};font-size:11px;font-weight:700;letter-spacing:0.16em;` +
+        `text-transform:uppercase;color:${INK};border-bottom:1px solid ${INK};padding-bottom:8px;margin-bottom:2px;">Items</div>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">` +
+        invoice.lines.map((l) => invoiceLineRowHtml(l, invoice.currency)).join("") +
+      `</table>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:6px;">` +
+        totals.join("") +
+      `</table>` +
+      `</td></tr>`,
+
+    // ── Notes ──
+    notes.length > 0
+      ? `<tr><td style="padding:14px 28px 0;font-family:${SANS};font-size:13px;color:${SUBTLE};line-height:1.6;">` +
+          notes.map((n) => `<p style="margin:0 0 8px;">${esc(n)}</p>`).join("") +
+          `</td></tr>`
+      : ``,
+
+    // ── Attachment note + company contact / no-reply ──
+    `<tr><td style="padding:18px 28px 24px;font-family:${SANS};font-size:13px;color:${SUBTLE};line-height:1.6;">` +
+      `<p style="margin:0 0 10px;color:${INK};">A PDF copy of this invoice is attached to this email.</p>` +
+      `<p style="margin:0 0 10px;">This invoice was sent from an unmonitored address — please don't reply.</p>` +
+      `<p style="margin:0 0 4px;color:${INK};font-weight:700;">${esc(company.name)}</p>` +
+      (contactLine ? `<p style="margin:0;">${contactLine}</p>` : ``) +
+      `<p style="margin:14px 0 0;color:${INK};">Thank you for your business.</p>` +
+      `</td></tr>`,
+
+    // ── Footer: the shared hosted PNG strip (see composeOrderCompletionEmail) ──
+    `<tr><td bgcolor="${INK}" style="background:${INK};font-size:0;line-height:0;padding:0;">` +
+      `<a href="${SITE_URL}" target="_blank" rel="noopener" style="display:block;text-decoration:none;">` +
+        `<img src="${FOOTER_IMG_URL}" alt="PrintExec — printexec.xyz" width="600" height="77" ` +
+          `style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none;" />` +
+      `</a>` +
+      `</td></tr>`,
+
+    `</table>`,
+    `</td></tr>`,
+    `</table>`
+  ].join("");
+}
+
+export function composeCustomerInvoiceEmail(data: CustomerInvoiceEmailData): ComposedEmail {
+  const subject = `Invoice ${data.invoice.number} from ${data.company.name}`;
+  return {
+    subject,
+    text: buildCustomerInvoiceText(data),
+    html: buildCustomerInvoiceHtml(data)
+  };
+}
