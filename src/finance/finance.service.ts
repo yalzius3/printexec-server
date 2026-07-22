@@ -1528,6 +1528,92 @@ export class FinanceService {
 
   // ── Bills (AP) ────────────────────────────────────────────────────────────
 
+  // Inventory intake (spools, spare parts) stamps the created asset UUIDs into
+  // bills.vendor_reference — "Spool <uuid>, <uuid>". Raw UUIDs are unreadable
+  // and dead-end, so every bill read resolves them to the asset's display name
+  // + kind, which the UI turns into a link straight to the asset's detail
+  // window. Deliberately done on READ (not stamped at write time) so bills
+  // recorded before this existed light up too, and so a renamed spool stays
+  // in sync. Unresolvable ids (asset deleted) simply don't come back — the
+  // client falls back to the reference code.
+  private static readonly UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+  private async resolveReferencedAssets(companyId: string, references: (string | null)[]) {
+    const ids = new Set<string>();
+    for (const ref of references) {
+      for (const id of ref?.match(FinanceService.UUID_IN_TEXT) ?? []) ids.add(id.toLowerCase());
+    }
+    if (ids.size === 0) return new Map<string, { asset_id: string; kind: string; label: string }>();
+
+    const rows = await this.databaseService.query<{
+      asset_id: string;
+      asset_type: "filament_spool" | "nozzle" | "resin_tank" | "spare_part";
+      nozzle_name: string | null;
+      nozzle_brand: string | null;
+      nozzle_material: string | null;
+      nozzle_diameter_mm: string | null;
+      spare_part_name: string | null;
+      spare_part_brand: string | null;
+      resin_brand: string | null;
+      resin_type: string | null;
+      resin_color: string | null;
+      filament_brand: string | null;
+      filament_material_type: string | null;
+      filament_color: string | null;
+    }>(
+      `
+        SELECT ai.asset_id, ai.asset_type,
+               ai.nozzle_name, ai.nozzle_brand, ai.nozzle_material, ai.nozzle_diameter_mm,
+               ai.spare_part_name, ai.spare_part_brand,
+               ai.resin_brand, ai.resin_type, ai.resin_color,
+               fr.brand AS filament_brand,
+               fr.material_type AS filament_material_type,
+               fr.color AS filament_color
+          FROM asset_instances ai
+          LEFT JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
+         WHERE ai.company_id = $1 AND ai.asset_id = ANY($2::uuid[])
+      `,
+      [companyId, Array.from(ids)]
+    );
+
+    // Mirrors AssetsService.buildAssetName — kept local because assets.service
+    // already depends on FinanceService (importing it back would be a cycle).
+    const join = (...parts: (string | null)[]) => parts.filter(Boolean).join(" ").trim();
+    const map = new Map<string, { asset_id: string; kind: string; label: string }>();
+    for (const a of rows.rows) {
+      let kind = "filament";
+      let label = "Asset";
+      if (a.asset_type === "filament_spool") {
+        label = join(a.filament_brand, a.filament_material_type, a.filament_color) || "Filament spool";
+      } else if (a.asset_type === "nozzle") {
+        kind = "nozzle";
+        label =
+          a.nozzle_name ||
+          join(a.nozzle_brand, a.nozzle_material, a.nozzle_diameter_mm ? `${a.nozzle_diameter_mm}mm` : null, "Nozzle");
+      } else if (a.asset_type === "spare_part") {
+        kind = "spare";
+        label = join(a.spare_part_brand, a.spare_part_name) || "Spare part";
+      } else {
+        kind = "resin";
+        label = join(a.resin_brand, a.resin_type, a.resin_color, "Tank") || "Resin tank";
+      }
+      map.set(a.asset_id.toLowerCase(), { asset_id: a.asset_id, kind, label });
+    }
+    return map;
+  }
+
+  private attachReferencedAssets<T extends { vendor_reference: string | null }>(
+    rows: T[],
+    resolved: Map<string, { asset_id: string; kind: string; label: string }>
+  ) {
+    return rows.map((row) => ({
+      ...row,
+      reference_assets: (row.vendor_reference?.match(FinanceService.UUID_IN_TEXT) ?? [])
+        .map((id) => resolved.get(id.toLowerCase()))
+        .filter((a): a is { asset_id: string; kind: string; label: string } => Boolean(a))
+    }));
+  }
+
   private billSelectSql() {
     return `
       SELECT
@@ -1554,15 +1640,19 @@ export class FinanceService {
       values.push(`%${query.search}%`);
       filters.push(`(b.bill_number ILIKE $${values.length} OR COALESCE(b.vendor_name, '') ILIKE $${values.length} OR COALESCE(b.vendor_reference, '') ILIKE $${values.length})`);
     }
-    const result = await this.databaseService.query(
+    const result = await this.databaseService.query<{ vendor_reference: string | null }>(
       `${this.billSelectSql()} WHERE ${filters.join(" AND ")} ORDER BY b.issue_date DESC, b.created_at DESC`,
       values
     );
-    return result.rows;
+    const resolved = await this.resolveReferencedAssets(
+      companyId,
+      result.rows.map((r) => r.vendor_reference)
+    );
+    return this.attachReferencedAssets(result.rows, resolved);
   }
 
   async getBill(companyId: string, billId: string) {
-    const bill = await this.databaseService.query(
+    const bill = await this.databaseService.query<{ vendor_reference: string | null }>(
       `${this.billSelectSql()} WHERE b.company_id = $1 AND b.bill_id = $2`,
       [companyId, billId]
     );
@@ -1588,7 +1678,9 @@ export class FinanceService {
       `,
       [companyId, billId]
     );
-    return { ...bill.rows[0], lines: lines.rows, applications: applications.rows };
+    const resolved = await this.resolveReferencedAssets(companyId, [bill.rows[0].vendor_reference]);
+    const [withAssets] = this.attachReferencedAssets(bill.rows, resolved);
+    return { ...withAssets, lines: lines.rows, applications: applications.rows };
   }
 
   async createBill(companyId: string, userId: string, input: CreateBillInput) {
