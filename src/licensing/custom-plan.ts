@@ -203,6 +203,46 @@ export interface CustomPlanRow {
 const num = (v: string | number | null | undefined): number | null =>
   v === null || v === undefined ? null : Number(v);
 
+/**
+ * The same terms as they live on a PLAN row (2026-07-23). A negotiated deal
+ * can be saved into `plans` as a private custom tier so it can be assigned to
+ * other companies or attached to a grant code; those rows carry the pricing
+ * under plain names rather than the custom_ prefix.
+ */
+export interface PlanTermsRow {
+  max_printers: number | null;
+  price_model?: CustomPriceModel | null;
+  price_amount?: string | number | null;
+  bundle_size?: number | null;
+  billing_basis?: CustomBillingBasis | null;
+  base_amount?: string | number | null;
+  included_printers?: number | null;
+  overage_model?: CustomOverageModel | null;
+  min_monthly?: string | number | null;
+  display_name?: string | null;
+}
+
+/**
+ * Terms carried by a plan itself. Returns null for an ordinary catalogue tier
+ * (no pricing model), so the caller falls back to the flat list price.
+ */
+export function termsFromPlanRow(row: PlanTermsRow | null | undefined): CustomPlanTerms | null {
+  if (!row || !row.price_model) return null;
+  return {
+    maxPrinters: row.max_printers ?? null,
+    priceModel: row.price_model,
+    priceAmount: num(row.price_amount),
+    bundleSize: row.bundle_size ?? null,
+    billingBasis: row.billing_basis ?? "cap",
+    baseAmount: num(row.base_amount),
+    includedPrinters: row.included_printers ?? null,
+    overageModel: row.overage_model ?? null,
+    minMonthly: num(row.min_monthly),
+    label: row.display_name ?? null,
+    note: null
+  };
+}
+
 /** Map a DB row's custom_* columns into CustomPlanTerms (null when unset). */
 export function termsFromRow(row: Partial<CustomPlanRow> | null | undefined): CustomPlanTerms | null {
   if (!row) return null;

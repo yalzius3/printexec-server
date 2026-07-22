@@ -9,6 +9,43 @@ export const checkoutSchema = z.object({
   plan_code: z.string().trim().min(1).max(40)
 });
 
+// Admin: add an invoice by hand for a cycle the activation hook didn't cover.
+export const createInvoiceSchema = z.object({
+  company_id: z.string().uuid(),
+  amount_usd: z.coerce.number().min(0).max(10_000_000),
+  plan_code: z.string().trim().max(60).nullable().optional(),
+  plan_name: z.string().trim().max(120).nullable().optional(),
+  period_start: z.string().datetime({ offset: true }).nullable().optional(),
+  period_end: z.string().datetime({ offset: true }).nullable().optional(),
+  note: z.string().trim().max(1000).nullable().optional()
+});
+
+// Admin: edit a draft's billable details (omitted fields are left alone).
+export const updateInvoiceSchema = z.object({
+  plan_name: z.string().trim().max(120).nullable().optional(),
+  amount_usd: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
+  period_start: z.string().datetime({ offset: true }).nullable().optional(),
+  period_end: z.string().datetime({ offset: true }).nullable().optional(),
+  note: z.string().trim().max(1000).nullable().optional(),
+  recipient_email: z.string().trim().max(200).nullable().optional(),
+  /** ProArt's official tax serial, if typed rather than uploaded with a file. */
+  official_number: z.string().trim().max(80).nullable().optional()
+});
+
+// Admin: save a negotiated deal into `plans` as a reusable private tier.
+export const saveCustomTierSchema = z.object({
+  display_name: z.string().trim().min(2).max(80),
+  max_printers: z.coerce.number().int().min(0).max(1_000_000).nullable().optional(),
+  price_model: z.enum(["flat", "per_printer", "bundle", "base_plus_overage"]).nullable().optional(),
+  price_amount: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
+  bundle_size: z.coerce.number().int().min(1).max(1_000_000).nullable().optional(),
+  billing_basis: z.enum(["cap", "actual"]).optional(),
+  base_amount: z.coerce.number().min(0).max(10_000_000).nullable().optional(),
+  included_printers: z.coerce.number().int().min(0).max(1_000_000).nullable().optional(),
+  overage_model: z.enum(["per_printer", "bundle"]).nullable().optional(),
+  min_monthly: z.coerce.number().min(0).max(10_000_000).nullable().optional()
+});
+
 // Admin step-up: exchange PLATFORM_ADMIN_SECRET for a short-lived session.
 export const adminUnlockSchema = z.object({
   secret: z.string().min(1).max(500)

@@ -5,8 +5,10 @@ import { DatabaseService, type SqlExecutor } from "../database/database.service"
 import {
   computeCustomMonthlyUsd,
   describeCustomPlan,
+  termsFromPlanRow,
   termsFromRow,
-  type CustomPlanRow
+  type CustomPlanRow,
+  type PlanTermsRow
 } from "./custom-plan";
 
 // ════════════════════════════════════════════════════════════════
@@ -91,7 +93,7 @@ export interface LicenseStatus {
   custom_plan: CustomPlanSummary | null;
 }
 
-interface SubscriptionRow extends Partial<CustomPlanRow> {
+interface SubscriptionRow extends Partial<CustomPlanRow>, Partial<PlanTermsRow> {
   company_id: string;
   plan_code: string;
   status: string;
@@ -208,14 +210,22 @@ export class LicensingService {
     );
     const printerCount = Number(countResult.rows[0]?.count ?? 0);
 
-    // Negotiated per-company terms (2026-07-22). The custom cap REPLACES the
-    // plan's for every downstream decision — over-limit, printer adds, the
-    // tenant's usage bar — so the rest of this method reads effectiveMax.
-    const customTerms = termsFromRow(sub);
-    const effectiveMax =
-      customTerms?.maxPrinters !== undefined && customTerms?.maxPrinters !== null
-        ? customTerms.maxPrinters
-        : sub.max_printers;
+    // Negotiated terms can come from two places, resolved field by field so
+    // they compose rather than shadow each other (2026-07-22 / 07-23):
+    //   cap     → the company's own override, else the plan's cap
+    //   pricing → the company's own price, else the plan's (a custom tier
+    //             carries one), else none at all → the plan's list price
+    // The effective cap REPLACES the plan's for every downstream decision —
+    // over-limit, printer adds, the tenant's usage bar.
+    const companyTerms = termsFromRow(sub);
+    const planTerms = termsFromPlanRow(sub);
+    const effectiveMax = companyTerms?.maxPrinters ?? sub.max_printers;
+    const pricing = companyTerms?.priceModel ? companyTerms : planTerms;
+    // Price against the EFFECTIVE cap: a company capped at 80 on a tier that
+    // normally allows 100 is billed for 80 slots, not 100.
+    const customTerms: typeof companyTerms = pricing
+      ? { ...pricing, maxPrinters: effectiveMax, label: companyTerms?.label ?? pricing.label }
+      : companyTerms;
 
     const now = Date.now();
     const periodEnd = sub.current_period_end ? new Date(sub.current_period_end).getTime() : null;
@@ -373,7 +383,9 @@ export class LicensingService {
                 cs.custom_max_printers, cs.custom_price_model, cs.custom_price_amount,
                 cs.custom_bundle_size, cs.custom_billing_basis, cs.custom_label, cs.custom_note,
                 cs.custom_base_amount, cs.custom_included_printers, cs.custom_overage_model,
-                cs.custom_min_monthly
+                cs.custom_min_monthly,
+                p.price_model, p.price_amount, p.bundle_size, p.billing_basis,
+                p.base_amount, p.included_printers, p.overage_model, p.min_monthly
          FROM company_subscriptions cs
          JOIN plans p ON p.plan_code = cs.plan_code
          WHERE cs.company_id = $1`,

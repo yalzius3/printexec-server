@@ -1,4 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { DatabaseService } from "../database/database.service";
 import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
@@ -73,7 +75,8 @@ export class SubscriptionInvoiceService {
   constructor(
     private readonly db: DatabaseService,
     private readonly email: EmailService,
-    private readonly discounts: DiscountService
+    private readonly discounts: DiscountService,
+    private readonly config: ConfigService
   ) {}
 
   /**
@@ -176,62 +179,100 @@ export class SubscriptionInvoiceService {
     const periodStart = sub.created_at ? new Date(sub.created_at).toISOString() : new Date().toISOString();
     const recipient = (sub.owner_email ?? "").trim() || null;
 
-    // Compose + attempt delivery FIRST so the persisted email_status reflects
-    // reality. A missing recipient is a recorded 'skipped', not a failure.
-    let emailStatus: "sent" | "dry_run" | "skipped" | "failed" = "skipped";
-    let emailError: string | null = recipient ? null : "company has no owner email on file";
+    // ── The tenant is NOT emailed here ──────────────────────────────────
+    // PrintExec is a product of ProArt Consulting, and ProArt is the legal
+    // entity that invoices customers under its own tax-authority serial
+    // numbers. Anything this platform generates is therefore a DRAFT, not a
+    // tax document, and must never reach a tenant on its own.
+    //
+    // So: record the draft, and email it to the OPERATOR
+    // (INVOICE_DRAFT_EMAIL). They pass it to ProArt, attach the finalized
+    // file that comes back, and send it to the tenant from the admin console
+    // (sendToTenant below). recipient_email is stored now so that later send
+    // already knows where it is going.
+    const invoiceData = {
+      invoiceNumber,
+      issuedAt: new Date().toISOString(),
+      company: {
+        name: sub.company_name,
+        ownerEmail: recipient,
+        city: sub.city,
+        countryCode: sub.country_code
+      },
+      plan: { name: sub.plan_name ?? sub.plan_code, maxPrinters: sub.max_printers },
+      amountUsd,
+      currency: "USD",
+      source: input.source,
+      periodStart,
+      periodEnd,
+      status: sub.status,
+      note,
+      appUrl: this.appUrl()
+    };
 
-    if (recipient) {
-      const invoiceData = {
-        invoiceNumber,
-        issuedAt: new Date().toISOString(),
-        company: {
-          name: sub.company_name,
-          ownerEmail: recipient,
-          city: sub.city,
-          countryCode: sub.country_code
-        },
-        plan: { name: sub.plan_name ?? sub.plan_code, maxPrinters: sub.max_printers },
-        amountUsd,
-        currency: "USD",
-        source: input.source,
-        periodStart,
-        periodEnd,
-        status: sub.status,
-        note,
-        appUrl: this.appUrl()
-      };
-      const message = composeSubscriptionInvoiceEmail(invoiceData);
-
-      // Attach the invoice as a real PDF document. Best-effort: if rendering
-      // fails we still send the email (the HTML invoice is the same content),
-      // because a missing attachment is far better than a missing invoice.
+    let draftStatus: "sent" | "dry_run" | "skipped" | "failed" = "skipped";
+    let draftError: string | null = null;
+    const draftTo = this.draftEmail();
+    if (!draftTo) {
+      draftError = "INVOICE_DRAFT_EMAIL is not set — draft recorded but not emailed.";
+      this.logger.warn(`invoice ${invoiceNumber}: ${draftError}`);
+    } else {
+      // The draft PDF is the same working document the operator hands to
+      // ProArt. Best-effort render: a missing attachment must not lose the
+      // notification that a draft is waiting.
       let attachments: { filename: string; content: Buffer; contentType: string }[] | undefined;
       try {
         const pdf = await renderInvoicePdf(invoiceData);
         attachments = [
-          { filename: `${invoiceNumber}.pdf`, content: pdf, contentType: "application/pdf" }
+          { filename: `DRAFT-${invoiceNumber}.pdf`, content: pdf, contentType: "application/pdf" }
         ];
       } catch (e) {
         this.logger.warn(
-          `invoice ${invoiceNumber}: PDF render failed, sending without attachment: ${e instanceof Error ? e.message : String(e)}`
+          `invoice ${invoiceNumber}: draft PDF render failed, emailing without attachment: ${e instanceof Error ? e.message : String(e)}`
         );
       }
 
+      const money = `USD ${amountUsd.toFixed(2)}`;
+      const periodText = periodEnd
+        ? `${new Date(periodStart).toISOString().slice(0, 10)} → ${new Date(periodEnd).toISOString().slice(0, 10)}`
+        : `${new Date(periodStart).toISOString().slice(0, 10)} → ongoing`;
+      // Deliberately internal copy — this is an operations notice, not the
+      // customer-facing invoice email (which only goes out after ProArt).
+      const lines = [
+        `DRAFT invoice ${invoiceNumber} — not a tax document, not sent to the customer.`,
+        "",
+        `Company:  ${sub.company_name}`,
+        `Owner:    ${recipient ?? "— no owner email on file —"}`,
+        `Plan:     ${sub.plan_name ?? sub.plan_code}`,
+        `Amount:   ${money}`,
+        `Period:   ${periodText}`,
+        `Source:   ${input.source}`,
+        note ? `Note:     ${note}` : "",
+        "",
+        "Next: pass this to ProArt for its official serial number, then attach",
+        "the finalized file to this draft in the admin console and send it.",
+        "",
+        `Admin console: ${this.appUrl()}`
+      ].filter(Boolean);
+
       try {
-        emailStatus = await this.email.send({
-          to: recipient,
-          subject: message.subject,
-          text: message.text,
-          html: message.html,
+        draftStatus = await this.email.send({
+          to: draftTo,
+          subject: `[DRAFT] Invoice ${invoiceNumber} — ${sub.company_name} — ${money}`,
+          text: lines.join("\n"),
           ...(attachments ? { attachments } : {})
         });
       } catch (e) {
-        emailStatus = "failed";
-        emailError = e instanceof Error ? e.message : String(e);
-        this.logger.warn(`invoice ${invoiceNumber}: delivery failed (invoice still recorded): ${emailError}`);
+        draftStatus = "failed";
+        draftError = e instanceof Error ? e.message : String(e);
+        this.logger.warn(`invoice ${invoiceNumber}: draft email failed (draft still recorded): ${draftError}`);
       }
     }
+
+    // The tenant-facing email fields stay empty until the finalized invoice is
+    // actually sent from the admin console.
+    const emailStatus: "sent" | "dry_run" | "skipped" | "failed" | null = null;
+    const emailError: string | null = null;
 
     // Persist the invoice regardless of email outcome — it's the billing
     // record. The discount columns arrive with the 2026-07-21 migration, so a
@@ -252,26 +293,208 @@ export class SubscriptionInvoiceService {
       input.issuedBy ?? "system"
     ];
     try {
+      // Preferred shape: an explicit 'draft' plus the outcome of the operator
+      // notification (2026-07-23 migration).
       await this.db.query(
         `INSERT INTO subscription_invoices
            (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
             source, period_start, period_end, recipient_email, email_status, email_error,
-            note, issued_by, discount_code, discount_amount)
-         VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-        [...baseValues, discountCode, discountAmount]
+            note, issued_by, discount_code, discount_amount,
+            status, draft_email_status, draft_email_error)
+         VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'draft',$16,$17)`,
+        [...baseValues, discountCode, discountAmount, draftStatus, draftError]
       );
     } catch (e) {
       if ((e as { code?: string }).code !== "42703") throw e;
-      await this.db.query(
-        `INSERT INTO subscription_invoices
-           (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
-            source, period_start, period_end, recipient_email, email_status, email_error, note, issued_by)
-         VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13)`,
-        baseValues
+      this.logger.warn(
+        `invoice ${invoiceNumber}: draft columns missing — apply migrations/2026-07-23_invoice_drafts_custom_tiers.sql. Recorded without draft state (the customer was still NOT emailed).`
       );
+      try {
+        await this.db.query(
+          `INSERT INTO subscription_invoices
+             (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
+              source, period_start, period_end, recipient_email, email_status, email_error,
+              note, issued_by, discount_code, discount_amount)
+           VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [...baseValues, discountCode, discountAmount]
+        );
+      } catch (e2) {
+        if ((e2 as { code?: string }).code !== "42703") throw e2;
+        await this.db.query(
+          `INSERT INTO subscription_invoices
+             (company_id, invoice_number, plan_code, plan_name, amount_usd, currency,
+              source, period_start, period_end, recipient_email, email_status, email_error, note, issued_by)
+           VALUES ($1,$2,$3,$4,$5,'USD',$6,$7,$8,$9,$10,$11,$12,$13)`,
+          baseValues
+        );
+      }
     }
 
     return invoiceNumber;
+  }
+
+  /** Where auto-generated drafts are sent for the ProArt hand-off. */
+  private draftEmail(): string | null {
+    const raw = (this.config.get<string>("INVOICE_DRAFT_EMAIL") ?? "").trim();
+    return raw || null;
+  }
+
+  /** Public wrapper so the admin console can mint a number for a hand-added
+   *  invoice using the same atomic per-year counter. */
+  mintNumber(): Promise<string> {
+    return this.mintInvoiceNumber();
+  }
+
+  /** Re-render a stored draft as a PDF, for handing to ProArt. */
+  async renderDraftPdf(invoiceId: string): Promise<Buffer> {
+    const { rows } = await this.db.query<{
+      invoice_number: string;
+      plan_name: string | null;
+      plan_code: string | null;
+      amount_usd: string;
+      currency: string;
+      source: string;
+      period_start: string | Date | null;
+      period_end: string | Date | null;
+      note: string | null;
+      created_at: string | Date;
+      recipient_email: string | null;
+      company_name: string;
+      city: string | null;
+      country_code: string | null;
+      max_printers: number | null;
+    }>(
+      `SELECT i.invoice_number, i.plan_name, i.plan_code, i.amount_usd, i.currency, i.source,
+              i.period_start, i.period_end, i.note, i.created_at, i.recipient_email,
+              c.name AS company_name, c.city, c.country_code, p.max_printers
+         FROM subscription_invoices i
+         JOIN companies c ON c.company_id = i.company_id
+         LEFT JOIN plans p ON p.plan_code = i.plan_code
+        WHERE i.invoice_id = $1`,
+      [invoiceId]
+    );
+    const inv = rows[0];
+    if (!inv) throw new Error("Invoice not found.");
+    return renderInvoicePdf({
+      invoiceNumber: inv.invoice_number,
+      issuedAt: new Date(inv.created_at).toISOString(),
+      company: {
+        name: inv.company_name,
+        ownerEmail: inv.recipient_email,
+        city: inv.city,
+        countryCode: inv.country_code
+      },
+      plan: { name: inv.plan_name ?? inv.plan_code ?? "—", maxPrinters: inv.max_printers },
+      amountUsd: Number(inv.amount_usd),
+      currency: inv.currency ?? "USD",
+      source: inv.source,
+      periodStart: inv.period_start ? new Date(inv.period_start).toISOString() : new Date(inv.created_at).toISOString(),
+      periodEnd: inv.period_end ? new Date(inv.period_end).toISOString() : null,
+      status: "draft",
+      note: inv.note,
+      appUrl: this.appUrl()
+    });
+  }
+
+  /** Park ProArt's finalized file in the uploads bucket, under a key that
+   *  can't collide across invoices. Returns the object key. */
+  async storeOfficialFile(invoiceId: string, buffer: Buffer, filename: string): Promise<string> {
+    const safe = (filename || "invoice.pdf").replace(/[^\w.\-]+/g, "_").slice(-80);
+    const key = `subscription-invoices/${invoiceId}/${Date.now()}-${safe}`;
+    const { error } = await this.storage()
+      .storage.from(this.bucket())
+      .upload(key, buffer, { contentType: "application/pdf", upsert: true });
+    if (error) throw new Error(`Could not store the finalized invoice: ${error.message}`);
+    return key;
+  }
+
+  /** Read back the finalized file so it can be attached to the tenant email. */
+  async loadOfficialFile(key: string): Promise<Buffer> {
+    const { data, error } = await this.storage().storage.from(this.bucket()).download(key);
+    if (error || !data) {
+      throw new Error(`Could not read the finalized invoice: ${error?.message ?? "missing file"}`);
+    }
+    return Buffer.from(await data.arrayBuffer());
+  }
+
+  private bucket(): string {
+    return this.config.get<string>("SUPABASE_UPLOAD_BUCKET") ?? "uploads";
+  }
+
+  private storage(): SupabaseClient {
+    if (!this.supabase) {
+      this.supabase = createClient(
+        this.config.getOrThrow<string>("SUPABASE_URL"),
+        this.config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY"),
+        { auth: { persistSession: false } }
+      );
+    }
+    return this.supabase;
+  }
+  private supabase: SupabaseClient | null = null;
+
+  /**
+   * Email ProArt's finalized invoice to the tenant. This is the ONLY path that
+   * puts an invoice in a customer's inbox, and it deliberately sends the exact
+   * file the operator attached — never a re-render — so what the customer
+   * holds is the real, tax-numbered document ProArt issued.
+   */
+  async sendToTenant(
+    invoiceId: string,
+    file: { buffer: Buffer; filename: string },
+    sentBy: string
+  ): Promise<{ status: "sent" | "dry_run"; to: string }> {
+    const { rows } = await this.db.query<{
+      invoice_number: string;
+      official_number: string | null;
+      recipient_email: string | null;
+      amount_usd: string;
+      plan_name: string | null;
+      company_name: string;
+      status: string;
+    }>(
+      `SELECT i.invoice_number, i.official_number, i.recipient_email, i.amount_usd,
+              i.plan_name, i.status, c.name AS company_name
+         FROM subscription_invoices i
+         JOIN companies c ON c.company_id = i.company_id
+        WHERE i.invoice_id = $1`,
+      [invoiceId]
+    );
+    const inv = rows[0];
+    if (!inv) throw new Error("Invoice not found.");
+    const to = (inv.recipient_email ?? "").trim();
+    if (!to) throw new Error("This company has no owner email on file to send to.");
+
+    const ref = inv.official_number?.trim() || inv.invoice_number;
+    const text = [
+      `Hello,`,
+      "",
+      `Please find attached your invoice ${ref}${inv.plan_name ? ` for the ${inv.plan_name} plan` : ""}.`,
+      "",
+      `Amount: USD ${Number(inv.amount_usd).toFixed(2)}`,
+      "",
+      "Thank you for using PrintExec.",
+      "",
+      "PrintExec — a product of ProArt Consulting"
+    ].join("\n");
+
+    const status = await this.email.send({
+      to,
+      subject: `Invoice ${ref}${inv.plan_name ? ` — ${inv.plan_name} plan` : ""}`,
+      text,
+      attachments: [
+        { filename: file.filename, content: file.buffer, contentType: "application/pdf" }
+      ]
+    });
+
+    await this.db.query(
+      `UPDATE subscription_invoices
+          SET status = 'sent', sent_at = now(), sent_to = $2,
+              email_status = $3, email_error = NULL, issued_by = COALESCE(issued_by, $4)
+        WHERE invoice_id = $1`,
+      [invoiceId, to, status, sentBy]
+    );
+    return { status, to };
   }
 
   /** Company + its subscription + the plan's list price, in one read. */

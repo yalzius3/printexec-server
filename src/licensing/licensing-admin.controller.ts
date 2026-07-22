@@ -8,9 +8,13 @@ import {
   NotFoundException,
   Param,
   Post,
+  Req,
+  Res,
   UseGuards,
   UseInterceptors
 } from "@nestjs/common";
+import type { FastifyReply, FastifyRequest } from "fastify";
+import { AdminEmail } from "./admin-email.decorator";
 import { UserId } from "../common/user-id.decorator";
 import { parseWithSchema } from "../common/zod";
 import { DatabaseService } from "../database/database.service";
@@ -29,8 +33,11 @@ import {
   companyRefSchema,
   createDiscountSchema,
   createGrantSchema,
+  createInvoiceSchema,
   customPlanSchema,
   endTrialSchema,
+  saveCustomTierSchema,
+  updateInvoiceSchema,
   sendMessageSchema,
   setDiscountActiveSchema,
   setHoldSchema
@@ -515,6 +522,72 @@ export class LicensingAdminController {
     };
   }
 
+  /**
+   * Save a negotiated deal into `plans` as a reusable private tier, so the
+   * same terms can later be ASSIGNED to another company or attached to a
+   * GRANT CODE like any catalogue plan — a custom plan becomes a real plan,
+   * not a one-off. Never public, never self-serve: these exist to be handed
+   * out deliberately.
+   */
+  @Post("custom-tier")
+  async saveCustomTier(@AdminEmail() adminEmail: string, @Body() body: unknown) {
+    const input = parseWithSchema(saveCustomTierSchema, body);
+
+    // Derive a stable, readable code and de-duplicate it.
+    const base = `custom-${input.display_name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`.slice(0, 48) || "custom-tier";
+    let planCode = base;
+    for (let i = 2; i < 50; i++) {
+      const { rowCount } = await this.db.query("SELECT 1 FROM plans WHERE plan_code = $1", [planCode]);
+      if (!rowCount) break;
+      planCode = `${base}-${i}`;
+    }
+
+    if (input.price_model === "base_plus_overage" && input.base_amount == null) {
+      throw new BadRequestException("Set the fixed monthly base for a base + overage tier.");
+    }
+    if (input.price_model === "bundle" && input.bundle_size == null) {
+      throw new BadRequestException("Bundle pricing needs a bundle size.");
+    }
+
+    const { rows: order } = await this.db.query<{ next: number }>(
+      "SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM plans"
+    );
+
+    try {
+      await this.db.query(
+        `INSERT INTO plans
+           (plan_code, display_name, max_printers, is_public, self_serve, sort_order,
+            price_model, price_amount, bundle_size, billing_basis,
+            base_amount, included_printers, overage_model, min_monthly,
+            is_custom, created_by)
+         VALUES ($1,$2,$3,FALSE,FALSE,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,$13)`,
+        [
+          planCode,
+          input.display_name.trim(),
+          input.max_printers ?? null,
+          order[0]?.next ?? 100,
+          input.price_model ?? null,
+          input.price_amount ?? null,
+          input.price_model === "bundle" || input.overage_model === "bundle" ? input.bundle_size ?? null : null,
+          input.billing_basis ?? "cap",
+          input.price_model === "base_plus_overage" ? input.base_amount ?? null : null,
+          input.price_model === "base_plus_overage" ? input.included_printers ?? null : null,
+          input.price_model === "base_plus_overage" ? input.overage_model ?? null : null,
+          input.min_monthly ?? null,
+          adminEmail
+        ]
+      );
+    } catch (e) {
+      if ((e as { code?: string }).code === "42703") {
+        throw new BadRequestException(
+          "Custom tiers need migrations/2026-07-23_invoice_drafts_custom_tiers.sql applied first."
+        );
+      }
+      throw e;
+    }
+    return { ok: true, plan_code: planCode, display_name: input.display_name.trim() };
+  }
+
   // Stop a company's trial right now. Trials carry no grace (see
   // LicensingService.resolve), so expiring the trial this instant drops the
   // company straight into read-only — they must pick a plan or redeem a code
@@ -907,14 +980,63 @@ export class LicensingAdminController {
 
   // Subscription invoices issued to one company (the admin drawer's "Invoices"
   // panel). Empty pre-migration rather than erroring.
-  @Get("invoices/:companyId")
-  async listCompanyInvoices(@UserId() userId: string, @Param("companyId") companyId: string) {
-    await this.assertPlatformAdmin(userId);
+  // ── Invoice drafts ───────────────────────────────────────────────────────
+  // PrintExec drafts invoices; ProArt (the parent company) issues the real,
+  // tax-numbered document. Nothing here reaches a tenant until an operator
+  // attaches ProArt's finalized file and presses send.
+
+  /** Columns every invoice view returns. Split out so the several read paths
+   *  below can't drift, and so a pre-2026-07-23 DB degrades in one place. */
+  private static readonly INVOICE_COLS = `invoice_id, company_id, invoice_number, plan_code, plan_name,
+                amount_usd, currency, source, period_start, period_end, status,
+                recipient_email, email_status, email_error, note, issued_by, created_at,
+                official_number, official_file_name, finalized_at, finalized_by,
+                sent_at, sent_to, draft_email_status, draft_email_error`;
+  private static readonly INVOICE_COLS_LEGACY = `invoice_id, company_id, invoice_number, plan_code, plan_name,
+                amount_usd, currency, source, period_start, period_end, status,
+                recipient_email, email_status, email_error, note, issued_by, created_at`;
+
+  /** Fill the post-migration fields in so the client has one stable shape. */
+  private legacyInvoice(r: Record<string, unknown>) {
+    return {
+      ...r,
+      official_number: null,
+      official_file_name: null,
+      finalized_at: null,
+      finalized_by: null,
+      sent_at: null,
+      sent_to: null,
+      draft_email_status: null,
+      draft_email_error: null
+    };
+  }
+
+  /** The whole working queue: every invoice, newest first. The client groups
+   *  them per tenant. */
+  @Get("invoices")
+  async listAllInvoices() {
+    const tail = "FROM subscription_invoices ORDER BY created_at DESC LIMIT 500";
     try {
       const { rows } = await this.db.query(
-        `SELECT invoice_number, plan_name, amount_usd, currency, source,
-                period_start, period_end, status, recipient_email, email_status,
-                email_error, note, issued_by, created_at
+        `SELECT ${LicensingAdminController.INVOICE_COLS} ${tail}`
+      );
+      return rows;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "42P01") return [];
+      if (code !== "42703") throw err;
+      const { rows } = await this.db.query(
+        `SELECT ${LicensingAdminController.INVOICE_COLS_LEGACY} ${tail}`
+      );
+      return rows.map((r) => this.legacyInvoice(r as Record<string, unknown>));
+    }
+  }
+
+  @Get("invoices/:companyId")
+  async listCompanyInvoices(@Param("companyId") companyId: string) {
+    try {
+      const { rows } = await this.db.query(
+        `SELECT ${LicensingAdminController.INVOICE_COLS}
            FROM subscription_invoices
           WHERE company_id = $1
           ORDER BY created_at DESC
@@ -923,9 +1045,191 @@ export class LicensingAdminController {
       );
       return rows;
     } catch (err) {
-      if ((err as { code?: string }).code === "42P01") return [];
-      throw err;
+      const code = (err as { code?: string }).code;
+      if (code === "42P01") return [];
+      if (code !== "42703") throw err;
+      const { rows } = await this.db.query(
+        `SELECT ${LicensingAdminController.INVOICE_COLS_LEGACY}
+           FROM subscription_invoices WHERE company_id = $1
+          ORDER BY created_at DESC LIMIT 100`,
+        [companyId]
+      );
+      return rows.map((r) => this.legacyInvoice(r as Record<string, unknown>));
     }
+  }
+
+  /** Add an invoice by hand (a cycle the activation hook didn't produce). */
+  @Post("invoices")
+  async createInvoice(@AdminEmail() adminEmail: string, @Body() body: unknown) {
+    const input = parseWithSchema(createInvoiceSchema, body);
+    const { rows: co } = await this.db.query<{ name: string; owner_email: string | null }>(
+      "SELECT name, owner_email FROM companies WHERE company_id = $1",
+      [input.company_id]
+    );
+    if (!co.length) throw new NotFoundException("Company not found.");
+
+    const invoiceNumber = await this.invoices.mintNumber();
+    const { rows } = await this.db.query(
+      `INSERT INTO subscription_invoices
+         (company_id, invoice_number, plan_code, plan_name, amount_usd, currency, source,
+          period_start, period_end, recipient_email, note, issued_by, status)
+       VALUES ($1,$2,$3,$4,$5,'USD','manual',$6,$7,$8,$9,$10,'draft')
+       RETURNING invoice_id`,
+      [
+        input.company_id,
+        invoiceNumber,
+        input.plan_code ?? null,
+        input.plan_name ?? null,
+        input.amount_usd,
+        input.period_start ?? new Date().toISOString(),
+        input.period_end ?? null,
+        co[0]!.owner_email,
+        input.note ?? null,
+        adminEmail
+      ]
+    );
+    return { ok: true, invoice_id: rows[0]?.invoice_id, invoice_number: invoiceNumber };
+  }
+
+  /** Edit a draft's billable details. Sent invoices are immutable — the
+   *  customer already holds that document. */
+  @Post("invoices/:invoiceId")
+  async updateInvoice(
+    @AdminEmail() adminEmail: string,
+    @Param("invoiceId") invoiceId: string,
+    @Body() body: unknown
+  ) {
+    const input = parseWithSchema(updateInvoiceSchema, body);
+    const current = await this.loadInvoice(invoiceId);
+    if (current.status === "sent") {
+      throw new BadRequestException("This invoice has already been sent and can no longer be edited.");
+    }
+    await this.db.query(
+      `UPDATE subscription_invoices
+          SET plan_name = COALESCE($2, plan_name),
+              amount_usd = COALESCE($3, amount_usd),
+              period_start = COALESCE($4, period_start),
+              period_end = COALESCE($5, period_end),
+              note = COALESCE($6, note),
+              recipient_email = COALESCE($7, recipient_email),
+              official_number = COALESCE($8, official_number),
+              edited_at = now(), edited_by = $9
+        WHERE invoice_id = $1`,
+      [
+        invoiceId,
+        input.plan_name ?? null,
+        input.amount_usd ?? null,
+        input.period_start ?? null,
+        input.period_end ?? null,
+        input.note ?? null,
+        input.recipient_email ?? null,
+        input.official_number ?? null,
+        adminEmail
+      ]
+    );
+    return { ok: true };
+  }
+
+  /** Remove an invoice outright (a draft that shouldn't exist). Sent ones are
+   *  voided instead of deleted, so the billing trail stays intact. */
+  @Post("invoices/:invoiceId/delete")
+  async deleteInvoice(@Param("invoiceId") invoiceId: string) {
+    const current = await this.loadInvoice(invoiceId);
+    if (current.status === "sent") {
+      await this.db.query(
+        "UPDATE subscription_invoices SET status = 'void' WHERE invoice_id = $1",
+        [invoiceId]
+      );
+      return { ok: true, voided: true };
+    }
+    await this.db.query("DELETE FROM subscription_invoices WHERE invoice_id = $1", [invoiceId]);
+    return { ok: true, deleted: true };
+  }
+
+  /** Download the working draft to hand to ProArt. */
+  @Get("invoices/:invoiceId/draft.pdf")
+  async downloadDraft(@Param("invoiceId") invoiceId: string, @Res() reply: FastifyReply) {
+    const inv = await this.loadInvoice(invoiceId);
+    const pdf = await this.invoices.renderDraftPdf(invoiceId);
+    void reply
+      .header("Content-Type", "application/pdf")
+      .header("Content-Disposition", `attachment; filename="DRAFT-${inv.invoice_number}.pdf"`)
+      .send(pdf);
+  }
+
+  /**
+   * Attach ProArt's finalized invoice (their file + official serial) to a
+   * draft, moving it to 'ready'. The uploaded bytes are what the tenant will
+   * receive verbatim, so nothing is re-rendered from here on.
+   */
+  @Post("invoices/:invoiceId/finalize")
+  async finalizeInvoice(
+    @AdminEmail() adminEmail: string,
+    @Param("invoiceId") invoiceId: string,
+    @Req() req: FastifyRequest
+  ) {
+    await this.loadInvoice(invoiceId);
+    if (!req.isMultipart()) {
+      throw new BadRequestException("Attach ProArt's finalized invoice file.");
+    }
+    const data = await req.file();
+    if (!data) throw new BadRequestException("No file received.");
+    const officialNumber = String(
+      (data.fields as Record<string, { value?: unknown } | undefined>)?.["official_number"]?.value ?? ""
+    ).trim();
+
+    const buffer = await data.toBuffer();
+    const key = await this.invoices.storeOfficialFile(invoiceId, buffer, data.filename);
+
+    await this.db.query(
+      `UPDATE subscription_invoices
+          SET official_file_key = $2, official_file_name = $3,
+              official_number = COALESCE(NULLIF($4, ''), official_number),
+              status = CASE WHEN status = 'sent' THEN status ELSE 'ready' END,
+              finalized_at = now(), finalized_by = $5
+        WHERE invoice_id = $1`,
+      [invoiceId, key, data.filename, officialNumber, adminEmail]
+    );
+    return { ok: true, official_file_name: data.filename, official_number: officialNumber || null };
+  }
+
+  /** Email ProArt's finalized invoice to the tenant. The only path that puts
+   *  an invoice in a customer's inbox. */
+  @Post("invoices/:invoiceId/send")
+  async sendInvoice(@AdminEmail() adminEmail: string, @Param("invoiceId") invoiceId: string) {
+    const inv = await this.loadInvoice(invoiceId);
+    if (!inv.official_file_key) {
+      throw new BadRequestException(
+        "Attach ProArt's finalized invoice before sending — drafts are not tax documents."
+      );
+    }
+    if (inv.status === "sent") {
+      throw new BadRequestException("This invoice has already been sent.");
+    }
+    const file = await this.invoices.loadOfficialFile(inv.official_file_key);
+    const result = await this.invoices.sendToTenant(
+      invoiceId,
+      { buffer: file, filename: inv.official_file_name ?? `${inv.invoice_number}.pdf` },
+      adminEmail
+    );
+    return { ok: true, ...result };
+  }
+
+  private async loadInvoice(invoiceId: string) {
+    const { rows } = await this.db.query<{
+      invoice_id: string;
+      invoice_number: string;
+      status: string;
+      official_file_key: string | null;
+      official_file_name: string | null;
+    }>(
+      `SELECT invoice_id, invoice_number, status, official_file_key, official_file_name
+         FROM subscription_invoices WHERE invoice_id = $1`,
+      [invoiceId]
+    );
+    const inv = rows[0];
+    if (!inv) throw new NotFoundException("Invoice not found.");
+    return inv;
   }
 
   @Get("grants")
