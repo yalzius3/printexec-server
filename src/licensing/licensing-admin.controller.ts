@@ -37,6 +37,7 @@ import {
   customPlanSchema,
   endTrialSchema,
   saveCustomTierSchema,
+  setAiBudgetSchema,
   updateInvoiceSchema,
   sendMessageSchema,
   setDiscountActiveSchema,
@@ -44,6 +45,7 @@ import {
 } from "./licensing.schemas";
 import { AdminAuditInterceptor } from "./admin-audit.interceptor";
 import { AdminSessionService } from "./admin-session.service";
+import { AnalyticsAiService } from "../analytics/analytics-ai.service";
 import { CompanyPurgeService } from "./company-purge.service";
 import {
   computeCustomMonthlyUsd,
@@ -88,8 +90,41 @@ export class LicensingAdminController {
     private readonly email: EmailService,
     private readonly invoices: SubscriptionInvoiceService,
     private readonly purge: CompanyPurgeService,
-    private readonly sessions: AdminSessionService
+    private readonly sessions: AdminSessionService,
+    private readonly analyticsAi: AnalyticsAiService
   ) {}
+
+  // ── Lorelei (AI analyst) allowance ───────────────────────────────────────
+  // View and adjust a company's monthly Lorelei budget. The effective-cap
+  // logic lives in AnalyticsAiService (the one owner of the AI budget), so the
+  // admin sees exactly what enforcement uses. A GET reads the live picture; the
+  // POST raises/lowers the override (null = back to the deployment default,
+  // 0 = unlimited for that company).
+  @Get("ai-budget/:companyId")
+  async aiBudget(@Param("companyId") companyId: string) {
+    return this.analyticsAi.adminBudgetView(companyId);
+  }
+
+  @Post("ai-budget")
+  async setAiBudget(@Body() body: unknown) {
+    const input = parseWithSchema(setAiBudgetSchema, body);
+    const company = await this.db.query("SELECT 1 FROM companies WHERE company_id = $1", [input.company_id]);
+    if (!company.rowCount) throw new NotFoundException("Company not found.");
+    try {
+      await this.db.query(
+        "UPDATE companies SET ai_monthly_budget_usd = $2 WHERE company_id = $1",
+        [input.company_id, input.monthly_usd]
+      );
+    } catch (err) {
+      if ((err as { code?: string }).code === "42703") {
+        throw new BadRequestException(
+          "Lorelei limits aren't available yet — apply migrations/2026-07-23_lorelei_budget_override.sql."
+        );
+      }
+      throw err;
+    }
+    return this.analyticsAi.adminBudgetView(input.company_id);
+  }
 
   // ── Step-up unlock ───────────────────────────────────────────────────────
   // Exchanges PLATFORM_ADMIN_SECRET for a short-lived session token. The guard
@@ -123,7 +158,29 @@ export class LicensingAdminController {
   @Get("overview")
   async overview(@UserId() userId: string) {
     await this.assertPlatformAdmin(userId);
-    return this.withCustomPlans(await this.overviewRows());
+    return this.withAiBudget(await this.withCustomPlans(await this.overviewRows()));
+  }
+
+  /**
+   * Tag rows that carry a per-company Lorelei allowance override. Same pattern
+   * as withCustomPlans: one cheap lookup of only the companies that have one,
+   * resilient to the column not being migrated. The default cap is attached
+   * once (not per row) as a non-enumerable-ish extra the client reads off row 0.
+   */
+  private async withAiBudget(rows: Record<string, unknown>[]): Promise<Record<string, unknown>[]> {
+    let overrides = new Map<string, number>();
+    try {
+      const { rows: r } = await this.db.query<{ company_id: string; ai_monthly_budget_usd: string }>(
+        "SELECT company_id, ai_monthly_budget_usd FROM companies WHERE ai_monthly_budget_usd IS NOT NULL"
+      );
+      overrides = new Map(r.map((x) => [x.company_id, Number(x.ai_monthly_budget_usd)]));
+    } catch {
+      // column not migrated yet — nobody has an override
+    }
+    return rows.map((row) => ({
+      ...row,
+      ai_budget_override_usd: overrides.get(String(row["company_id"])) ?? null
+    }));
   }
 
   /**

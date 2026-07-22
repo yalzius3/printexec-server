@@ -606,11 +606,35 @@ export class AnalyticsAiService {
   // AI_BUDGET_USD=0 disables the cap. The dollar figure is internal: callers
   // surface only a 0–100 percentage (used_pct) to the user, never the amount.
 
-  private budgetUsd(): number {
+  /** The deployment-wide default monthly cap (env AI_BUDGET_USD, $1). Public so
+   *  the licensing admin can show "default: $X" beside a per-company override. */
+  defaultBudgetUsd(): number {
     const raw = env("AI_BUDGET_USD");
     if (raw === undefined) return 1;
     const v = Number(raw);
     return Number.isFinite(v) && v >= 0 ? v : 1;
+  }
+
+  /** The EFFECTIVE monthly cap for a company: its own override when set, else
+   *  the deployment default. The override only applies in "company" scope — a
+   *  global shared cap has no per-company notion. A stored override of 0 means
+   *  "no cap for this company" (mirrors env 0 = unlimited). */
+  private async budgetUsd(companyId: string): Promise<number> {
+    const fallback = this.defaultBudgetUsd();
+    if (this.budgetScope() !== "company") return fallback;
+    try {
+      const { rows } = await this.databaseService.query<{ ai_monthly_budget_usd: string | null }>(
+        "SELECT ai_monthly_budget_usd FROM companies WHERE company_id = $1",
+        [companyId]
+      );
+      const raw = rows[0]?.ai_monthly_budget_usd;
+      if (raw === null || raw === undefined) return fallback;
+      const v = Number(raw);
+      return Number.isFinite(v) && v >= 0 ? v : fallback;
+    } catch {
+      // Column not migrated yet — every company runs on the default.
+      return fallback;
+    }
   }
 
   private budgetScope(): "global" | "company" {
@@ -664,10 +688,38 @@ export class AnalyticsAiService {
     return Math.max(0, Math.min(100, Math.round((spend / cap) * 100)));
   }
 
+  /** Admin view of a company's Lorelei allowance: the effective status plus the
+   *  raw override (null = on the default) and the deployment default. Unlike the
+   *  tenant meter, this DOES expose the dollar figures — the operator sets them. */
+  async adminBudgetView(companyId: string): Promise<{
+    status: Awaited<ReturnType<AnalyticsAiService["budgetStatus"]>>;
+    override_usd: number | null;
+    default_usd: number;
+    scope: "global" | "company";
+  }> {
+    let override: number | null = null;
+    try {
+      const { rows } = await this.databaseService.query<{ ai_monthly_budget_usd: string | null }>(
+        "SELECT ai_monthly_budget_usd FROM companies WHERE company_id = $1",
+        [companyId]
+      );
+      const raw = rows[0]?.ai_monthly_budget_usd;
+      override = raw === null || raw === undefined ? null : Number(raw);
+    } catch {
+      // column not migrated yet — no override exists
+    }
+    return {
+      status: await this.budgetStatus(companyId),
+      override_usd: override,
+      default_usd: this.defaultBudgetUsd(),
+      scope: this.budgetScope()
+    };
+  }
+
   /** Live budget snapshot for the client's meter — also GET /analytics/ask/budget.
    *  used_pct is what the UI renders; the *_usd fields are internal detail. */
   async budgetStatus(companyId: string) {
-    const cap = this.budgetUsd();
+    const cap = await this.budgetUsd(companyId);
     const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
     try {
       const { spend, resetsAt } = await this.monthSpend(companyId);
@@ -701,8 +753,8 @@ export class AnalyticsAiService {
   }
 
   private async enforceBudget(companyId: string): Promise<void> {
-    const cap = this.budgetUsd();
-    if (cap <= 0) return; // cap disabled
+    const cap = await this.budgetUsd(companyId);
+    if (cap <= 0) return; // cap disabled (env 0, or a per-company override of 0)
     try {
       const { spend, resetsAt } = await this.monthSpend(companyId);
       if (spend < cap) return;

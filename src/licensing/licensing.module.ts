@@ -1,4 +1,5 @@
 import { Global, Module } from "@nestjs/common";
+import { AnalyticsModule } from "../analytics/analytics.module";
 import { EmailModule } from "../email/email.module";
 import { AdminAuditInterceptor } from "./admin-audit.interceptor";
 import { AdminSessionService } from "./admin-session.service";
@@ -19,7 +20,10 @@ import { SubscriptionInvoiceService } from "./subscription-invoice.service";
 // subscription invoices issued on plan activation.
 @Global()
 @Module({
-  imports: [EmailModule],
+  // AnalyticsModule provides AnalyticsAiService so the admin can view/adjust a
+  // company's Lorelei monthly allowance through the one service that owns the
+  // effective-cap logic (no duplicated budget math).
+  imports: [EmailModule, AnalyticsModule],
   controllers: [LicensingController, LicensingAdminController],
   providers: [
     LicensingService,

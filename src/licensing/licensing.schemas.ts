@@ -51,6 +51,14 @@ export const adminUnlockSchema = z.object({
   secret: z.string().min(1).max(500)
 });
 
+// Admin: raise/lower a company's monthly Lorelei (AI analyst) allowance.
+// monthly_usd: null → clear the override (use the deployment default);
+// 0 → unlimited for this company; a positive number → that monthly cap.
+export const setAiBudgetSchema = z.object({
+  company_id: z.string().uuid(),
+  monthly_usd: z.coerce.number().min(0).max(100_000).nullable()
+});
+
 // Admin: per-company custom plan overrides (cap and/or pricing) layered on top
 // of the assigned catalogue plan. `clear: true` wipes every override back to
 // the plan's own terms. Omitted fields are left untouched, so a partial edit

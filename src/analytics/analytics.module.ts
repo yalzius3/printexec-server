@@ -5,6 +5,9 @@ import { AnalyticsAiService } from "./analytics-ai.service";
 
 @Module({
   controllers: [AnalyticsController],
-  providers: [AnalyticsService, AnalyticsAiService]
+  providers: [AnalyticsService, AnalyticsAiService],
+  // Exported so the licensing admin can read/adjust a company's Lorelei
+  // allowance through the one service that owns the effective-cap logic.
+  exports: [AnalyticsAiService]
 })
 export class AnalyticsModule {}
