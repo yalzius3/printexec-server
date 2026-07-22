@@ -60,29 +60,61 @@ ALTER TABLE public.subscription_invoices
   ADD COLUMN IF NOT EXISTS edited_by           TEXT;
 
 DO $$
+DECLARE
+  c record;
 BEGIN
   -- Widen the status domain, migrating legacy rows first so the new CHECK
   -- can't reject data that predates it.
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint
-     WHERE conrelid = 'public.subscription_invoices'::regclass
-       AND contype = 'c'
-       AND pg_get_constraintdef(oid) ILIKE '%status%'
-  ) THEN
-    EXECUTE (
-      SELECT 'ALTER TABLE public.subscription_invoices DROP CONSTRAINT ' || quote_ident(conname)
-        FROM pg_constraint
-       WHERE conrelid = 'public.subscription_invoices'::regclass
-         AND contype = 'c'
-         AND pg_get_constraintdef(oid) ILIKE '%status%'
-       LIMIT 1
-    );
-  END IF;
+  --
+  -- Drop every CHECK that constrains the `status` column — identified by the
+  -- COLUMN it covers (conkey), not by text-matching its definition.
+  --
+  -- This matters: the table also carries email_status (and now
+  -- draft_email_status) checks, whose definitions contain the substring
+  -- "status". The first cut of this migration matched '%status%' and took
+  -- LIMIT 1, so it dropped email_status's constraint and left
+  -- status IN ('issued','void') in force — and the UPDATE below then failed
+  -- with subscription_invoices_status_check. Matching on conkey can't make
+  -- that mistake. Multi-column checks are deliberately left alone.
+  FOR c IN
+    SELECT con.conname
+      FROM pg_constraint con
+     WHERE con.conrelid = 'public.subscription_invoices'::regclass
+       AND con.contype = 'c'
+       AND con.conkey = ARRAY[(
+             SELECT att.attnum
+               FROM pg_attribute att
+              WHERE att.attrelid = 'public.subscription_invoices'::regclass
+                AND att.attname = 'status'
+           )]
+  LOOP
+    EXECUTE format('ALTER TABLE public.subscription_invoices DROP CONSTRAINT %I', c.conname);
+  END LOOP;
 
   -- Anything already 'issued' had been emailed to the owner under the old
   -- behaviour — that is exactly what 'sent' now means.
   UPDATE public.subscription_invoices SET status = 'sent' WHERE status = 'issued';
 
+  -- Self-heal: the broken first cut of this migration dropped the
+  -- email_status check by mistake. If that run committed before failing, put
+  -- it back; if it rolled back (the normal case) this is a no-op.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'public.subscription_invoices'::regclass
+       AND contype = 'c'
+       AND conkey = ARRAY[(
+             SELECT att.attnum FROM pg_attribute att
+              WHERE att.attrelid = 'public.subscription_invoices'::regclass
+                AND att.attname = 'email_status'
+           )]
+  ) THEN
+    ALTER TABLE public.subscription_invoices
+      ADD CONSTRAINT subscription_invoices_email_status_check
+      CHECK (email_status IS NULL OR email_status IN ('sent', 'dry_run', 'skipped', 'failed'));
+  END IF;
+
+  -- Re-created unconditionally: the loop above also removed any earlier
+  -- version of this constraint, so re-running the migration is safe.
   ALTER TABLE public.subscription_invoices
     ADD CONSTRAINT subscription_invoices_status_chk
     CHECK (status IN ('draft', 'ready', 'sent', 'void'));
