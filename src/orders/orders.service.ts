@@ -787,6 +787,24 @@ export class OrdersService {
         await reevaluateBedAfterPieceRemoval(client, companyId, bedId);
       }
 
+      // 2c. Mark any invoice billing this order BEFORE the row disappears.
+      //     invoices.order_id is ON DELETE SET NULL, so a moment from now the
+      //     link is gone for good — an accountant would be left with a
+      //     receivable for work that no longer exists and no way to tell. The
+      //     number snapshot is what the Finance UI shows the marker from
+      //     (COALESCE so an invoice predating the snapshot column still gets
+      //     one); order_deleted_at records when. The invoice is deliberately
+      //     NOT auto-voided: only a human should decide that, and a posted
+      //     invoice may well be legitimately owed regardless.
+      await client.query(`
+        UPDATE invoices
+        SET order_number_snapshot = COALESCE(order_number_snapshot, $3),
+            order_deleted_at = NOW(),
+            updated_at = NOW()
+        WHERE company_id = $2
+          AND order_id = $1
+      `, [orderId, companyId, order.order_number]);
+
       // 3. Delete the order
       await client.query(`
         DELETE FROM orders

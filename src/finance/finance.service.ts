@@ -1039,6 +1039,12 @@ export class FinanceService {
         i.due_date::text, i.subtotal::text, i.tax_total::text, i.total::text,
         i.amount_paid::text, i.balance_due::text, i.memo, i.terms,
         i.journal_entry_id, i.created_at, i.updated_at,
+        i.order_number_snapshot, i.order_deleted_at,
+        -- The billed order was destroyed: order_id was nulled by the FK's
+        -- ON DELETE SET NULL, but the snapshot we took at link time remains.
+        -- Derived from the FK itself rather than order_deleted_at, so it holds
+        -- even when the order went away without deleteOrder() running.
+        (i.order_id IS NULL AND i.order_number_snapshot IS NOT NULL) AS order_detached,
         o.order_number
       FROM invoices i
       LEFT JOIN orders o ON o.order_id = i.order_id
@@ -1112,21 +1118,26 @@ export class FinanceService {
         ? await this.customerDisplayName(client, companyId, input.customer_id)
         : input.counterparty_name!;
 
+      // Read the order NUMBER, not just its existence: it is snapshotted onto
+      // the invoice so the link is still legible after the order is deleted
+      // (order_id is nulled by the FK; the snapshot is what survives).
+      let orderNumberSnapshot: string | null = null;
       if (input.order_id) {
-        const order = await this.databaseService.query(
-          `SELECT 1 FROM orders WHERE company_id = $1 AND order_id = $2`,
+        const order = await this.databaseService.query<{ order_number: string }>(
+          `SELECT order_number FROM orders WHERE company_id = $1 AND order_id = $2`,
           [companyId, input.order_id],
           client
         );
         if (!order.rows[0]) throw new NotFoundException("Order not found.");
+        orderNumberSnapshot = order.rows[0].order_number;
       }
 
       const invoiceNumber = await this.nextDocNumber(client, companyId, "invoice", issueDate);
       const created = await this.databaseService.query<{ invoice_id: string }>(
         `
           INSERT INTO invoices
-            (company_id, invoice_number, customer_id, counterparty_name, order_id, issue_date, due_date, memo, terms, created_by)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            (company_id, invoice_number, customer_id, counterparty_name, order_id, order_number_snapshot, issue_date, due_date, memo, terms, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
           RETURNING invoice_id
         `,
         [
@@ -1135,6 +1146,7 @@ export class FinanceService {
           input.customer_id ?? null,
           counterparty,
           input.order_id ?? null,
+          orderNumberSnapshot,
           issueDate,
           input.due_date ?? null,
           input.memo ?? null,
@@ -1462,10 +1474,13 @@ export class FinanceService {
         // lines are wiped and rewritten from the current basis below.
         invoiceId = prior.invoice_id;
         invoiceNumber = prior.invoice_number;
+        // order_number_snapshot is refreshed too — a draft created before the
+        // snapshot column existed would otherwise stay unmarkable if its order
+        // is later deleted.
         await this.databaseService.query(
-          `UPDATE invoices SET customer_id = $3, counterparty_name = $4, updated_at = NOW()
+          `UPDATE invoices SET customer_id = $3, counterparty_name = $4, order_number_snapshot = $5, updated_at = NOW()
             WHERE company_id = $1 AND invoice_id = $2`,
-          [companyId, invoiceId, row.customer_id, counterparty],
+          [companyId, invoiceId, row.customer_id, counterparty, row.order_number],
           client
         );
       } else {
@@ -1473,8 +1488,8 @@ export class FinanceService {
         const created = await this.databaseService.query<{ invoice_id: string }>(
           `
             INSERT INTO invoices
-              (company_id, invoice_number, customer_id, counterparty_name, order_id, issue_date, memo, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+              (company_id, invoice_number, customer_id, counterparty_name, order_id, order_number_snapshot, issue_date, memo, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING invoice_id
           `,
           [
@@ -1483,6 +1498,7 @@ export class FinanceService {
             row.customer_id,
             counterparty,
             orderId,
+            row.order_number,
             issueDate,
             `Generated from order ${row.order_number}`,
             userId
