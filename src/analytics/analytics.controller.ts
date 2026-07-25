@@ -25,11 +25,18 @@ export class AnalyticsController {
     private readonly aiService: AnalyticsAiService
   ) {}
 
+  // ai_enabled is the AND of the deploy-wide switch and this workspace's own
+  // activation, so the client shows Lorelei only where she can actually answer.
+  // ai_available reports the server half alone — that's what lets Settings say
+  // "turn it on" rather than hiding the option on a deploy where AI is off.
   @Get("meta")
   @RequirePermission(DASH_PERMS)
   async meta(@Req() req: AuthRequest) {
-    const meta = await this.analyticsService.meta(req.companyId, req);
-    return { ...meta, ai_enabled: this.aiService.enabled() };
+    const [meta, aiEnabled] = await Promise.all([
+      this.analyticsService.meta(req.companyId, req),
+      this.aiService.enabledForCompany(req.companyId)
+    ]);
+    return { ...meta, ai_enabled: aiEnabled, ai_available: this.aiService.enabled() };
   }
 
   @Get("insights")

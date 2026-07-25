@@ -34,7 +34,11 @@ const ownerSetupSchema = z.object({
   // step. The enum mirrors the seeded self-serve catalogue; enterprise is
   // contact-only and trial is the default, so nothing else is accepted.
   terms_accepted: z.boolean().optional(),
-  plan_code: z.enum(["trial", "starter", "growth"]).optional()
+  plan_code: z.enum(["trial", "starter", "growth"]).optional(),
+  // Optional marketing consent from the signup card (name + logo only).
+  // Absent or false both mean "no" — unlike terms_accepted this is never
+  // required, and nothing in signup fails when it's missing.
+  showcase_opt_in: z.boolean().optional()
 });
 
 const staffSetupSchema = z.object({
@@ -228,6 +232,22 @@ export class AuthController {
       if (branding.rows[0]) Object.assign(profile, branding.rows[0]);
     } catch {
       // branding columns not migrated yet — profile still returns without them
+    }
+    // Best-effort consent/activation flags (2026-07-25 migration). Kept in
+    // their own try/catch rather than folded into the main SELECT above: a
+    // missing column there would 500 /auth/me and lock everyone out until the
+    // migration runs. Absent columns simply read as "off", which is also the
+    // safe default for both — no marketing use, no AI.
+    try {
+      const flags = await this.db.query<{ showcase_opt_in: boolean; showcase_opt_in_at: string | null; ai_analyst_enabled: boolean }>(
+        `SELECT c.showcase_opt_in, c.showcase_opt_in_at, c.ai_analyst_enabled
+         FROM companies c JOIN users u ON u.company_id = c.company_id
+         WHERE u.id = $1`,
+        [userId]
+      );
+      if (flags.rows[0]) Object.assign(profile, flags.rows[0]);
+    } catch {
+      // flags not migrated yet — client treats undefined as off
     }
     // Best-effort terms state — drives the client's re-accept interstitial.
     // Only attached when the tos columns exist (2026-07-17 migration), so a
@@ -483,6 +503,87 @@ export class AuthController {
       [userId]
     );
     return rows[0] ?? null;
+  }
+
+  // Owner-only: the customer-showcase consent flag — permission to use this
+  // company's NAME and LOGO to identify them as a PrintExec customer in our
+  // marketing. Deliberately narrow: it does NOT cover testimonials, quotes,
+  // case studies or business metrics, each of which needs its own signed
+  // release. Withdrawal clears the timestamp too, so the row alone answers
+  // "is consent live, and since when?".
+  //
+  // Returns only the flags; the client merges them into the profile it already
+  // holds rather than swapping the whole object (which would drop license and
+  // terms state that this query doesn't select).
+  @Post("company-showcase")
+  async setCompanyShowcase(
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z.object({ showcase_opt_in: z.boolean() }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("showcase_opt_in must be true or false.");
+    }
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change marketing consent.");
+    }
+
+    const optIn = parsed.data.showcase_opt_in;
+    try {
+      await this.db.query(
+        `UPDATE companies
+            SET showcase_opt_in = $1,
+                showcase_opt_in_at = CASE WHEN $1 THEN now() ELSE NULL END
+          WHERE company_id = $2`,
+        [optIn, companyId]
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not persist showcase_opt_in for ${companyId} (migration pending?): ${err instanceof Error ? err.message : err}`
+      );
+      throw new BadRequestException("Marketing consent isn't available yet — please try again later.");
+    }
+
+    const { rows } = await this.db.query<{ showcase_opt_in: boolean; showcase_opt_in_at: string | null }>(
+      "SELECT showcase_opt_in, showcase_opt_in_at FROM companies WHERE company_id = $1",
+      [companyId]
+    );
+    return { ok: true, ...(rows[0] ?? { showcase_opt_in: optIn, showcase_opt_in_at: null }) };
+  }
+
+  // Owner-only: turn the Lorelei AI analyst on or off for this workspace.
+  // Sits BENEATH the global AI_ANALYST_ENABLED env switch — this only decides
+  // whether an already-available feature is active for this tenant. Off by
+  // default, because enabling it means workspace data (customer names, revenue,
+  // receivables) starts reaching a third-party model on each question.
+  @Post("company-ai")
+  async setCompanyAi(
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z.object({ ai_analyst_enabled: z.boolean() }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("ai_analyst_enabled must be true or false.");
+    }
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can turn the AI analyst on or off.");
+    }
+
+    try {
+      await this.db.query(
+        "UPDATE companies SET ai_analyst_enabled = $1 WHERE company_id = $2",
+        [parsed.data.ai_analyst_enabled, companyId]
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not persist ai_analyst_enabled for ${companyId} (migration pending?): ${err instanceof Error ? err.message : err}`
+      );
+      throw new BadRequestException("The AI analyst setting isn't available yet — please try again later.");
+    }
+
+    return { ok: true, ai_analyst_enabled: parsed.data.ai_analyst_enabled };
   }
 
   // Email-existence pre-check. Called from the account step BEFORE the client
@@ -788,6 +889,25 @@ export class AuthController {
         );
       } catch {
         // licensing tables not migrated yet — resolver will self-heal
+      }
+
+      // Marketing consent from the signup card. Only written when explicitly
+      // true — the column already defaults to false, so an absent or false
+      // value needs no write at all. Kept out of the company INSERT and
+      // best-effort on purpose: a pre-migration column must never roll back a
+      // finished signup, and "we failed to record a yes" degrades to "no",
+      // which is the safe direction for a consent flag.
+      if (owner.showcase_opt_in === true) {
+        try {
+          await this.db.query(
+            "UPDATE companies SET showcase_opt_in = TRUE, showcase_opt_in_at = now() WHERE company_id = $1",
+            [companyId]
+          );
+        } catch (err) {
+          this.logger.warn(
+            `Could not record showcase_opt_in at signup for ${companyId} (migration pending?): ${err instanceof Error ? err.message : err}`
+          );
+        }
       }
 
       // Durable click-wrap record (audit row + users stamp) — after the

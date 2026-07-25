@@ -435,6 +435,29 @@ export class AnalyticsAiService {
     return env("AI_ANALYST_ENABLED") === "true" && !!env("AI_API_KEY") && !!env("AI_MODEL");
   }
 
+  // Per-workspace activation, beneath the deploy-wide `enabled()` switch above.
+  // The Terms say the analyst runs "where a workspace turns it on" and the
+  // Privacy Policy says workspace data only reaches the model when a Subscriber
+  // actively uses the feature — this is what makes both true, rather than every
+  // tenant being live the moment the env var flips on.
+  //
+  // Fails CLOSED: if the flag can't be read (column not migrated yet, query
+  // error), the answer is "off". Wrong-but-off costs a tenant a feature until
+  // the migration lands; wrong-but-on would ship their customer names and
+  // revenue to a third-party model without consent.
+  async enabledForCompany(companyId: string): Promise<boolean> {
+    if (!this.enabled()) return false;
+    try {
+      const { rows } = await this.databaseService.query<{ ai_analyst_enabled: boolean }>(
+        "SELECT ai_analyst_enabled FROM companies WHERE company_id = $1",
+        [companyId]
+      );
+      return rows[0]?.ai_analyst_enabled === true;
+    } catch {
+      return false;
+    }
+  }
+
   private buildAdapter(): ProviderAdapter {
     const provider = env("AI_PROVIDER") ?? "openai";
     const apiKey = env("AI_API_KEY") ?? "";
@@ -489,6 +512,11 @@ export class AnalyticsAiService {
   async ask(body: AskBody, companyId: string, access: AnalyticsAccess) {
     if (!this.enabled()) {
       throw new ServiceUnavailableException("The AI analyst is not enabled on this server.");
+    }
+    if (!(await this.enabledForCompany(companyId))) {
+      throw new ServiceUnavailableException(
+        "Lorelei is turned off for this workspace. An owner can turn it on in Settings."
+      );
     }
     await this.enforceBudget(companyId);
 

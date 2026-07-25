@@ -8,4 +8,4 @@
 // The terms TEXT lives client-side (printexec-client/src/TermsOfUse.tsx),
 // which carries its own copy of this string — the repos are separate, so
 // keep the two in lockstep when bumping.
-export const TERMS_VERSION = "2026-07-17";
+export const TERMS_VERSION = "2026-07-25";
