@@ -1012,8 +1012,17 @@ export class SimpleJobsService {
   // ──────────────────────────────────────────────────────────
   async autoSchedule(
     companyId: string,
-    input: { items: Array<{ id: string; is_bed?: boolean | undefined }> }
+    input: { items: Array<{ id: string; is_bed?: boolean | undefined }>; dry_run?: boolean }
   ) {
+    // dry_run simulates the whole pack and commits nothing — no schedule(), no
+    // reserveSpools(). Everything else (ordering, conflict resolution, the
+    // 60-day horizon, the turnaround gaps) runs identically, so the preview and
+    // the commit agree unless the board changed in between. Caveat worth being
+    // honest about: the guarded schedule() is what rejects an offline printer or
+    // a stale status, and dry_run doesn't call it — so the commit can still skip
+    // an item the preview showed as placed. The response carries `dry_run` so
+    // the client can say that out loud.
+    const dryRun = input.dry_run === true;
     type Interval = { s: number; e: number };
     const LEAD_MS = 4 * 60_000; // clears schedule()'s past-check + operator lead
     // Mandatory turnaround: every job needs ≥5 min of clear time before AND
@@ -1166,12 +1175,48 @@ export class SimpleJobsService {
       return (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0);
     });
 
+    // ── Reserved spools for every candidate, in ONE round trip per kind. This
+    //    used to be a query per candidate inside the loop (up to 200 sequential
+    //    awaits); with the preview flow the pack now runs twice per click, so
+    //    the loop's round trips were about to double. Batched here instead.
+    const reservedByPiece = new Map<string, string[]>();
+    if (ids.length > 0) {
+      const r = await this.db.query<{ piece_id: string; spool_asset_id: string }>(
+        `SELECT piece_id, spool_asset_id FROM order_piece_spools
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+        [companyId, ids]
+      );
+      for (const row of r.rows) {
+        const arr = reservedByPiece.get(row.piece_id) ?? [];
+        arr.push(row.spool_asset_id);
+        reservedByPiece.set(row.piece_id, arr);
+      }
+    }
+    const reservedByBed = new Map<string, string[]>();
+    if (bedIds.length > 0) {
+      const r = await this.db.query<{ bed_id: string; spool_asset_id: string }>(
+        `SELECT DISTINCT op.bed_id, ops.spool_asset_id
+           FROM order_piece_spools ops
+           JOIN order_pieces op ON op.piece_id = ops.piece_id
+          WHERE ops.company_id = $1 AND op.bed_id = ANY($2::uuid[])`,
+        [companyId, bedIds]
+      );
+      for (const row of r.rows) {
+        const arr = reservedByBed.get(row.bed_id) ?? [];
+        arr.push(row.spool_asset_id);
+        reservedByBed.set(row.bed_id, arr);
+      }
+    }
+
     // `slack_minutes` = the pre-scheduling buffer (drives the order); `late` =
     // the placement actually finishes after the deadline; `deadline_at` echoes
-    // the deadline so the UI can explain either.
+    // the deadline so the UI can explain either. `will_reserve_spool` only
+    // appears in a dry run — it marks a piece the commit would auto-reserve
+    // stock for, which is a side effect worth showing before it happens.
     const placed: Array<{
       id: string; is_bed: boolean; name: string; start_at: string; end_at: string;
       deadline_at: string | null; slack_minutes: number | null; late: boolean;
+      printer_id: string | null; minutes: number | null; will_reserve_spool?: boolean;
     }> = [];
     const skipped: Array<{ id: string; is_bed: boolean; name: string; reason: string }> = [];
 
@@ -1193,37 +1238,53 @@ export class SimpleJobsService {
       // Ensure a physical spool is reserved (pieces): auto-plan when absent —
       // the same auto-reservation Save uses, so one click is truly enough.
       let mySpools: string[] = [];
+      let willReserveSpool = false;
       if (!c.is_bed) {
-        const cur = await this.db.query<{ spool_asset_id: string }>(
-          `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
-          [companyId, c.id]
-        );
-        mySpools = cur.rows.map((r) => r.spool_asset_id);
+        mySpools = reservedByPiece.get(c.id) ?? [];
         if (mySpools.length === 0) {
-          try {
-            await this.jobsService.reserveSpools(companyId, c.id, {});
-            const after = await this.db.query<{ spool_asset_id: string }>(
-              `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
-              [companyId, c.id]
-            );
-            mySpools = after.rows.map((r) => r.spool_asset_id);
-          } catch (e) {
-            skipped.push({
-              id: c.id, is_bed: false, name: c.name,
-              reason: e instanceof Error ? e.message : "couldn't reserve a spool",
-            });
-            continue;
+          if (dryRun) {
+            // Don't reserve — ask the planner which spool(s) the commit WOULD
+            // take, so the simulated placement still honours spool exclusivity
+            // instead of ignoring a constraint the real run enforces.
+            willReserveSpool = true;
+            try {
+              const plan = await this.jobsService.filamentPlan(companyId, c.id);
+              mySpools = plan.multicolor
+                ? plan.slots.flatMap((s) => s.allocation.map((a) => a.spool_asset_id))
+                : plan.allocation.map((a) => a.spool_asset_id);
+              if (mySpools.length === 0) {
+                skipped.push({
+                  id: c.id, is_bed: false, name: c.name,
+                  reason: "no spool in stock covers this piece's filament",
+                });
+                continue;
+              }
+            } catch (e) {
+              skipped.push({
+                id: c.id, is_bed: false, name: c.name,
+                reason: e instanceof Error ? e.message : "couldn't plan a spool",
+              });
+              continue;
+            }
+          } else {
+            try {
+              await this.jobsService.reserveSpools(companyId, c.id, {});
+              const after = await this.db.query<{ spool_asset_id: string }>(
+                `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+                [companyId, c.id]
+              );
+              mySpools = after.rows.map((r) => r.spool_asset_id);
+            } catch (e) {
+              skipped.push({
+                id: c.id, is_bed: false, name: c.name,
+                reason: e instanceof Error ? e.message : "couldn't reserve a spool",
+              });
+              continue;
+            }
           }
         }
       } else {
-        const cur = await this.db.query<{ spool_asset_id: string }>(
-          `SELECT DISTINCT ops.spool_asset_id
-             FROM order_piece_spools ops
-             JOIN order_pieces op ON op.piece_id = ops.piece_id
-            WHERE ops.company_id = $1 AND op.bed_id = $2`,
-          [companyId, c.id]
-        );
-        mySpools = cur.rows.map((r) => r.spool_asset_id);
+        mySpools = reservedByBed.get(c.id) ?? [];
       }
 
       // Earliest instant where printer ∧ nozzle ∧ every spool are free.
@@ -1251,17 +1312,21 @@ export class SimpleJobsService {
         continue;
       }
 
-      // Commit through the guarded schedule() — never around it.
+      // Commit through the guarded schedule() — never around it. A dry run
+      // stops here: the placement is still recorded in the local busy maps
+      // below, so the rest of the batch packs around it exactly as it would.
       const startIso = new Date(startMs).toISOString();
-      try {
-        if (c.is_bed) await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
-        else await this.jobsService.schedule(companyId, c.id, { start_at: startIso });
-      } catch (e) {
-        skipped.push({
-          id: c.id, is_bed: c.is_bed, name: c.name,
-          reason: e instanceof Error ? e.message : "schedule was rejected",
-        });
-        continue;
+      if (!dryRun) {
+        try {
+          if (c.is_bed) await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
+          else await this.jobsService.schedule(companyId, c.id, { start_at: startIso });
+        } catch (e) {
+          skipped.push({
+            id: c.id, is_bed: c.is_bed, name: c.name,
+            reason: e instanceof Error ? e.message : "schedule was rejected",
+          });
+          continue;
+        }
       }
       const iv = { s: startMs, e: startMs + durMs };
       push(printerBusy, c.printer_id, iv);
@@ -1275,12 +1340,15 @@ export class SimpleJobsService {
         deadline_at: c.deadline ?? null,
         slack_minutes: hasDl ? Math.round((dlMs - now - durMs) / 60_000) : null,
         late: hasDl && startMs + durMs > dlMs,
+        printer_id: c.printer_id,
+        minutes: c.minutes,
+        ...(dryRun ? { will_reserve_spool: willReserveSpool } : {}),
       });
     }
 
     // Surface the packing order actually used (least slack first) so the client
     // can show why each job landed where it did — and how many will still miss
     // their deadline even after optimal packing.
-    return { placed, skipped, ordered_by: "least_slack_first" as const };
+    return { placed, skipped, ordered_by: "least_slack_first" as const, dry_run: dryRun };
   }
 }

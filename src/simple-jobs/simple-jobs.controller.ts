@@ -79,6 +79,11 @@ const autoScheduleSchema = z.object({
     .array(z.object({ id: z.string().uuid(), is_bed: z.boolean().optional() }))
     .min(1)
     .max(200),
+  // Simulate the pack and return the plan WITHOUT committing anything: no
+  // schedule() calls, no spool reservations. Lets the operator review "12
+  // placed, 2 late, 1 skipped" before agreeing to it — a heuristic that
+  // rearranges the whole shop floor shouldn't fire on a single blind click.
+  dry_run: z.boolean().optional().default(false),
 });
 
 // Simple-mode Jobs surface. Additive — the Advanced /jobs endpoints are
@@ -133,6 +138,7 @@ export class SimpleJobsController {
   // One-click constraint-satisfying packer: earliest slot per item where its
   // printer, nozzle and reserved spool(s) are ALL free; commits via the
   // guarded jobs/beds schedule(). Mixed pieces + beds. Available in both modes.
+  // Pass dry_run to get the same plan back without committing it.
   @Post("auto-schedule")
   @RequirePermission("action_orders")
   autoSchedule(@CompanyId() companyId: string, @Body() body: unknown) {
