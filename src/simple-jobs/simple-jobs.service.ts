@@ -9,6 +9,17 @@ import {
   recomputeOrderStatusTx,
   releasePrinterForPieceTx,
 } from "../common/cascade";
+// The scheduling kernel — pure, unit-tested placement math (see packing.ts and
+// test/packing.test.ts). autoSchedule keeps the I/O and calls in here to decide.
+import {
+  earliestFit,
+  chooseNozzle,
+  nozzleFits,
+  compareBySlack,
+  UNUSABLE_NOZZLE_STATUS,
+  type Interval,
+  type NozzleOption,
+} from "./packing";
 
 // Simple mode treats both resin technologies as one family — assigning an SLA
 // part to an MSLA printer (or vice-versa) is fine; only cross-family is
@@ -1010,25 +1021,151 @@ export class SimpleJobsService {
   // Pieces with no spool reservation get the auto-planned spool reserved
   // first (same fallback the manual Reserve button uses).
   // ──────────────────────────────────────────────────────────
+  /**
+   * Everything the fleet-wide packer would act on: ready, unscheduled, and
+   * actually assigned to a printer. Deliberately the same gate autoSchedule's
+   * loop applies, so the count on the button matches what the plan contains.
+   */
+  async listSchedulable(companyId: string, printerIds?: string[]) {
+    const scoped = printerIds && printerIds.length > 0;
+    const params: unknown[] = [companyId];
+    if (scoped) params.push(printerIds);
+    const pieces = await this.db.query<{
+      piece_id: string; piece_name: string; printer_id: string;
+      printer_label: string | null; minutes: number | null; deadline: string | null;
+    }>(
+      `SELECT op.piece_id, op.piece_name, op.assigned_printer_id AS printer_id,
+              CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS printer_label,
+              op.slicer_print_time_minutes AS minutes, o.deadline::text AS deadline
+         FROM order_pieces op
+         JOIN orders o ON o.order_id = op.order_id
+         LEFT JOIN printer_instances pi ON pi.printer_id = op.assigned_printer_id
+        WHERE op.company_id = $1 AND op.status = 'ready'
+          AND op.assigned_printer_id IS NOT NULL
+          AND op.scheduled_start_at IS NULL
+          AND op.bed_id IS NULL
+          ${scoped ? "AND op.assigned_printer_id = ANY($2::uuid[])" : ""}`,
+      params
+    );
+    type Item = {
+      id: string; is_bed: boolean; name: string;
+      printer_id: string; printer_label: string | null;
+      minutes: number | null; deadline: string | null;
+    };
+    const items: Item[] = pieces.rows.map((r) => ({
+      id: r.piece_id, is_bed: false, name: r.piece_name,
+      printer_id: r.printer_id, printer_label: r.printer_label,
+      minutes: r.minutes != null ? Number(r.minutes) : null,
+      deadline: r.deadline,
+    }));
+    try {
+      const beds = await this.db.query<{
+        bed_id: string; bed_name: string; printer_id: string;
+        printer_label: string | null; minutes: number | null; deadline: string | null;
+      }>(
+        `SELECT b.bed_id, b.bed_name, b.assigned_printer_id AS printer_id,
+                CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS printer_label,
+                b.slicer_print_time_minutes AS minutes,
+                b.effective_deadline::text AS deadline
+           FROM print_beds b
+           LEFT JOIN printer_instances pi ON pi.printer_id = b.assigned_printer_id
+          WHERE b.company_id = $1 AND b.status = 'ready'
+            AND b.assigned_printer_id IS NOT NULL
+            AND b.scheduled_start_at IS NULL
+            ${scoped ? "AND b.assigned_printer_id = ANY($2::uuid[])" : ""}`,
+        params
+      );
+      for (const r of beds.rows) {
+        items.push({
+          id: r.bed_id, is_bed: true, name: r.bed_name,
+          printer_id: r.printer_id, printer_label: r.printer_label,
+          minutes: r.minutes != null ? Number(r.minutes) : null,
+          deadline: r.deadline,
+        });
+      }
+    } catch { /* print_beds not migrated yet — pieces alone are correct */ }
+
+    const printers = new Map<string, { printer_id: string; printer_label: string | null; jobs: number }>();
+    for (const i of items) {
+      const cur = printers.get(i.printer_id) ?? { printer_id: i.printer_id, printer_label: i.printer_label, jobs: 0 };
+      cur.jobs += 1;
+      printers.set(i.printer_id, cur);
+    }
+    return { items, printers: Array.from(printers.values()) };
+  }
+
+  /**
+   * Fleet-wide pack. Gathers the whole schedulable backlog and hands it to the
+   * one packer, so all printers are filled in a single least-slack pass.
+   *
+   * Why this matters beyond convenience: run per-printer and each run only sees
+   * its own printer's contention, so two printers that share a nozzle both plan
+   * as if they own it and the second commit collides. One pass over the whole
+   * fleet resolves shared nozzles and spools globally — which is also what lets
+   * nozzle substitution pay off, since it can see that the 0.4mm brass on
+   * Printer 2 is idle exactly when Printer 1 wants one.
+   */
+  async autoScheduleAll(
+    companyId: string,
+    input: {
+      dry_run?: boolean | undefined;
+      min_margin_minutes?: number | undefined;
+      allow_nozzle_swap?: boolean | undefined;
+      printer_ids?: string[] | undefined;
+    }
+  ) {
+    const { items, printers } = await this.listSchedulable(companyId, input.printer_ids);
+    if (items.length === 0) {
+      return {
+        placed: [], skipped: [], ordered_by: "least_slack_first" as const,
+        dry_run: input.dry_run === true,
+        min_margin_minutes: input.min_margin_minutes ?? 5,
+        nozzle_swaps: 0, span_minutes: 0, utilisation: [],
+        printers,
+      };
+    }
+    const result = await this.autoSchedule(companyId, {
+      items: items.map((i) => ({ id: i.id, is_bed: i.is_bed })),
+      ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
+      ...(input.min_margin_minutes !== undefined ? { min_margin_minutes: input.min_margin_minutes } : {}),
+      ...(input.allow_nozzle_swap !== undefined ? { allow_nozzle_swap: input.allow_nozzle_swap } : {}),
+    });
+    // Carry the printer roster through so the review step can label lanes
+    // without a second round trip.
+    return { ...result, printers };
+  }
+
   async autoSchedule(
     companyId: string,
-    input: { items: Array<{ id: string; is_bed?: boolean | undefined }>; dry_run?: boolean }
+    input: {
+      items: Array<{ id: string; is_bed?: boolean | undefined }>;
+      dry_run?: boolean | undefined;
+      min_margin_minutes?: number | undefined;
+      allow_nozzle_swap?: boolean | undefined;
+    }
   ) {
     // dry_run simulates the whole pack and commits nothing — no schedule(), no
-    // reserveSpools(). Everything else (ordering, conflict resolution, the
-    // 60-day horizon, the turnaround gaps) runs identically, so the preview and
-    // the commit agree unless the board changed in between. Caveat worth being
-    // honest about: the guarded schedule() is what rejects an offline printer or
-    // a stale status, and dry_run doesn't call it — so the commit can still skip
-    // an item the preview showed as placed. The response carries `dry_run` so
-    // the client can say that out loud.
+    // reserveSpools(), no nozzle swap. Everything else (ordering, conflict
+    // resolution, the 60-day horizon, the margins) runs identically, so the
+    // preview and the commit agree unless the board changed in between. Caveat
+    // worth being honest about: the guarded schedule() is what rejects an
+    // offline printer or a stale status, and dry_run doesn't call it — so the
+    // commit can still skip an item the preview showed as placed. The response
+    // carries `dry_run` so the client can say that out loud.
     const dryRun = input.dry_run === true;
-    type Interval = { s: number; e: number };
     const LEAD_MS = 4 * 60_000; // clears schedule()'s past-check + operator lead
-    // Mandatory turnaround: every job needs ≥5 min of clear time before AND
-    // after any other block on a shared resource — physically you must pull the
-    // finished print and prep the bed. So no two sequential jobs ever touch.
-    const GAP_MS = 5 * 60_000;
+    // Turnaround between two blocks on any shared resource. Defaults to the
+    // 5 min this has always enforced — physically you must pull the finished
+    // print and prep the bed — but the operator can override it per run from the
+    // review step, down to 0 for genuinely back-to-back work. Clamped to a day
+    // so a fat-fingered value can't silently empty the board.
+    const GAP_MS = Math.max(0, Math.min(1440, input.min_margin_minutes ?? 5)) * 60_000;
+    // Nozzle substitution: when a piece's assigned nozzle is tied up, look for
+    // another nozzle of the SAME spec on the same printer and take the one that
+    // frees the earliest slot. On by default — it's the single biggest source of
+    // false serialisation, since one busy 0.4mm brass nozzle would otherwise
+    // stall every piece that wants a 0.4mm brass nozzle.
+    const allowNozzleSwap = input.allow_nozzle_swap !== false;
     const HORIZON_MS = 60 * 24 * 60 * 60_000;
     const now = Date.now();
 
@@ -1102,6 +1239,9 @@ export class SimpleJobsService {
       id: string; is_bed: boolean; name: string; status: string;
       printer_id: string | null; nozzle_id: string | null;
       minutes: number | null; deadline: string | null;
+      // The nozzle SPEC the piece needs, which is what makes substitution
+      // possible: any nozzle meeting this spec will print it identically.
+      req_dia: number | null; req_mat: string | null;
     };
     const candidates: Candidate[] = [];
     if (ids.length > 0) {
@@ -1109,9 +1249,11 @@ export class SimpleJobsService {
         piece_id: string; piece_name: string; status: string;
         assigned_printer_id: string | null; assigned_nozzle_asset_id: string | null;
         slicer_print_time_minutes: number | null; deadline: string | null;
+        required_nozzle_diameter_mm: number | null; required_nozzle_material: string | null;
       }>(
         `SELECT op.piece_id, op.piece_name, op.status, op.assigned_printer_id,
                 op.assigned_nozzle_asset_id, op.slicer_print_time_minutes,
+                op.required_nozzle_diameter_mm, op.required_nozzle_material,
                 o.deadline::text AS deadline
            FROM order_pieces op
            JOIN orders o ON o.order_id = op.order_id
@@ -1124,6 +1266,8 @@ export class SimpleJobsService {
           printer_id: p.assigned_printer_id, nozzle_id: p.assigned_nozzle_asset_id,
           minutes: p.slicer_print_time_minutes != null ? Number(p.slicer_print_time_minutes) : null,
           deadline: p.deadline,
+          req_dia: p.required_nozzle_diameter_mm != null ? Number(p.required_nozzle_diameter_mm) : null,
+          req_mat: p.required_nozzle_material,
         });
       }
     }
@@ -1132,9 +1276,11 @@ export class SimpleJobsService {
         bed_id: string; bed_name: string; status: string;
         assigned_printer_id: string | null; assigned_nozzle_asset_id: string | null;
         slicer_print_time_minutes: number | null; deadline: string | null;
+        required_nozzle_diameter_mm: number | null; required_nozzle_material: string | null;
       }>(
         `SELECT bed_id, bed_name, status, assigned_printer_id, assigned_nozzle_asset_id,
-                slicer_print_time_minutes, effective_deadline::text AS deadline
+                slicer_print_time_minutes, required_nozzle_diameter_mm,
+                required_nozzle_material, effective_deadline::text AS deadline
            FROM print_beds
           WHERE company_id = $1 AND bed_id = ANY($2::uuid[])`,
         [companyId, bedIds]
@@ -1145,7 +1291,51 @@ export class SimpleJobsService {
           printer_id: b.assigned_printer_id, nozzle_id: b.assigned_nozzle_asset_id,
           minutes: b.slicer_print_time_minutes != null ? Number(b.slicer_print_time_minutes) : null,
           deadline: b.deadline,
+          req_dia: b.required_nozzle_diameter_mm != null ? Number(b.required_nozzle_diameter_mm) : null,
+          req_mat: b.required_nozzle_material,
         });
+      }
+    }
+
+    // ── Nozzle roster for every printer in this batch, in ONE query. A nozzle is
+    //    interchangeable with another of the same diameter + material, so this
+    //    turns "which nozzle" from a fixed input into a choice the packer makes.
+    //    installed_on_asset_id matters: a nozzle sitting on ANOTHER printer can
+    //    still be used, but someone has to physically move it, so those are
+    //    ranked last and reported in the plan rather than assumed free.
+    const nozzlesByPrinter = new Map<string, NozzleOption[]>();
+    const printerIds = Array.from(
+      new Set(candidates.map((c) => c.printer_id).filter((p): p is string => !!p))
+    );
+    if (allowNozzleSwap && printerIds.length > 0) {
+      const r = await this.db.query<{
+        printer_id: string; nozzle_asset_id: string;
+        nozzle_diameter_mm: number | null; nozzle_material: string | null;
+        status: string; installed_on: string | null;
+      }>(
+        `SELECT pnc.printer_id, pnc.nozzle_asset_id,
+                ai.nozzle_diameter_mm, ai.nozzle_material,
+                COALESCE(asto.status, 'available') AS status,
+                asto.installed_on_asset_id AS installed_on
+           FROM printer_nozzle_compatibility pnc
+           JOIN asset_instances ai ON ai.asset_id = pnc.nozzle_asset_id
+           LEFT JOIN asset_stock asto ON asto.asset_id = pnc.nozzle_asset_id
+          WHERE pnc.company_id = $1 AND pnc.printer_id = ANY($2::uuid[])`,
+        [companyId, printerIds]
+      );
+      for (const n of r.rows) {
+        const arr = nozzlesByPrinter.get(n.printer_id) ?? [];
+        const dia = n.nozzle_diameter_mm != null ? Number(n.nozzle_diameter_mm) : null;
+        arr.push({
+          nozzle_asset_id: n.nozzle_asset_id,
+          nozzle_diameter_mm: dia,
+          nozzle_material: n.nozzle_material,
+          status: n.status,
+          installed_on: n.installed_on,
+          label: [dia != null ? `${dia}mm` : null, n.nozzle_material].filter(Boolean).join(" ")
+            || `Nozzle ${n.nozzle_asset_id.slice(0, 6)}`,
+        });
+        nozzlesByPrinter.set(n.printer_id, arr);
       }
     }
     // LEAST-SLACK-FIRST (minimum-laxity). Slack = how much idle buffer a job
@@ -1159,21 +1349,7 @@ export class SimpleJobsService {
     // as physically possible. No deadline → +∞ slack (packed last, after every
     // time-critical job). Ties break by earlier deadline, then the queue order.
     const orderIndex = new Map(input.items.map((i, idx) => [i.id, idx]));
-    const slackOf = (c: Candidate): number => {
-      if (!c.deadline) return Infinity;
-      const dl = Date.parse(c.deadline);
-      if (Number.isNaN(dl)) return Infinity;
-      return dl - now - Math.max(0, c.minutes ?? 0) * 60_000;
-    };
-    candidates.sort((a, b) => {
-      const sa = slackOf(a);
-      const sb = slackOf(b);
-      if (sa !== sb) return sa - sb;
-      const da = a.deadline ? Date.parse(a.deadline) : Infinity;
-      const db_ = b.deadline ? Date.parse(b.deadline) : Infinity;
-      if (da !== db_) return da - db_;
-      return (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0);
-    });
+    candidates.sort((a, b) => compareBySlack(a, b, now, orderIndex));
 
     // ── Reserved spools for every candidate, in ONE round trip per kind. This
     //    used to be a query per candidate inside the loop (up to 200 sequential
@@ -1217,6 +1393,12 @@ export class SimpleJobsService {
       id: string; is_bed: boolean; name: string; start_at: string; end_at: string;
       deadline_at: string | null; slack_minutes: number | null; late: boolean;
       printer_id: string | null; minutes: number | null; will_reserve_spool?: boolean;
+      nozzle_asset_id: string | null;
+      // Present only when the packer picked a different nozzle than the one
+      // assigned — the operator needs to know a swap is part of this plan.
+      nozzle_swapped?: true;
+      nozzle_label?: string | null;
+      nozzle_move_from_printer_id?: string | null;
     }> = [];
     const skipped: Array<{ id: string; is_bed: boolean; name: string; reason: string }> = [];
 
@@ -1287,26 +1469,46 @@ export class SimpleJobsService {
         mySpools = reservedByBed.get(c.id) ?? [];
       }
 
-      // Earliest instant where printer ∧ nozzle ∧ every spool are free.
+      // ── Earliest instant where printer ∧ nozzle ∧ every spool are free.
+      //    First-fit forward scan: start at the lead time and jump past any block
+      //    that overlaps (padded by the margin on both sides), repeating until a
+      //    full pass moves nothing. Because it only ever jumps to the END of a
+      //    conflict, it settles into the first gap wide enough to hold the job —
+      //    so short jobs backfill holes instead of queueing at the tail, which is
+      //    where most of the utilisation comes from.
       const durMs = Math.max(1, c.minutes) * 60_000;
-      const busy: Interval[] = [
-        ...(printerBusy.get(c.printer_id) ?? []),
-        ...(c.nozzle_id ? nozzleBusy.get(c.nozzle_id) ?? [] : []),
-        ...mySpools.flatMap((sid) => spoolBusy.get(sid) ?? []),
-      ].sort((a, b) => a.s - b.s);
-      let startMs = now + LEAD_MS;
-      let moved = true;
-      while (moved) {
-        moved = false;
-        for (const iv of busy) {
-          // Treat each block as padded by GAP on both sides so the placed job
-          // keeps its 5-min turnaround from whatever it sits next to.
-          if (startMs < iv.e + GAP_MS && startMs + durMs > iv.s - GAP_MS) {
-            startMs = iv.e + GAP_MS;
-            moved = true;
-          }
-        }
-      }
+      const printerIvs = printerBusy.get(c.printer_id) ?? [];
+      const spoolIvs = mySpools.flatMap((sid) => spoolBusy.get(sid) ?? []);
+      const earliestWith = (nozzleId: string | null): number =>
+        earliestFit(
+          [...printerIvs, ...(nozzleId ? nozzleBusy.get(nozzleId) ?? [] : []), ...spoolIvs],
+          durMs,
+          now + LEAD_MS,
+          GAP_MS,
+        );
+
+      // ── Nozzle substitution. The assigned nozzle is one option, not the only
+      //    one: any nozzle on this printer meeting the piece's spec prints it
+      //    identically, so the packer takes whichever opens the earliest slot.
+      //    'damaged' is the only status that rules a nozzle out — 'installed'
+      //    and 'in_use' are the common, perfectly usable cases.
+      const options = allowNozzleSwap
+        ? (nozzlesByPrinter.get(c.printer_id) ?? []).filter(
+            (n) => nozzleFits(n, c.req_dia, c.req_mat) && n.status !== UNUSABLE_NOZZLE_STATUS
+          )
+        : [];
+      const nozzleChoice = chooseNozzle({
+        assignedId: c.nozzle_id,
+        printerId: c.printer_id,
+        options,
+        earliestFor: earliestWith,
+      });
+      const chosenNozzle = nozzleChoice.id;
+      const startMs = nozzleChoice.startMs;
+      const nozzleMovedFrom = nozzleChoice.movedFromPrinterId;
+      const chosenLabel = nozzleChoice.label;
+      const nozzleSwapped = nozzleChoice.swapped;
+
       if (startMs + durMs > now + HORIZON_MS) {
         skipped.push({ id: c.id, is_bed: c.is_bed, name: c.name, reason: "no free slot within 60 days" });
         continue;
@@ -1317,6 +1519,22 @@ export class SimpleJobsService {
       // below, so the rest of the batch packs around it exactly as it would.
       const startIso = new Date(startMs).toISOString();
       if (!dryRun) {
+        // Persist the nozzle swap BEFORE scheduling, while the item is still
+        // 'ready' and setNozzle() will take it freely. setNozzle re-validates
+        // compatibility itself, so a roster that went stale mid-batch is caught
+        // here rather than writing a nozzle the printer can't mount.
+        if (nozzleSwapped && chosenNozzle) {
+          try {
+            if (c.is_bed) await this.bedsService.setNozzle(companyId, c.id, chosenNozzle);
+            else await this.jobsService.setNozzle(companyId, c.id, chosenNozzle);
+          } catch (e) {
+            skipped.push({
+              id: c.id, is_bed: c.is_bed, name: c.name,
+              reason: e instanceof Error ? `couldn't switch nozzle — ${e.message}` : "couldn't switch nozzle",
+            });
+            continue;
+          }
+        }
         try {
           if (c.is_bed) await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
           else await this.jobsService.schedule(companyId, c.id, { start_at: startIso });
@@ -1330,7 +1548,9 @@ export class SimpleJobsService {
       }
       const iv = { s: startMs, e: startMs + durMs };
       push(printerBusy, c.printer_id, iv);
-      push(nozzleBusy, c.nozzle_id, iv);
+      // Book the nozzle we actually chose, not the one that was assigned —
+      // otherwise the next candidate would think the substitute is still free.
+      push(nozzleBusy, chosenNozzle, iv);
       for (const sid of mySpools) push(spoolBusy, sid, iv);
       const dlMs = c.deadline ? Date.parse(c.deadline) : NaN;
       const hasDl = !Number.isNaN(dlMs);
@@ -1342,13 +1562,64 @@ export class SimpleJobsService {
         late: hasDl && startMs + durMs > dlMs,
         printer_id: c.printer_id,
         minutes: c.minutes,
+        nozzle_asset_id: chosenNozzle,
+        ...(nozzleSwapped ? {
+          nozzle_swapped: true as const,
+          nozzle_label: chosenLabel,
+          // Set only when the substitute currently sits on a DIFFERENT printer,
+          // i.e. the operator has to physically carry it over before this start.
+          nozzle_move_from_printer_id: nozzleMovedFrom,
+        } : {}),
         ...(dryRun ? { will_reserve_spool: willReserveSpool } : {}),
       });
     }
 
+    // ── Per-printer utilisation of the plan. "Maximum machine utilisation" is
+    //    the objective, so the plan has to be able to show whether it hit it:
+    //    busy = the minutes this plan books on the machine, span = wall-clock
+    //    from the first start to the last end across the whole plan. A printer
+    //    that packs 8h of work into an 8h span is saturated; one that spreads
+    //    2h across 30h is where the operator should look.
+    let planFrom = Infinity;
+    let planTo = -Infinity;
+    for (const p of placed) {
+      planFrom = Math.min(planFrom, Date.parse(p.start_at));
+      planTo = Math.max(planTo, Date.parse(p.end_at));
+    }
+    const spanMinutes = placed.length > 0 ? Math.round((planTo - planFrom) / 60_000) : 0;
+    const perPrinter = new Map<string, { booked_minutes: number; jobs: number }>();
+    for (const p of placed) {
+      if (!p.printer_id) continue;
+      const cur = perPrinter.get(p.printer_id) ?? { booked_minutes: 0, jobs: 0 };
+      cur.booked_minutes += Math.round((Date.parse(p.end_at) - Date.parse(p.start_at)) / 60_000);
+      cur.jobs += 1;
+      perPrinter.set(p.printer_id, cur);
+    }
+    const utilisation = Array.from(perPrinter.entries())
+      .map(([printer_id, v]) => ({
+        printer_id,
+        booked_minutes: v.booked_minutes,
+        jobs: v.jobs,
+        // Share of the plan's wall-clock window this machine is actually running.
+        // Null when the plan is a single instant (nothing to be a fraction of).
+        utilisation_pct: spanMinutes > 0 ? Math.round((v.booked_minutes / spanMinutes) * 100) : null,
+      }))
+      .sort((a, b) => b.booked_minutes - a.booked_minutes);
+
     // Surface the packing order actually used (least slack first) so the client
     // can show why each job landed where it did — and how many will still miss
     // their deadline even after optimal packing.
-    return { placed, skipped, ordered_by: "least_slack_first" as const, dry_run: dryRun };
+    return {
+      placed,
+      skipped,
+      ordered_by: "least_slack_first" as const,
+      dry_run: dryRun,
+      // Echo the knobs the plan was computed with, so the review step can show
+      // what it's reviewing and re-run with a different margin.
+      min_margin_minutes: Math.round(GAP_MS / 60_000),
+      nozzle_swaps: placed.filter((p) => p.nozzle_swapped).length,
+      span_minutes: spanMinutes,
+      utilisation,
+    };
   }
 }

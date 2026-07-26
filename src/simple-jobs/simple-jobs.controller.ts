@@ -80,10 +80,30 @@ const autoScheduleSchema = z.object({
     .min(1)
     .max(200),
   // Simulate the pack and return the plan WITHOUT committing anything: no
-  // schedule() calls, no spool reservations. Lets the operator review "12
-  // placed, 2 late, 1 skipped" before agreeing to it — a heuristic that
-  // rearranges the whole shop floor shouldn't fire on a single blind click.
+  // schedule() calls, no spool reservations, no nozzle swaps. Lets the operator
+  // review "12 placed, 2 late, 1 skipped" before agreeing to it — a heuristic
+  // that rearranges the whole shop floor shouldn't fire on a single blind click.
   dry_run: z.boolean().optional().default(false),
+  // Turnaround left clear on either side of every placement, on printers,
+  // nozzles and spools alike. Defaults to the 5 min the packer has always
+  // enforced; the review step can override it per run, including to 0 for
+  // genuinely back-to-back work. Capped at a day.
+  min_margin_minutes: z.number().int().min(0).max(1440).optional(),
+  // Let the packer substitute an equivalent nozzle (same diameter + material, on
+  // the same printer) when the assigned one is tied up. Defaults on — it's the
+  // main source of false serialisation. Set false to pin every piece to the
+  // nozzle a human chose.
+  allow_nozzle_swap: z.boolean().optional(),
+});
+
+// Fleet-wide pack: no item list, the server gathers every schedulable item
+// itself. Same knobs as the item-scoped form.
+const autoScheduleAllSchema = z.object({
+  dry_run: z.boolean().optional().default(false),
+  min_margin_minutes: z.number().int().min(0).max(1440).optional(),
+  allow_nozzle_swap: z.boolean().optional(),
+  // Restrict to specific printers; omitted or empty = the whole fleet.
+  printer_ids: z.array(z.string().uuid()).max(200).optional(),
 });
 
 // Simple-mode Jobs surface. Additive — the Advanced /jobs endpoints are
@@ -146,5 +166,27 @@ export class SimpleJobsController {
       companyId,
       parseWithSchema(autoScheduleSchema, body)
     );
+  }
+
+  // Fleet-wide pack. Same engine, but the item list is the whole schedulable
+  // backlog rather than one printer's bucket — so every machine is packed in a
+  // single least-slack pass and a nozzle contended between two printers is
+  // resolved once, globally, instead of each printer's run guessing separately.
+  @Post("auto-schedule-all")
+  @RequirePermission("action_orders")
+  autoScheduleAll(@CompanyId() companyId: string, @Body() body: unknown) {
+    return this.simpleJobsService.autoScheduleAll(
+      companyId,
+      parseWithSchema(autoScheduleAllSchema, body)
+    );
+  }
+
+  // What the fleet-wide pack would operate on — every ready, unscheduled,
+  // printer-assigned piece/bed. Lets the client show "24 items across 5
+  // printers" on the button without POSTing a dry run first.
+  @Get("schedulable")
+  @RequirePermission("view_orders")
+  schedulable(@CompanyId() companyId: string) {
+    return this.simpleJobsService.listSchedulable(companyId);
   }
 }
