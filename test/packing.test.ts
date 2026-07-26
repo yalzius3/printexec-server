@@ -10,6 +10,7 @@ import {
   earliestFit,
   chooseNozzle,
   nozzleFits,
+  nozzleSpecKey,
   slackMs,
   compareBySlack,
   type Interval,
@@ -291,6 +292,101 @@ test("chooseNozzle: no assigned nozzle means no substitution", () => {
   });
   assert.equal(d.id, null);
   assert.equal(d.swapped, false);
+});
+
+// ── Nozzle policy ──────────────────────────────────────────────────────────
+
+test("chooseNozzle: keep_assigned never substitutes, however much time it costs", () => {
+  const d = chooseNozzle({
+    assignedId: "A",
+    printerId: "P1",
+    options: [nozzle("A", "P1"), nozzle("B", "P1")],
+    // The assigned nozzle is tied up for 8h; the twin is free right now.
+    earliestFor: (id) => (id === "A" ? T0 + 8 * H : T0),
+    policy: "keep_assigned",
+  });
+  assert.equal(d.id, "A");
+  assert.equal(d.swapped, false);
+  assert.equal(d.startMs, T0 + 8 * H);   // waits rather than swaps
+});
+
+test("chooseNozzle: minimise_changes reuses the pinned nozzle even when slower", () => {
+  // This is the whole point of the policy: the printer already has B fitted for
+  // this spec, so a later job takes B and waits rather than mounting C.
+  const d = chooseNozzle({
+    assignedId: "A",
+    printerId: "P1",
+    options: [nozzle("A", "P1"), nozzle("B", "P1"), nozzle("C", "P1")],
+    earliestFor: (id) => (id === "B" ? T0 + 5 * H : T0),
+    policy: "minimise_changes",
+    pinnedId: "B",
+  });
+  assert.equal(d.id, "B");
+  assert.equal(d.startMs, T0 + 5 * H);
+  assert.equal(d.swapped, true);        // differs from the assignment
+});
+
+test("chooseNozzle: minimise_changes picks the least disruptive nozzle when nothing is pinned", () => {
+  // First job of this spec on this printer. The assigned nozzle fits, so it
+  // wins outright — no reason to mount anything else.
+  const d = chooseNozzle({
+    assignedId: "A",
+    printerId: "P1",
+    options: [nozzle("A", "P1"), nozzle("B", null), nozzle("C", "P2")],
+    earliestFor: (id) => (id === "A" ? T0 + 9 * H : T0),
+    policy: "minimise_changes",
+    pinnedId: null,
+  });
+  assert.equal(d.id, "A");
+  assert.equal(d.swapped, false);
+});
+
+test("chooseNozzle: minimise_changes prefers an on-printer nozzle over one needing a walk", () => {
+  // Assigned nozzle doesn't fit the spec, so something must be mounted. B is
+  // already on this printer; C would have to be carried from P2.
+  const d = chooseNozzle({
+    assignedId: "X",
+    printerId: "P1",
+    options: [nozzle("C", "P2"), nozzle("B", "P1")],
+    earliestFor: () => T0,
+    policy: "minimise_changes",
+  });
+  assert.equal(d.id, "B");
+  assert.equal(d.movedFromPrinterId, null);
+});
+
+test("chooseNozzle: a pinned nozzle that no longer fits the spec is ignored", () => {
+  // The pin is per printer+spec, so a different spec must not inherit it. If a
+  // stale pin ever arrives, fall back rather than plan an incompatible nozzle.
+  const d = chooseNozzle({
+    assignedId: "A",
+    printerId: "P1",
+    options: [nozzle("A", "P1"), nozzle("B", "P1")],
+    earliestFor: () => T0,
+    policy: "minimise_changes",
+    pinnedId: "NOT-IN-OPTIONS",
+  });
+  assert.equal(d.id, "A");
+  assert.equal(d.swapped, false);
+});
+
+test("chooseNozzle: earliest remains the default when no policy is given", () => {
+  const d = chooseNozzle({
+    assignedId: "A",
+    printerId: "P1",
+    options: [nozzle("A", "P1"), nozzle("B", "P1")],
+    earliestFor: (id) => (id === "A" ? T0 + 8 * H : T0),
+  });
+  assert.equal(d.id, "B");
+  assert.equal(d.swapped, true);
+});
+
+test("nozzleSpecKey: same printer + spec share a key, case-insensitively", () => {
+  assert.equal(nozzleSpecKey("P1", 0.4, "Brass"), nozzleSpecKey("P1", 0.4, "brass"));
+  assert.notEqual(nozzleSpecKey("P1", 0.4, "brass"), nozzleSpecKey("P2", 0.4, "brass"));
+  assert.notEqual(nozzleSpecKey("P1", 0.4, "brass"), nozzleSpecKey("P1", 0.6, "brass"));
+  // A missing spec is its own bucket, not a wildcard that merges with others.
+  assert.notEqual(nozzleSpecKey("P1", null, null), nozzleSpecKey("P1", 0.4, "brass"));
 });
 
 test("chooseNozzle: empty option set leaves the assignment alone", () => {

@@ -15,10 +15,12 @@ import {
   earliestFit,
   chooseNozzle,
   nozzleFits,
+  nozzleSpecKey,
   compareBySlack,
   UNUSABLE_NOZZLE_STATUS,
   type Interval,
   type NozzleOption,
+  type NozzlePolicy,
 } from "./packing";
 
 // Simple mode treats both resin technologies as one family — assigning an SLA
@@ -1110,6 +1112,8 @@ export class SimpleJobsService {
     input: {
       dry_run?: boolean | undefined;
       min_margin_minutes?: number | undefined;
+      nozzle_policy?: NozzlePolicy | undefined;
+      /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
       printer_ids?: string[] | undefined;
     }
@@ -1128,6 +1132,7 @@ export class SimpleJobsService {
       items: items.map((i) => ({ id: i.id, is_bed: i.is_bed })),
       ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
       ...(input.min_margin_minutes !== undefined ? { min_margin_minutes: input.min_margin_minutes } : {}),
+      ...(input.nozzle_policy !== undefined ? { nozzle_policy: input.nozzle_policy } : {}),
       ...(input.allow_nozzle_swap !== undefined ? { allow_nozzle_swap: input.allow_nozzle_swap } : {}),
     });
     // Carry the printer roster through so the review step can label lanes
@@ -1141,6 +1146,8 @@ export class SimpleJobsService {
       items: Array<{ id: string; is_bed?: boolean | undefined }>;
       dry_run?: boolean | undefined;
       min_margin_minutes?: number | undefined;
+      nozzle_policy?: NozzlePolicy | undefined;
+      /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
     }
   ) {
@@ -1160,12 +1167,20 @@ export class SimpleJobsService {
     // review step, down to 0 for genuinely back-to-back work. Clamped to a day
     // so a fat-fingered value can't silently empty the board.
     const GAP_MS = Math.max(0, Math.min(1440, input.min_margin_minutes ?? 5)) * 60_000;
-    // Nozzle substitution: when a piece's assigned nozzle is tied up, look for
-    // another nozzle of the SAME spec on the same printer and take the one that
-    // frees the earliest slot. On by default — it's the single biggest source of
-    // false serialisation, since one busy 0.4mm brass nozzle would otherwise
-    // stall every piece that wants a 0.4mm brass nozzle.
-    const allowNozzleSwap = input.allow_nozzle_swap !== false;
+    // How much freedom the packer has over nozzles (see NozzlePolicy):
+    //   earliest         — substitute an equivalent nozzle to open an earlier
+    //                      slot. Default, because one busy 0.4mm brass nozzle
+    //                      would otherwise stall every job wanting one.
+    //   keep_assigned    — never substitute.
+    //   minimise_changes — one nozzle per printer per spec for the whole plan,
+    //                      for shops that would rather queue than keep swapping
+    //                      hardware between prints.
+    // `allow_nozzle_swap: false` is the older spelling of keep_assigned; still
+    // honoured so a client mid-deploy doesn't silently get substitutions.
+    const nozzlePolicy: NozzlePolicy =
+      input.nozzle_policy ?? (input.allow_nozzle_swap === false ? "keep_assigned" : "earliest");
+    // minimise_changes only: printer+spec → the nozzle that printer is keeping.
+    const pinnedNozzleBySpec = new Map<string, string>();
     const HORIZON_MS = 60 * 24 * 60 * 60_000;
     const now = Date.now();
 
@@ -1307,7 +1322,8 @@ export class SimpleJobsService {
     const printerIds = Array.from(
       new Set(candidates.map((c) => c.printer_id).filter((p): p is string => !!p))
     );
-    if (allowNozzleSwap && printerIds.length > 0) {
+    // keep_assigned never consults the roster, so don't pay for it.
+    if (nozzlePolicy !== "keep_assigned" && printerIds.length > 0) {
       const r = await this.db.query<{
         printer_id: string; nozzle_asset_id: string;
         nozzle_diameter_mm: number | null; nozzle_material: string | null;
@@ -1412,61 +1428,84 @@ export class SimpleJobsService {
         });
         continue;
       }
-      if (!c.printer_id || c.minutes == null || c.minutes <= 0 || (!c.is_bed && !c.nozzle_id)) {
+      // A bed is a piece as far as scheduling is concerned: it occupies one
+      // printer, mounts one nozzle and draws from real spools, so it clears the
+      // same gate. It used to be waved through without a nozzle, which meant a
+      // bed booked no nozzle time and could be double-booked against a piece
+      // using the very same nozzle.
+      if (!c.printer_id || c.minutes == null || c.minutes <= 0 || !c.nozzle_id) {
         skipped.push({ id: c.id, is_bed: c.is_bed, name: c.name, reason: "missing printer/nozzle/print time" });
         continue;
       }
 
-      // Ensure a physical spool is reserved (pieces): auto-plan when absent —
-      // the same auto-reservation Save uses, so one click is truly enough.
+      // Ensure a physical spool is reserved: auto-plan when absent — the same
+      // auto-reservation Save uses, so one click is truly enough. Beds go
+      // through the identical path; theirs is anchored on the bed's first child
+      // piece inside bedsService, which is a storage detail, not a scheduling
+      // one. Previously beds only ever read ALREADY-reserved spools, so an
+      // unreserved bed booked zero spool time and the packer would happily put
+      // a piece on the same spool at the same instant.
       let mySpools: string[] = [];
       let willReserveSpool = false;
-      if (!c.is_bed) {
-        mySpools = reservedByPiece.get(c.id) ?? [];
-        if (mySpools.length === 0) {
-          if (dryRun) {
-            // Don't reserve — ask the planner which spool(s) the commit WOULD
-            // take, so the simulated placement still honours spool exclusivity
-            // instead of ignoring a constraint the real run enforces.
-            willReserveSpool = true;
-            try {
-              const plan = await this.jobsService.filamentPlan(companyId, c.id);
-              mySpools = plan.multicolor
-                ? plan.slots.flatMap((s) => s.allocation.map((a) => a.spool_asset_id))
-                : plan.allocation.map((a) => a.spool_asset_id);
-              if (mySpools.length === 0) {
-                skipped.push({
-                  id: c.id, is_bed: false, name: c.name,
-                  reason: "no spool in stock covers this piece's filament",
-                });
-                continue;
-              }
-            } catch (e) {
+      const readReservedSpools = async (): Promise<string[]> => {
+        if (c.is_bed) {
+          const r = await this.db.query<{ spool_asset_id: string }>(
+            `SELECT DISTINCT ops.spool_asset_id
+               FROM order_piece_spools ops
+               JOIN order_pieces op ON op.piece_id = ops.piece_id
+              WHERE ops.company_id = $1 AND op.bed_id = $2`,
+            [companyId, c.id]
+          );
+          return r.rows.map((x) => x.spool_asset_id);
+        }
+        const r = await this.db.query<{ spool_asset_id: string }>(
+          `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, c.id]
+        );
+        return r.rows.map((x) => x.spool_asset_id);
+      };
+      mySpools = (c.is_bed ? reservedByBed.get(c.id) : reservedByPiece.get(c.id)) ?? [];
+      if (mySpools.length === 0) {
+        const what = c.is_bed ? "bed" : "piece";
+        if (dryRun) {
+          // Don't reserve — ask the planner which spool(s) the commit WOULD
+          // take, so the simulated placement still honours spool exclusivity
+          // instead of ignoring a constraint the real run enforces.
+          willReserveSpool = true;
+          try {
+            const plan = c.is_bed
+              ? await this.bedsService.filamentPlan(companyId, c.id)
+              : await this.jobsService.filamentPlan(companyId, c.id);
+            mySpools = plan.multicolor
+              ? plan.slots.flatMap((s) => s.allocation.map((a) => a.spool_asset_id))
+              : plan.allocation.map((a) => a.spool_asset_id);
+            if (mySpools.length === 0) {
               skipped.push({
-                id: c.id, is_bed: false, name: c.name,
-                reason: e instanceof Error ? e.message : "couldn't plan a spool",
+                id: c.id, is_bed: c.is_bed, name: c.name,
+                reason: `no spool in stock covers this ${what}'s filament`,
               });
               continue;
             }
-          } else {
-            try {
-              await this.jobsService.reserveSpools(companyId, c.id, {});
-              const after = await this.db.query<{ spool_asset_id: string }>(
-                `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
-                [companyId, c.id]
-              );
-              mySpools = after.rows.map((r) => r.spool_asset_id);
-            } catch (e) {
-              skipped.push({
-                id: c.id, is_bed: false, name: c.name,
-                reason: e instanceof Error ? e.message : "couldn't reserve a spool",
-              });
-              continue;
-            }
+          } catch (e) {
+            skipped.push({
+              id: c.id, is_bed: c.is_bed, name: c.name,
+              reason: e instanceof Error ? e.message : "couldn't plan a spool",
+            });
+            continue;
+          }
+        } else {
+          try {
+            if (c.is_bed) await this.bedsService.reserveSpools(companyId, c.id, {});
+            else await this.jobsService.reserveSpools(companyId, c.id, {});
+            mySpools = await readReservedSpools();
+          } catch (e) {
+            skipped.push({
+              id: c.id, is_bed: c.is_bed, name: c.name,
+              reason: e instanceof Error ? e.message : "couldn't reserve a spool",
+            });
+            continue;
           }
         }
-      } else {
-        mySpools = reservedByBed.get(c.id) ?? [];
       }
 
       // ── Earliest instant where printer ∧ nozzle ∧ every spool are free.
@@ -1492,17 +1531,24 @@ export class SimpleJobsService {
       //    identically, so the packer takes whichever opens the earliest slot.
       //    'damaged' is the only status that rules a nozzle out — 'installed'
       //    and 'in_use' are the common, perfectly usable cases.
-      const options = allowNozzleSwap
-        ? (nozzlesByPrinter.get(c.printer_id) ?? []).filter(
-            (n) => nozzleFits(n, c.req_dia, c.req_mat) && n.status !== UNUSABLE_NOZZLE_STATUS
-          )
-        : [];
+      const options = (nozzlesByPrinter.get(c.printer_id) ?? []).filter(
+        (n) => nozzleFits(n, c.req_dia, c.req_mat) && n.status !== UNUSABLE_NOZZLE_STATUS
+      );
+      // Under minimise_changes a printer keeps one nozzle per spec for the whole
+      // plan, so the first job to need a spec picks it and every later job on
+      // that printer needing the same spec inherits it.
+      const specKey = nozzleSpecKey(c.printer_id, c.req_dia, c.req_mat);
       const nozzleChoice = chooseNozzle({
         assignedId: c.nozzle_id,
         printerId: c.printer_id,
         options,
         earliestFor: earliestWith,
+        policy: nozzlePolicy,
+        pinnedId: pinnedNozzleBySpec.get(specKey) ?? null,
       });
+      if (nozzlePolicy === "minimise_changes" && nozzleChoice.id) {
+        pinnedNozzleBySpec.set(specKey, nozzleChoice.id);
+      }
       const chosenNozzle = nozzleChoice.id;
       const startMs = nozzleChoice.startMs;
       const nozzleMovedFrom = nozzleChoice.movedFromPrinterId;
@@ -1595,6 +1641,29 @@ export class SimpleJobsService {
       cur.jobs += 1;
       perPrinter.set(p.printer_id, cur);
     }
+    // Physical nozzle changes the plan implies: walk each printer's placements
+    // in start order and count how often the nozzle differs from the previous
+    // one. This is the literal number of times someone walks over and swaps
+    // hardware, and it is what makes the nozzle policy's trade legible —
+    // 'earliest' finishes sooner but usually costs more changes than
+    // 'minimise_changes'.
+    const changesByPrinter = new Map<string, number>();
+    const byPrinterSorted = new Map<string, typeof placed>();
+    for (const p of placed) {
+      if (!p.printer_id) continue;
+      const arr = byPrinterSorted.get(p.printer_id) ?? [];
+      arr.push(p);
+      byPrinterSorted.set(p.printer_id, arr);
+    }
+    for (const [printerId, arr] of byPrinterSorted) {
+      arr.sort((a, b) => Date.parse(a.start_at) - Date.parse(b.start_at));
+      let changes = 0;
+      for (let i = 1; i < arr.length; i++) {
+        if (arr[i]!.nozzle_asset_id !== arr[i - 1]!.nozzle_asset_id) changes += 1;
+      }
+      changesByPrinter.set(printerId, changes);
+    }
+
     const utilisation = Array.from(perPrinter.entries())
       .map(([printer_id, v]) => ({
         printer_id,
@@ -1603,6 +1672,7 @@ export class SimpleJobsService {
         // Share of the plan's wall-clock window this machine is actually running.
         // Null when the plan is a single instant (nothing to be a fraction of).
         utilisation_pct: spanMinutes > 0 ? Math.round((v.booked_minutes / spanMinutes) * 100) : null,
+        nozzle_changes: changesByPrinter.get(printer_id) ?? 0,
       }))
       .sort((a, b) => b.booked_minutes - a.booked_minutes);
 
@@ -1617,7 +1687,10 @@ export class SimpleJobsService {
       // Echo the knobs the plan was computed with, so the review step can show
       // what it's reviewing and re-run with a different margin.
       min_margin_minutes: Math.round(GAP_MS / 60_000),
+      nozzle_policy: nozzlePolicy,
       nozzle_swaps: placed.filter((p) => p.nozzle_swapped).length,
+      // Total physical swaps across the fleet — the number the operator feels.
+      nozzle_changes: Array.from(changesByPrinter.values()).reduce((a, b) => a + b, 0),
       span_minutes: spanMinutes,
       utilisation,
     };

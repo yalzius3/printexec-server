@@ -106,6 +106,30 @@ export interface NozzleDecision {
 }
 
 /**
+ * How much freedom the packer has over which nozzle a job uses.
+ *
+ *  · `earliest`         — substitute any equivalent nozzle that opens an
+ *                         earlier slot. Best throughput, most handling.
+ *  · `keep_assigned`    — never substitute; each job uses the nozzle a human
+ *                         picked. The packer only decides WHEN.
+ *  · `minimise_changes` — one nozzle per printer per required spec, reused for
+ *                         every job on that printer needing that spec. A change
+ *                         then only happens where the SPEC changes, which is
+ *                         physics rather than a scheduling choice. Shops that
+ *                         would rather queue than keep swapping hardware want
+ *                         this, and it can cost throughput — that's the trade
+ *                         being made deliberately.
+ */
+export type NozzlePolicy = "earliest" | "keep_assigned" | "minimise_changes";
+
+/** Key identifying "jobs that can share one nozzle on one printer". */
+export function nozzleSpecKey(
+  printerId: string, dia: number | null, mat: string | null,
+): string {
+  return `${printerId}|${dia ?? ""}|${(mat ?? "").toLowerCase()}`;
+}
+
+/**
  * Pick the nozzle that opens the earliest slot.
  *
  * A nozzle is interchangeable with any other of the same diameter + material,
@@ -131,12 +155,18 @@ export function chooseNozzle(args: {
   printerId: string;
   options: readonly NozzleOption[];
   earliestFor: (nozzleId: string | null) => number;
+  policy?: NozzlePolicy;
+  /** `minimise_changes` only: the nozzle already committed to this printer for
+   *  this spec earlier in the plan. Reused verbatim so the printer never
+   *  rotates hardware mid-run. */
+  pinnedId?: string | null | undefined;
 }): NozzleDecision {
   const { assignedId, printerId, options, earliestFor } = args;
+  const policy: NozzlePolicy = args.policy ?? "earliest";
   const baselineStart = earliestFor(assignedId);
   // No assigned nozzle means there's nothing to substitute FOR — assigning one
   // where a human left it blank is a different decision than this makes.
-  if (!assignedId || options.length === 0) {
+  if (!assignedId || options.length === 0 || policy === "keep_assigned") {
     return { id: assignedId, startMs: baselineStart, movedFromPrinterId: null, label: null, swapped: false };
   }
 
@@ -145,6 +175,28 @@ export function chooseNozzle(args: {
     if (!n.installed_on || n.installed_on === printerId) return 1;
     return 2;
   };
+  const decisionFor = (n: NozzleOption): NozzleDecision => ({
+    id: n.nozzle_asset_id,
+    startMs: earliestFor(n.nozzle_asset_id),
+    movedFromPrinterId: n.installed_on && n.installed_on !== printerId ? n.installed_on : null,
+    label: n.label,
+    swapped: n.nozzle_asset_id !== assignedId,
+  });
+
+  // ── minimise_changes: the printer keeps ONE nozzle per spec for the whole
+  //    plan. Timing is an outcome, not an input — deliberately, since the whole
+  //    point is to stop optimising throughput at the cost of hardware handling.
+  if (policy === "minimise_changes") {
+    const pinned = args.pinnedId
+      ? options.find((n) => n.nozzle_asset_id === args.pinnedId)
+      : undefined;
+    if (pinned) return decisionFor(pinned);
+    // Nothing pinned for this spec yet — take the least disruptive nozzle that
+    // fits and let the caller pin it for everything that follows.
+    const best = [...options].sort((a, b) => rankOf(a) - rankOf(b))[0];
+    return best ? decisionFor(best)
+      : { id: assignedId, startMs: baselineStart, movedFromPrinterId: null, label: null, swapped: false };
+  }
 
   let best = {
     id: assignedId as string | null,

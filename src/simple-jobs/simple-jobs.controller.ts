@@ -89,10 +89,15 @@ const autoScheduleSchema = z.object({
   // enforced; the review step can override it per run, including to 0 for
   // genuinely back-to-back work. Capped at a day.
   min_margin_minutes: z.number().int().min(0).max(1440).optional(),
-  // Let the packer substitute an equivalent nozzle (same diameter + material, on
-  // the same printer) when the assigned one is tied up. Defaults on — it's the
-  // main source of false serialisation. Set false to pin every piece to the
-  // nozzle a human chose.
+  // How much freedom the packer has over nozzles:
+  //   earliest         — substitute an equivalent nozzle (same diameter +
+  //                      material, same printer) to open an earlier slot.
+  //                      Default; the main cure for false serialisation.
+  //   keep_assigned    — never substitute.
+  //   minimise_changes — one nozzle per printer per spec across the whole plan,
+  //                      so a printer never rotates hardware between prints.
+  nozzle_policy: z.enum(["earliest", "keep_assigned", "minimise_changes"]).optional(),
+  /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
   allow_nozzle_swap: z.boolean().optional(),
 });
 
@@ -101,6 +106,8 @@ const autoScheduleSchema = z.object({
 const autoScheduleAllSchema = z.object({
   dry_run: z.boolean().optional().default(false),
   min_margin_minutes: z.number().int().min(0).max(1440).optional(),
+  nozzle_policy: z.enum(["earliest", "keep_assigned", "minimise_changes"]).optional(),
+  /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
   allow_nozzle_swap: z.boolean().optional(),
   // Restrict to specific printers; omitted or empty = the whole fleet.
   printer_ids: z.array(z.string().uuid()).max(200).optional(),
