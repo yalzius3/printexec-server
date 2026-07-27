@@ -2628,10 +2628,15 @@ export class JobsService {
     }
     const wantFamily = materialFamily(material);
     const res = await this.databaseService.query<{
-      asset_id: string; label: string | null; marker: string | null; material_type: string | null; color: string | null; remaining_grams: string | null; reserved_grams: string | null; status: string;
+      asset_id: string; label: string | null; marker: string | null; material_type: string | null; color: string | null; remaining_grams: string | null; reserved_grams: string | null; status: string; initial_grams: string | null; parent_asset_id: string | null;
     }>(
+      // initial_grams + parent_asset_id are selected for the Storage /
+      // Operational Inventory classification, which is computed from grams and
+      // lineage rather than status — see common/spool-choice.ts.
       `SELECT ai.asset_id,
               ai.marker,
+              ai.initial_grams,
+              ai.parent_asset_id,
               fr.material_type,
               fr.color,
               COALESCE(ast.remaining_grams, ai.initial_grams) AS remaining_grams,
@@ -2655,12 +2660,17 @@ export class JobsService {
       .map((r) => {
       const remaining = Number(r.remaining_grams ?? 0);
       const reserved = Number(r.reserved_grams ?? 0);
-      return { spool_asset_id: r.asset_id, label: r.label, marker: r.marker, remaining, reserved, status: r.status, free: Math.max(0, remaining - reserved) };
+      return {
+        spool_asset_id: r.asset_id, label: r.label, marker: r.marker, remaining, reserved,
+        status: r.status, free: Math.max(0, remaining - reserved),
+        initial_grams: r.initial_grams, parent_asset_id: r.parent_asset_id,
+      };
     });
-    // Preference order (see common/spool-choice.ts): the spool that is already
-    // mounted or open beats one sealed on a shelf, and within a tier the one
-    // with the most unreserved grams wins — least likely to run out mid-print
-    // and least likely to force every job onto the same spool.
+    // Preference order (see common/spool-choice.ts): Operational Inventory —
+    // anything already opened, reserved against, or split off another spool —
+    // beats untouched Storage, and within a tier the one with the most
+    // unreserved grams wins. Same classification the Storage / Operational
+    // Inventory badges use, so a plan agrees with the Assets screen.
     spools.sort(compareSpoolPreference);
 
     const best = bestSingleSpool(spools, needed);

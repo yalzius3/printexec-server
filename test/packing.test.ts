@@ -21,7 +21,7 @@ import {
   type WorkWindow,
 } from "../src/simple-jobs/packing.ts";
 import {
-  spoolTier,
+  isSpoolStorage,
   bestSingleSpool,
   combineOrder,
   compareSpoolPreference,
@@ -283,63 +283,147 @@ test("earliestFitWithin: no window behaves exactly like earliestFit", () => {
 });
 
 // ── Spool preference ───────────────────────────────────────────────────────
+// Storage vs Operational Inventory is computed from GRAMS AND LINEAGE, not from
+// asset_stock.status — mirroring isSpoolStorage() in the client's windowKit.tsx,
+// which renders the badges and the Assets tab filters. These tests pin that
+// pairing, because the two drifting apart is invisible until someone compares a
+// plan against the Assets screen.
 
-const spool = (id: string, status: string, free: number) => ({ spool_asset_id: id, status, free });
-
-test("spoolTier: mounted or open is operational, sealed stock is storage", () => {
-  assert.equal(spoolTier("installed"), "operational");
-  assert.equal(spoolTier("in_use"), "operational");
-  assert.equal(spoolTier("available"), "storage");
-  assert.equal(spoolTier(null), "storage");
+/** A spool at full weight with nothing reserved and no parent = Storage. */
+const sealed = (id: string, grams: number) => ({
+  spool_asset_id: id, initial_grams: grams, remaining_grams: grams,
+  reserved_grams: 0, parent_asset_id: null, free: grams,
+});
+/** Partially used → Operational Inventory. */
+const opened = (id: string, initial: number, remaining: number) => ({
+  spool_asset_id: id, initial_grams: initial, remaining_grams: remaining,
+  reserved_grams: 0, parent_asset_id: null, free: remaining,
 });
 
-test("bestSingleSpool: an operational spool beats a fuller one in storage", () => {
-  // The shelf spool has more headroom, but the open one already covers the job —
-  // no reason to crack a new spool.
-  const best = bestSingleSpool([
-    spool("shelf", "available", 900),
-    spool("open", "in_use", 400),
-  ], 300);
+test("isSpoolStorage: untouched full spool is Storage", () => {
+  assert.equal(isSpoolStorage(sealed("a", 1000)), true);
+});
+
+test("isSpoolStorage: a single gram used makes it Operational Inventory", () => {
+  assert.equal(isSpoolStorage(opened("a", 1000, 999)), false);
+});
+
+test("isSpoolStorage: reserved grams alone make it Operational Inventory", () => {
+  // Full weight, but somebody has already claimed part of it.
+  assert.equal(isSpoolStorage({
+    spool_asset_id: "a", initial_grams: 1000, remaining_grams: 1000,
+    reserved_grams: 250, parent_asset_id: null,
+  }), false);
+});
+
+test("isSpoolStorage: a split child is never Storage, even at full weight", () => {
+  assert.equal(isSpoolStorage({
+    spool_asset_id: "child", initial_grams: 500, remaining_grams: 500,
+    reserved_grams: 0, parent_asset_id: "parent-1",
+  }), false);
+});
+
+test("isSpoolStorage: unknown grams fall back to Operational Inventory", () => {
+  // Matches the client: it only claims "Storage" when it can prove it.
+  assert.equal(isSpoolStorage({ spool_asset_id: "a", parent_asset_id: null }), false);
+});
+
+test("isSpoolStorage: NUMERIC columns arriving as strings still classify", () => {
+  // pg hands back NUMERIC as a string; a naive === would misread every spool.
+  assert.equal(isSpoolStorage({
+    spool_asset_id: "a", initial_grams: "1000.00", remaining_grams: "1000.00",
+    reserved_grams: "0", parent_asset_id: null,
+  }), true);
+  assert.equal(isSpoolStorage({
+    spool_asset_id: "a", initial_grams: "1000.00", remaining_grams: "980.50",
+    reserved_grams: "0", parent_asset_id: null,
+  }), false);
+});
+
+test("isSpoolStorage: status is NOT what decides it", () => {
+  // The trap the first implementation fell into. A sealed spool that happens to
+  // be mounted is still Storage; a part-used one sitting in the rack is still
+  // Operational Inventory. Status doesn't appear in the rule at all.
+  assert.equal(isSpoolStorage(sealed("mounted-but-sealed", 1000)), true);
+  assert.equal(isSpoolStorage(opened("shelved-but-open", 1000, 400)), false);
+});
+
+test("bestSingleSpool: an opened spool beats a fuller sealed one", () => {
+  // The sealed spool has more headroom, but the open one already covers the job
+  // — no reason to crack a new spool.
+  const best = bestSingleSpool([sealed("sealed", 900), opened("open", 1000, 400)], 300);
   assert.equal(best?.spool_asset_id, "open");
 });
 
 test("bestSingleSpool: within a tier, the freest wins (not the tightest fit)", () => {
-  const best = bestSingleSpool([
-    spool("nearly-spent", "in_use", 310),
-    spool("roomy", "in_use", 800),
-  ], 300);
+  const best = bestSingleSpool([opened("nearly-spent", 1000, 310), opened("roomy", 1000, 800)], 300);
   assert.equal(best?.spool_asset_id, "roomy");
 });
 
-test("bestSingleSpool: falls through to storage when nothing open can cover it", () => {
-  const best = bestSingleSpool([
-    spool("open", "in_use", 100),
-    spool("shelf", "available", 900),
-  ], 300);
-  assert.equal(best?.spool_asset_id, "shelf");
+test("bestSingleSpool: falls through to sealed stock when nothing open can cover it", () => {
+  const best = bestSingleSpool([opened("open", 1000, 100), sealed("sealed", 900)], 300);
+  assert.equal(best?.spool_asset_id, "sealed");
 });
 
 test("bestSingleSpool: null when no single spool covers the job", () => {
-  assert.equal(bestSingleSpool([spool("a", "in_use", 100), spool("b", "available", 150)], 300), null);
+  assert.equal(bestSingleSpool([opened("a", 1000, 100), sealed("b", 150)], 300), null);
 });
 
-test("combineOrder: drains what's open before opening stock", () => {
+test("combineOrder: drains what's open before opening sealed stock", () => {
   const order = combineOrder([
-    spool("shelf-big", "available", 1000),
-    spool("open-small", "in_use", 120),
-    spool("open-big", "installed", 500),
+    sealed("sealed-big", 1000),
+    opened("open-small", 1000, 120),
+    opened("open-big", 1000, 500),
   ]).map((s) => s.spool_asset_id);
-  assert.deepEqual(order, ["open-big", "open-small", "shelf-big"]);
+  assert.deepEqual(order, ["open-big", "open-small", "sealed-big"]);
+});
+
+/** The CLIENT's isSpoolStorage (windowKit.tsx), copied verbatim as an oracle.
+ *  Client and server are separate repos, so nothing but a test stops these two
+ *  drifting. If this copy ever needs editing to pass, the real implementations
+ *  have already diverged and the badges no longer describe what the packer does. */
+function isSpoolStorageClient(s: {
+  initial_grams?: unknown; remaining_grams?: unknown;
+  reserved_grams?: unknown; parent_asset_id?: unknown;
+}): boolean {
+  const gramsToNum = (value: unknown): number | null => {
+    if (value == null) return null;
+    const n = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+  if (s.parent_asset_id != null && s.parent_asset_id !== "") return false;
+  const initial = gramsToNum(s.initial_grams);
+  const remaining = gramsToNum(s.remaining_grams);
+  if (initial == null || remaining == null) return false;
+  return remaining >= initial && (gramsToNum(s.reserved_grams) ?? 0) <= 0;
+}
+
+test("isSpoolStorage: agrees with the client's classification on random stock", () => {
+  let seed = 0x51ee7;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const pick = <T,>(xs: T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+  for (let i = 0; i < 5000; i++) {
+    const initial = pick([null, undefined, 0, 250, 1000, "1000.00", "750.5", "not-a-number"]);
+    const remaining = pick([null, undefined, 0, 250, 1000, 1200, "1000.00", "999.99", "nope"]);
+    const reserved = pick([null, undefined, 0, "0", 0.5, 250, "250.00", -5]);
+    const parent = pick([null, undefined, "", "parent-1"]);
+    const s = { initial_grams: initial, remaining_grams: remaining, reserved_grams: reserved, parent_asset_id: parent };
+    assert.equal(
+      isSpoolStorage(s), isSpoolStorageClient(s),
+      `drift on ${JSON.stringify(s)}`,
+    );
+  }
 });
 
 test("compareSpoolPreference: identical inventory always plans identically", () => {
   // A plan that reshuffles between two dry runs is impossible to review, so
   // equal-tier equal-free spools fall back to a stable id order.
-  const a = spool("bbb", "in_use", 500);
-  const b = spool("aaa", "in_use", 500);
+  const a = opened("bbb", 1000, 500);
+  const b = opened("aaa", 1000, 500);
   assert.ok(compareSpoolPreference(a, b) > 0);
   assert.ok(compareSpoolPreference(b, a) < 0);
 });
+
 
 // ── nozzleFits ─────────────────────────────────────────────────────────────
 
