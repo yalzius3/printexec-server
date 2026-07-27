@@ -1027,6 +1027,30 @@ export class SimpleJobsService {
   // first (same fallback the manual Reserve button uses).
   // ──────────────────────────────────────────────────────────
   /**
+   * The company's saved default working hours, or nulls for round the clock.
+   *
+   * Best-effort like the rest of the company settings: if the migration hasn't
+   * run, an auto-schedule must still work — it just isn't hour-constrained.
+   */
+  private async companyWorkingHours(
+    companyId: string,
+  ): Promise<{ startHour: number | null; latestStartHour: number | null }> {
+    try {
+      const r = await this.db.query<{ work_start_hour: number | null; work_latest_start_hour: number | null }>(
+        `SELECT work_start_hour, work_latest_start_hour FROM companies WHERE company_id = $1`,
+        [companyId]
+      );
+      const row = r.rows[0];
+      return {
+        startHour: row?.work_start_hour ?? null,
+        latestStartHour: row?.work_latest_start_hour ?? null,
+      };
+    } catch {
+      return { startHour: null, latestStartHour: null };
+    }
+  }
+
+  /**
    * Everything the fleet-wide packer would act on: ready, unscheduled, and
    * actually assigned to a printer. Deliberately the same gate autoSchedule's
    * loop applies, so the count on the button matches what the plan contains.
@@ -1118,8 +1142,8 @@ export class SimpleJobsService {
       nozzle_policy?: NozzlePolicy | undefined;
       /** Earliest / latest LOCAL hour a print may be started, plus the caller's
        *  UTC offset so the hours mean the shop's clock, not the server's. */
-      work_start_hour?: number | undefined;
-      work_latest_start_hour?: number | undefined;
+      work_start_hour?: number | null | undefined;
+      work_latest_start_hour?: number | null | undefined;
       tz_offset_minutes?: number | undefined;
       /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
@@ -1160,8 +1184,8 @@ export class SimpleJobsService {
       nozzle_policy?: NozzlePolicy | undefined;
       /** Earliest / latest LOCAL hour a print may be started, plus the caller's
        *  UTC offset so the hours mean the shop's clock, not the server's. */
-      work_start_hour?: number | undefined;
-      work_latest_start_hour?: number | undefined;
+      work_start_hour?: number | null | undefined;
+      work_latest_start_hour?: number | null | undefined;
       tz_offset_minutes?: number | undefined;
       /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
@@ -1199,15 +1223,28 @@ export class SimpleJobsService {
     const pinnedNozzleBySpec = new Map<string, string>();
     // Working hours. Constrains when a print may be STARTED — a long print runs
     // on unattended past closing, which is normal. Absent = round the clock.
+    //
+    // The request wins when it names hours (the review step's per-run
+    // override); otherwise the company's saved default applies. `null` from the
+    // request is NOT "unset" — the review step sends nulls to mean "ignore our
+    // working hours for this run", so an explicit clear must not fall back to
+    // the default. That's what the `in` checks distinguish.
+    const requestNamesHours =
+      "work_start_hour" in input || "work_latest_start_hour" in input;
+    let startHour = input.work_start_hour ?? null;
+    let latestStartHour = input.work_latest_start_hour ?? null;
+    if (!requestNamesHours) {
+      const saved = await this.companyWorkingHours(companyId);
+      startHour = saved.startHour;
+      latestStartHour = saved.latestStartHour;
+    }
     // A window covering the whole day is the same as none, so it's dropped
     // rather than carried through every placement as a no-op.
     const workWindow: WorkWindow | null =
-      input.work_start_hour != null &&
-      input.work_latest_start_hour != null &&
-      input.work_start_hour !== input.work_latest_start_hour
+      startHour != null && latestStartHour != null && startHour !== latestStartHour
         ? {
-            startHour: input.work_start_hour,
-            latestStartHour: input.work_latest_start_hour,
+            startHour,
+            latestStartHour,
             tzOffsetMinutes: input.tz_offset_minutes ?? 0,
           }
         : null;

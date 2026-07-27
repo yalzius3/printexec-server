@@ -102,8 +102,12 @@ const autoScheduleSchema = z.object({
   // which is normal. Omit both for round-the-clock; equal values = no limit.
   // tz_offset_minutes is the caller's UTC offset (Cairo = 120), so the hours
   // never silently mean the server's timezone.
-  work_start_hour: z.number().int().min(0).max(23).optional(),
-  work_latest_start_hour: z.number().int().min(0).max(23).optional(),
+  // Nullable AND optional, and the difference is load-bearing: OMITTED means
+  // "use the company default", while an explicit null means "ignore working
+  // hours for this run". zod drops absent optional keys and keeps explicit
+  // nulls, which is what lets the service tell the two apart.
+  work_start_hour: z.number().int().min(0).max(23).nullable().optional(),
+  work_latest_start_hour: z.number().int().min(0).max(23).nullable().optional(),
   tz_offset_minutes: z.number().int().min(-840).max(840).optional(),
   /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
   allow_nozzle_swap: z.boolean().optional(),
@@ -120,8 +124,12 @@ const autoScheduleAllSchema = z.object({
   // which is normal. Omit both for round-the-clock; equal values = no limit.
   // tz_offset_minutes is the caller's UTC offset (Cairo = 120), so the hours
   // never silently mean the server's timezone.
-  work_start_hour: z.number().int().min(0).max(23).optional(),
-  work_latest_start_hour: z.number().int().min(0).max(23).optional(),
+  // Nullable AND optional, and the difference is load-bearing: OMITTED means
+  // "use the company default", while an explicit null means "ignore working
+  // hours for this run". zod drops absent optional keys and keeps explicit
+  // nulls, which is what lets the service tell the two apart.
+  work_start_hour: z.number().int().min(0).max(23).nullable().optional(),
+  work_latest_start_hour: z.number().int().min(0).max(23).nullable().optional(),
   tz_offset_minutes: z.number().int().min(-840).max(840).optional(),
   /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
   allow_nozzle_swap: z.boolean().optional(),

@@ -200,7 +200,24 @@ export class AuthController {
     // exist yet (pre-setup), so the global guard's profile lookup would 401.
     const token = authHeader.slice(7);
     const { userId } = await verifyToken(token, this.supabaseUrl, this.supabaseKey);
+    return this.composeProfile(userId);
+  }
 
+  /**
+   * The whole profile: identity, permissions, and every company setting group.
+   *
+   * Every settings endpoint returns THIS, not its own SELECT. They used to each
+   * run a partial query naming only the columns that endpoint touched, and the
+   * client does `setProfile(response)` — a wholesale replace. So saving the
+   * electricity price silently dropped branding, consent flags, terms state and
+   * the licence from the in-memory profile until the next reload. One composer
+   * means a settings save can never shrink the profile again.
+   *
+   * Each column group stays in its own try/catch on purpose: a column missing
+   * because a migration hasn't run must not 500 /auth/me and lock everyone out.
+   * An absent group simply doesn't appear, and the client treats it as unset.
+   */
+  private async composeProfile(userId: string) {
     const { rows } = await this.db.query<{ user_id: string; company_id: string; company_name: string; operation_mode: string; role: string; permissions: Record<string, boolean>; display_name: string | null; email: string }>(
       `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email
        FROM users u JOIN companies c ON c.company_id = u.company_id
@@ -286,6 +303,19 @@ export class AuthController {
     } catch {
       // messages table not migrated yet — profile returns without them
     }
+    // Working hours — the shop's default window for auto-scheduling. Null hours
+    // mean round the clock, which is how the packer behaved before this existed.
+    try {
+      const hours = await this.db.query<{ work_start_hour: number | null; work_latest_start_hour: number | null }>(
+        `SELECT c.work_start_hour, c.work_latest_start_hour
+         FROM companies c JOIN users u ON u.company_id = c.company_id
+         WHERE u.id = $1`,
+        [userId]
+      );
+      if (hours.rows[0]) Object.assign(profile, hours.rows[0]);
+    } catch {
+      // work-hour columns not migrated yet — treated as round the clock
+    }
     profile.is_platform_admin = this.licensing.isPlatformAdminEmail(rows[0]!.email);
     return profile;
   }
@@ -318,13 +348,8 @@ export class AuthController {
       [parsed.data.electricity_price_per_kwh, companyId]
     );
 
-    const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
-       FROM users u JOIN companies c ON c.company_id = u.company_id
-       WHERE u.id = $1`,
-      [userId]
-    );
-    return rows[0] ?? null;
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
   }
 
   // Owner-only: set (or clear, with null) the company's hourly shop rate (labour
@@ -354,13 +379,8 @@ export class AuthController {
       [parsed.data.shop_rate, companyId]
     );
 
-    const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
-       FROM users u JOIN companies c ON c.company_id = u.company_id
-       WHERE u.id = $1`,
-      [userId]
-    );
-    return rows[0] ?? null;
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
   }
 
   // Owner-only: choose whether full slicer files are stored on our servers
@@ -388,13 +408,55 @@ export class AuthController {
       [parsed.data.store_full, companyId]
     );
 
-    const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
-       FROM users u JOIN companies c ON c.company_id = u.company_id
-       WHERE u.id = $1`,
-      [userId]
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
+  }
+
+  // Owner-only: the shop's default working hours for auto-scheduling — the
+  // window inside which a print may be STARTED. Send nulls to clear it back to
+  // round-the-clock. Both hours move together; half a window is meaningless.
+  // A plan can still override this per run from the review step.
+  @Post("working-hours")
+  async setWorkingHours(
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const hour = z.number().int().min(0).max(23);
+    const parsed = z
+      .object({
+        work_start_hour: hour.nullable(),
+        work_latest_start_hour: hour.nullable(),
+      })
+      // Either both set or both cleared — mirrors the DB check constraint, so
+      // the error is a readable 400 rather than a constraint violation.
+      .refine(
+        (v) => (v.work_start_hour === null) === (v.work_latest_start_hour === null),
+        { message: "Set both hours, or clear both for round-the-clock." }
+      )
+      // Equal hours would leave a zero-length window, which the packer treats as
+      // no restriction anyway — reject it rather than save something inert.
+      .refine(
+        (v) => v.work_start_hour === null || v.work_start_hour !== v.work_latest_start_hour,
+        { message: "Start and latest-start can't be the same hour — that leaves no window." }
+      )
+      .safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException(
+        parsed.error.issues[0]?.message ?? "Working hours must be whole hours from 0 to 23."
+      );
+    }
+
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the working hours.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET work_start_hour = $1, work_latest_start_hour = $2 WHERE company_id = $3",
+      [parsed.data.work_start_hour, parsed.data.work_latest_start_hour, companyId]
     );
-    return rows[0] ?? null;
+    return this.composeProfile(userId);
   }
 
   // Owner-only: switch the company between 'advanced' and 'simple'. Soft — it
@@ -423,13 +485,8 @@ export class AuthController {
       [parsed.data.mode, companyId]
     );
 
-    const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate, c.store_full_slicer_files
-       FROM users u JOIN companies c ON c.company_id = u.company_id
-       WHERE u.id = $1`,
-      [userId]
-    );
-    return rows[0] ?? null;
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
   }
 
   // Owner-only: set (or clear, with null) the company's logo URL. The file
@@ -457,13 +514,8 @@ export class AuthController {
       [parsed.data.logo_url, companyId]
     );
 
-    const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.logo_url, c.slogan, c.about_text
-       FROM users u JOIN companies c ON c.company_id = u.company_id
-       WHERE u.id = $1`,
-      [userId]
-    );
-    return rows[0] ?? null;
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
   }
 
   // Owner-only: set the company's slogan and about paragraph, shown on the
@@ -496,13 +548,8 @@ export class AuthController {
       [parsed.data.slogan?.trim() || null, parsed.data.about_text?.trim() || null, companyId]
     );
 
-    const { rows } = await this.db.query(
-      `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.logo_url, c.slogan, c.about_text
-       FROM users u JOIN companies c ON c.company_id = u.company_id
-       WHERE u.id = $1`,
-      [userId]
-    );
-    return rows[0] ?? null;
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
   }
 
   // Owner-only: the customer-showcase consent flag — permission to use this
@@ -704,13 +751,8 @@ export class AuthController {
       [userId]
     );
     if (existing.rows.length) {
-      const user = await this.db.query(
-        `SELECT u.id AS user_id, u.company_id, c.name AS company_name, c.operation_mode, u.role, u.permissions, u.display_name, u.email, c.electricity_price_per_kwh, c.shop_rate
-         FROM users u JOIN companies c ON c.company_id = u.company_id
-         WHERE u.id = $1`,
-        [userId]
-      );
-      return user.rows[0];
+      // Already set up — hand back the same full profile /auth/me would.
+      return this.composeProfile(userId);
     }
 
     // Terms of Use click-wrap: hard requirement for every NEW account, owner
