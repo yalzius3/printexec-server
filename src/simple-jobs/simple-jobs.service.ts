@@ -18,6 +18,7 @@ import {
   nozzleFits,
   nozzleSpecKey,
   nozzleSpecOf,
+  orderForFewestSetups,
   compareBySlack,
   UNUSABLE_NOZZLE_STATUS,
   type Interval,
@@ -1324,6 +1325,8 @@ export class SimpleJobsService {
       // The nozzle SPEC the piece needs, which is what makes substitution
       // possible: any nozzle meeting this spec will print it identically.
       req_dia: number | null; req_mat: string | null;
+      /** printer + nozzle spec; filled in just before ordering. */
+      setupKey?: string;
     };
     const candidates: Candidate[] = [];
     if (ids.length > 0) {
@@ -1432,7 +1435,20 @@ export class SimpleJobsService {
     // as physically possible. No deadline → +∞ slack (packed last, after every
     // time-critical job). Ties break by earlier deadline, then the queue order.
     const orderIndex = new Map(input.items.map((i, idx) => [i.id, idx]));
+    // Tag each candidate with the setup it needs — printer + nozzle spec. Jobs
+    // sharing one can run back-to-back without touching a spanner, so the
+    // ordering below uses it to stop identical work alternating 0.4 / 0.5 /
+    // 0.4 / 0.5 purely because that was the queue order.
+    for (const c of candidates) {
+      c.setupKey = c.printer_id ? nozzleSpecKey(c.printer_id, c.req_dia, c.req_mat) : "";
+    }
     candidates.sort((a, b) => compareBySlack(a, b, now, orderIndex));
+    // minimise_changes goes further: whole setup RUNS per printer, most urgent
+    // run first. That can delay a job behind a more urgent group, which plain
+    // least-slack would not — the trade this policy exists to make.
+    const ordered = nozzlePolicy === "minimise_changes"
+      ? orderForFewestSetups(candidates, now, orderIndex)
+      : candidates;
 
     // ── Reserved spools for every candidate, in ONE round trip per kind. This
     //    used to be a query per candidate inside the loop (up to 200 sequential
@@ -1487,7 +1503,7 @@ export class SimpleJobsService {
     }> = [];
     const skipped: Array<{ id: string; is_bed: boolean; name: string; reason: string }> = [];
 
-    for (const c of candidates) {
+    for (const c of ordered) {
       if (c.status !== "ready") {
         skipped.push({
           id: c.id, is_bed: c.is_bed, name: c.name,

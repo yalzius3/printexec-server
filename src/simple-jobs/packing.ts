@@ -362,6 +362,9 @@ export interface SlackSortable {
   id: string;
   deadline: string | null;
   minutes: number | null;
+  /** printer + nozzle spec (see nozzleSpecKey). Jobs sharing one need no
+   *  hardware change between them. Used only to break exact ties. */
+  setupKey?: string;
 }
 
 /**
@@ -369,7 +372,24 @@ export interface SlackSortable {
  *
  * Beats plain earliest-deadline because it accounts for how LONG each job runs:
  * a 3h job due in 4h is tighter than a 10min job due in 1h, and only slack sees
- * that. Ties break by earlier deadline, then the caller's original order.
+ * that. Ties break by earlier deadline, then by SETUP, then the caller's order.
+ *
+ * ── Why the setup tiebreak is free ────────────────────────────────────────
+ * Four identical pieces — two needing a 0.4 nozzle, two needing 0.5 — used to
+ * come out 0.4, 0.5, 0.4, 0.5, because they tie on slack and on deadline and
+ * the last tiebreak was the raw queue order. Three nozzle re-fits where one
+ * would do.
+ *
+ * Grouping them costs nothing, and that is provable rather than a judgement
+ * call: slack = deadline − now − duration, so two jobs with equal slack AND
+ * equal deadline necessarily have equal duration. They are interchangeable —
+ * swapping them cannot change which jobs finish late, only which spanner work
+ * sits between them. So the tiebreak only ever reorders jobs whose order was
+ * already arbitrary.
+ *
+ * This does NOT batch jobs whose deadlines genuinely differ; that trades
+ * lateness for handling, so it belongs to the minimise_changes policy
+ * (orderForFewestSetups) rather than to the default ordering.
  */
 export function compareBySlack<T extends SlackSortable>(
   a: T, b: T, nowMs: number, orderIndex: ReadonlyMap<string, number>,
@@ -380,5 +400,49 @@ export function compareBySlack<T extends SlackSortable>(
   const da = a.deadline ? Date.parse(a.deadline) : Infinity;
   const db = b.deadline ? Date.parse(b.deadline) : Infinity;
   if (da !== db) return da - db;
+  // Truly interchangeable at this point — cluster same-setup work.
+  const ka = a.setupKey ?? "";
+  const kb = b.setupKey ?? "";
+  if (ka !== kb) return ka < kb ? -1 : 1;
   return (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0);
+}
+
+/**
+ * Order jobs so each printer runs its work in setup RUNS — every job needing
+ * one nozzle spec, then the next spec — instead of alternating.
+ *
+ * Only for the minimise_changes policy. Unlike the tiebreak above this is NOT
+ * free: a job can be pushed behind a whole group that is more urgent than it,
+ * so something can finish later than least-slack alone would have managed.
+ * That is exactly the trade that policy exists to make ("I would rather queue
+ * than keep swapping hardware"), and the plan reports both halves — the
+ * re-fit count and any resulting lateness — so it is visible before Apply.
+ *
+ * Groups are emitted by their most urgent member, so a run containing the
+ * tightest job still goes first; within a run, least-slack order is preserved.
+ */
+export function orderForFewestSetups<T extends SlackSortable>(
+  candidates: readonly T[], nowMs: number, orderIndex: ReadonlyMap<string, number>,
+): T[] {
+  const groups = new Map<string, T[]>();
+  for (const c of candidates) {
+    const key = c.setupKey ?? "";
+    const arr = groups.get(key) ?? [];
+    arr.push(c);
+    groups.set(key, arr);
+  }
+  const ranked = Array.from(groups.entries()).map(([key, members]) => {
+    members.sort((a, b) => compareBySlack(a, b, nowMs, orderIndex));
+    const urgency = Math.min(...members.map((m) => slackMs(m.deadline, nowMs, m.minutes)));
+    // Earliest deadline in the group, to break ties between equally slack groups.
+    const soonest = Math.min(
+      ...members.map((m) => (m.deadline ? Date.parse(m.deadline) : Infinity)),
+    );
+    return { key, members, urgency, soonest };
+  });
+  ranked.sort((a, b) =>
+    a.urgency - b.urgency
+    || a.soonest - b.soonest
+    || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return ranked.flatMap((g) => g.members);
 }

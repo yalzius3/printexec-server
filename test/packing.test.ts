@@ -17,6 +17,7 @@ import {
   nozzleSpecOf,
   slackMs,
   compareBySlack,
+  orderForFewestSetups,
   type Interval,
   type NozzleOption,
   type WorkWindow,
@@ -692,6 +693,104 @@ test("compareBySlack: undated work packs last", () => {
   const order = new Map([["undated", 0], ["dated", 1]]);
   const sorted = [undated, dated].sort((a, b) => compareBySlack(a, b, T0, order));
   assert.deepEqual(sorted.map((j) => j.id), ["dated", "undated"]);
+});
+
+// ── Setup runs: don't alternate nozzle specs for no reason ─────────────────
+// The reported bug. Four pieces, identical print time and filament, two needing
+// a 0.4 nozzle and two needing 0.5, came out 0.4 / 0.5 / 0.4 / 0.5 — three
+// physical nozzle re-fits where one would do. They tie on slack and on
+// deadline, so the last tiebreak was the raw queue order.
+
+/** Count spec transitions in a placement order — the re-fits an operator does. */
+const refits = (order: readonly { setupKey?: string }[]): number => {
+  let n = 0;
+  for (let i = 1; i < order.length; i++) if (order[i]!.setupKey !== order[i - 1]!.setupKey) n += 1;
+  return n;
+};
+
+/** Four interchangeable pieces on one printer, queued alternating by spec. */
+const fourAlternating = () => {
+  const dl = new Date(T0 + 48 * H).toISOString();
+  return [
+    { id: "a04", deadline: dl, minutes: 120, setupKey: "P1|0.4|brass" },
+    { id: "b05", deadline: dl, minutes: 120, setupKey: "P1|0.5|brass" },
+    { id: "c04", deadline: dl, minutes: 120, setupKey: "P1|0.4|brass" },
+    { id: "d05", deadline: dl, minutes: 120, setupKey: "P1|0.5|brass" },
+  ];
+};
+const queueOrder = (xs: readonly { id: string }[]) =>
+  new Map(xs.map((x, i) => [x.id, i]));
+
+test("compareBySlack: identical pieces group by nozzle spec instead of alternating", () => {
+  const items = fourAlternating();
+  const idx = queueOrder(items);
+  // Sanity: the reported input really does alternate before sorting.
+  assert.equal(refits(items), 3);
+  const sorted = [...items].sort((a, b) => compareBySlack(a, b, T0, idx));
+  assert.equal(refits(sorted), 1, `still alternating: ${sorted.map((s) => s.setupKey).join(" -> ")}`);
+  // Both 0.4s adjacent, both 0.5s adjacent — and every piece still placed.
+  assert.deepEqual(sorted.map((s) => s.id).sort(), ["a04", "b05", "c04", "d05"]);
+});
+
+test("compareBySlack: grouping never reorders jobs that differ in urgency", () => {
+  // The tiebreak must not touch anything with a real slack difference — a
+  // tighter job keeps its earlier position even if that costs a re-fit.
+  const idx = new Map([["urgent05", 0], ["loose04a", 1], ["loose04b", 2]]);
+  const items = [
+    { id: "loose04a", deadline: new Date(T0 + 90 * H).toISOString(), minutes: 60, setupKey: "P1|0.4|brass" },
+    { id: "urgent05", deadline: new Date(T0 + 3 * H).toISOString(), minutes: 60, setupKey: "P1|0.5|brass" },
+    { id: "loose04b", deadline: new Date(T0 + 90 * H).toISOString(), minutes: 60, setupKey: "P1|0.4|brass" },
+  ];
+  const sorted = [...items].sort((a, b) => compareBySlack(a, b, T0, idx));
+  assert.equal(sorted[0]!.id, "urgent05");   // tightest still first
+});
+
+test("compareBySlack: equal slack but different deadlines still sorts by deadline", () => {
+  // Deadline outranks the setup tiebreak, so a shorter job due sooner is not
+  // dragged behind a same-spec partner.
+  const idx = new Map([["soon05", 0], ["later04", 1]]);
+  const soon05 = { id: "soon05", deadline: new Date(T0 + 2 * H).toISOString(), minutes: 60, setupKey: "P1|0.5|brass" };
+  const later04 = { id: "later04", deadline: new Date(T0 + 4 * H).toISOString(), minutes: 180, setupKey: "P1|0.4|brass" };
+  // Both have 1h of slack; the deadlines differ.
+  assert.equal(slackMs(soon05.deadline, T0, soon05.minutes), slackMs(later04.deadline, T0, later04.minutes));
+  const sorted = [soon05, later04].sort((a, b) => compareBySlack(a, b, T0, idx));
+  assert.equal(sorted[0]!.id, "soon05");
+});
+
+test("orderForFewestSetups: batches whole runs, most urgent run first", () => {
+  const idx = new Map([["u05", 0], ["a04", 1], ["b04", 2], ["c05", 3]]);
+  const items = [
+    { id: "u05", deadline: new Date(T0 + 3 * H).toISOString(), minutes: 60, setupKey: "P1|0.5|brass" },
+    { id: "a04", deadline: new Date(T0 + 40 * H).toISOString(), minutes: 60, setupKey: "P1|0.4|brass" },
+    { id: "b04", deadline: new Date(T0 + 50 * H).toISOString(), minutes: 60, setupKey: "P1|0.4|brass" },
+    { id: "c05", deadline: new Date(T0 + 60 * H).toISOString(), minutes: 60, setupKey: "P1|0.5|brass" },
+  ];
+  const out = orderForFewestSetups(items, T0, idx);
+  // The 0.5 run owns the tightest job, so it goes first — and c05 is pulled
+  // forward into it rather than left to force a third re-fit later.
+  assert.deepEqual(out.map((o) => o.id), ["u05", "c05", "a04", "b04"]);
+  assert.equal(refits(out), 1);
+});
+
+test("orderForFewestSetups: keeps each printer's runs separate", () => {
+  // setupKey includes the printer, so two machines never merge into one run.
+  const idx = new Map([["p1a", 0], ["p2a", 1], ["p1b", 2]]);
+  const dl = new Date(T0 + 40 * H).toISOString();
+  const items = [
+    { id: "p1a", deadline: dl, minutes: 60, setupKey: "P1|0.4|brass" },
+    { id: "p2a", deadline: dl, minutes: 60, setupKey: "P2|0.4|brass" },
+    { id: "p1b", deadline: dl, minutes: 60, setupKey: "P1|0.4|brass" },
+  ];
+  const out = orderForFewestSetups(items, T0, idx);
+  const keys = out.map((o) => o.setupKey);
+  assert.deepEqual(keys, ["P1|0.4|brass", "P1|0.4|brass", "P2|0.4|brass"]);
+});
+
+test("orderForFewestSetups: places every job exactly once", () => {
+  const items = fourAlternating();
+  const out = orderForFewestSetups(items, T0, queueOrder(items));
+  assert.deepEqual(out.map((o) => o.id).sort(), ["a04", "b05", "c04", "d05"]);
+  assert.equal(refits(out), 1);
 });
 
 test("compareBySlack: equal slack falls back to deadline, then to the given order", () => {
