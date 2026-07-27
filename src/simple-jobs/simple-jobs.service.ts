@@ -17,6 +17,7 @@ import {
   chooseNozzle,
   nozzleFits,
   nozzleSpecKey,
+  nozzleSpecOf,
   compareBySlack,
   UNUSABLE_NOZZLE_STATUS,
   type Interval,
@@ -1439,6 +1440,8 @@ export class SimpleJobsService {
       deadline_at: string | null; slack_minutes: number | null; late: boolean;
       printer_id: string | null; minutes: number | null; will_reserve_spool?: boolean;
       nozzle_asset_id: string | null;
+      /** Diameter+material the machine must be wearing. Drives the change count. */
+      nozzle_spec: string;
       // Present only when the packer picked a different nozzle than the one
       // assigned — the operator needs to know a swap is part of this plan.
       nozzle_swapped?: true;
@@ -1639,6 +1642,11 @@ export class SimpleJobsService {
         printer_id: c.printer_id,
         minutes: c.minutes,
         nozzle_asset_id: chosenNozzle,
+        // The SPEC the printer must be wearing for this job. Two different
+        // 0.4mm nozzles are interchangeable at the machine — what costs the
+        // operator a physical replacement is the spec changing, so the change
+        // count below keys on this rather than on the asset id.
+        nozzle_spec: nozzleSpecOf(c.req_dia, c.req_mat),
         ...(nozzleSwapped ? {
           nozzle_swapped: true as const,
           nozzle_label: chosenLabel,
@@ -1671,12 +1679,18 @@ export class SimpleJobsService {
       cur.jobs += 1;
       perPrinter.set(p.printer_id, cur);
     }
-    // Physical nozzle changes the plan implies: walk each printer's placements
-    // in start order and count how often the nozzle differs from the previous
-    // one. This is the literal number of times someone walks over and swaps
-    // hardware, and it is what makes the nozzle policy's trade legible —
-    // 'earliest' finishes sooner but usually costs more changes than
-    // 'minimise_changes'.
+    // ── Physical nozzle replacements the plan implies.
+    //
+    //    Counted on the SPEC, not the asset id. A printer wears one nozzle at a
+    //    time; if the next job on it needs the same 0.4mm brass, the operator
+    //    runs it on whatever 0.4mm brass is already fitted and never touches a
+    //    spanner — even where the plan names a different nozzle asset, which is
+    //    a booking detail (asset-level exclusivity is what keeps two PRINTERS
+    //    off the same physical nozzle). A replacement is 0.4 → 0.5, or brass →
+    //    hardened: the spec changing between consecutive prints on one machine.
+    //
+    //    This previously counted asset transitions and so reported swaps the
+    //    shop floor would never perform.
     const changesByPrinter = new Map<string, number>();
     const byPrinterSorted = new Map<string, typeof placed>();
     for (const p of placed) {
@@ -1689,7 +1703,7 @@ export class SimpleJobsService {
       arr.sort((a, b) => Date.parse(a.start_at) - Date.parse(b.start_at));
       let changes = 0;
       for (let i = 1; i < arr.length; i++) {
-        if (arr[i]!.nozzle_asset_id !== arr[i - 1]!.nozzle_asset_id) changes += 1;
+        if (arr[i]!.nozzle_spec !== arr[i - 1]!.nozzle_spec) changes += 1;
       }
       changesByPrinter.set(printerId, changes);
     }

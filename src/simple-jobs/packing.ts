@@ -214,11 +214,26 @@ export interface NozzleDecision {
  */
 export type NozzlePolicy = "earliest" | "keep_assigned" | "minimise_changes";
 
+/**
+ * The nozzle SPEC a job needs, independent of which physical nozzle serves it.
+ *
+ * This is the unit that matters at the machine. Two different 0.4mm brass
+ * nozzles are interchangeable — if one is already fitted, the operator runs the
+ * next job on it and never touches a spanner. What costs a real replacement is
+ * the spec changing: 0.4 → 0.5, or brass → hardened.
+ *
+ * Null spec ("any nozzle will do") is its own bucket rather than a wildcard
+ * that silently merges with every other spec.
+ */
+export function nozzleSpecOf(dia: number | null, mat: string | null): string {
+  return `${dia ?? "any"}|${(mat ?? "any").toLowerCase()}`;
+}
+
 /** Key identifying "jobs that can share one nozzle on one printer". */
 export function nozzleSpecKey(
   printerId: string, dia: number | null, mat: string | null,
 ): string {
-  return `${printerId}|${dia ?? ""}|${(mat ?? "").toLowerCase()}`;
+  return `${printerId}|${nozzleSpecOf(dia, mat)}`;
 }
 
 /**

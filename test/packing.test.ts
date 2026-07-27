@@ -14,6 +14,7 @@ import {
   chooseNozzle,
   nozzleFits,
   nozzleSpecKey,
+  nozzleSpecOf,
   slackMs,
   compareBySlack,
   type Interval,
@@ -625,6 +626,18 @@ test("chooseNozzle: earliest remains the default when no policy is given", () =>
   });
   assert.equal(d.id, "B");
   assert.equal(d.swapped, true);
+});
+
+test("nozzleSpecOf: two different nozzles of the same spec are the same spec", () => {
+  // The distinction that matters at the machine. A printer wears one nozzle;
+  // running the next job on a different 0.4mm brass costs nobody a spanner, so
+  // it must NOT read as a replacement. 0.4 -> 0.5 must.
+  assert.equal(nozzleSpecOf(0.4, "brass"), nozzleSpecOf(0.4, "Brass"));
+  assert.notEqual(nozzleSpecOf(0.4, "brass"), nozzleSpecOf(0.5, "brass"));
+  assert.notEqual(nozzleSpecOf(0.4, "brass"), nozzleSpecOf(0.4, "hardened"));
+  // "any" is its own bucket, not a wildcard that merges with every spec.
+  assert.notEqual(nozzleSpecOf(null, null), nozzleSpecOf(0.4, "brass"));
+  assert.equal(nozzleSpecOf(null, null), nozzleSpecOf(null, null));
 });
 
 test("nozzleSpecKey: same printer + spec share a key, case-insensitively", () => {
