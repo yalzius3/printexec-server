@@ -8,6 +8,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   earliestFit,
+  earliestFitWithin,
+  isWithinWorkWindow,
+  nextAllowedStart,
   chooseNozzle,
   nozzleFits,
   nozzleSpecKey,
@@ -15,7 +18,14 @@ import {
   compareBySlack,
   type Interval,
   type NozzleOption,
+  type WorkWindow,
 } from "../src/simple-jobs/packing.ts";
+import {
+  spoolTier,
+  bestSingleSpool,
+  combineOrder,
+  compareSpoolPreference,
+} from "../src/common/spool-choice.ts";
 
 const MIN = 60_000;
 const H = 60 * MIN;
@@ -177,6 +187,158 @@ test("earliestFit: stops early instead of scanning a board it has already cleare
   const ms = Number(process.hrtime.bigint() - t) / 1e6;
   assert.equal(got, T0);                // fits immediately, before block 0
   assert.ok(ms < 250, `took ${ms.toFixed(1)}ms`);
+});
+
+// ── Working hours ──────────────────────────────────────────────────────────
+// The window constrains the START only — a long print runs on past closing.
+// All fixtures use UTC (tzOffsetMinutes 0) unless the test is about offsets.
+
+const WIN = (startHour: number, latestStartHour: number, tzOffsetMinutes = 0): WorkWindow =>
+  ({ startHour, latestStartHour, tzOffsetMinutes });
+/** 2026-08-01 at a given UTC hour. */
+const at = (hour: number, day = 1) => Date.parse(`2026-08-0${day}T${String(hour).padStart(2, "0")}:00:00.000Z`);
+
+test("isWithinWorkWindow: inside, before and after a normal day window", () => {
+  const w = WIN(8, 18);
+  assert.equal(isWithinWorkWindow(at(7), w), false);
+  assert.equal(isWithinWorkWindow(at(8), w), true);
+  assert.equal(isWithinWorkWindow(at(17), w), true);
+  assert.equal(isWithinWorkWindow(at(18), w), false);   // latest start is exclusive
+  assert.equal(isWithinWorkWindow(at(23), w), false);
+});
+
+test("isWithinWorkWindow: a window that wraps midnight (night shift)", () => {
+  const w = WIN(22, 6);
+  assert.equal(isWithinWorkWindow(at(23), w), true);
+  assert.equal(isWithinWorkWindow(at(2), w), true);
+  assert.equal(isWithinWorkWindow(at(6), w), false);
+  assert.equal(isWithinWorkWindow(at(12), w), false);
+});
+
+test("isWithinWorkWindow: no window, or a full-day window, never blocks", () => {
+  assert.equal(isWithinWorkWindow(at(3), null), true);
+  assert.equal(isWithinWorkWindow(at(3), WIN(9, 9)), true);
+});
+
+test("nextAllowedStart: waits for this morning's opening", () => {
+  assert.equal(nextAllowedStart(at(6), WIN(8, 18)), at(8));
+});
+
+test("nextAllowedStart: after closing, rolls to tomorrow's opening", () => {
+  assert.equal(nextAllowedStart(at(20), WIN(8, 18)), at(8, 2));
+});
+
+test("nextAllowedStart: leaves an instant already inside the window alone", () => {
+  assert.equal(nextAllowedStart(at(9), WIN(8, 18)), at(9));
+});
+
+test("nextAllowedStart: hours are the SHOP's clock, not the server's", () => {
+  // Cairo is UTC+2. 07:00 UTC is 09:00 locally, so an 08:00–18:00 local window
+  // is already open — a naive UTC reading would have made the shop wait an hour.
+  const cairo = WIN(8, 18, 120);
+  assert.equal(nextAllowedStart(at(7), cairo), at(7));
+  // 06:00 UTC is 08:00 local exactly — the moment it opens.
+  assert.equal(nextAllowedStart(at(6), cairo), at(6));
+  // 05:00 UTC is 07:00 local — an hour early, so wait until 06:00 UTC.
+  assert.equal(nextAllowedStart(at(5), cairo), at(6));
+});
+
+test("earliestFitWithin: a job that would start after hours waits for the morning", () => {
+  // Board is clear, but 20:00 is past the 18:00 cut-off.
+  assert.equal(earliestFitWithin([], 2 * H, at(20), 0, WIN(8, 18)), at(8, 2));
+});
+
+test("earliestFitWithin: a print may RUN past closing, it just can't START then", () => {
+  // Starts 17:00, runs 6h to 23:00 — allowed, because only the start is gated.
+  assert.equal(earliestFitWithin([], 6 * H, at(17), 0, WIN(8, 18)), at(17));
+});
+
+test("earliestFitWithin: a conflict that pushes past closing rolls to the next day", () => {
+  // Free at 08:00, but a block occupies 08:00–17:30, so the next free instant
+  // is 17:30 — inside the window — and the job lands there.
+  const busy: Interval[] = [{ s: at(8), e: at(17) + 30 * MIN }];
+  assert.equal(earliestFitWithin(busy, 1 * H, at(8), 0, WIN(8, 18)), at(17) + 30 * MIN);
+  // Extend the block past the cut-off and it must wait for tomorrow instead.
+  const busy2: Interval[] = [{ s: at(8), e: at(19) }];
+  assert.equal(earliestFitWithin(busy2, 1 * H, at(8), 0, WIN(8, 18)), at(8, 2));
+});
+
+test("earliestFitWithin: alternating window and conflict pushes still converge", () => {
+  // Every day is blocked 08:00-18:00 for three days, so the job can only start
+  // once a day is clear — proving the two constraints don't ping-pong forever.
+  const busy: Interval[] = [
+    { s: at(8, 1), e: at(19, 1) },
+    { s: at(8, 2), e: at(19, 2) },
+    { s: at(8, 3), e: at(19, 3) },
+  ];
+  assert.equal(earliestFitWithin(busy, 1 * H, at(8, 1), 0, WIN(8, 18)), at(8, 4));
+});
+
+test("earliestFitWithin: no window behaves exactly like earliestFit", () => {
+  const busy: Interval[] = [{ s: at(8), e: at(12) }];
+  assert.equal(
+    earliestFitWithin(busy, 1 * H, at(8), 5 * MIN, null),
+    earliestFit(busy, 1 * H, at(8), 5 * MIN),
+  );
+});
+
+// ── Spool preference ───────────────────────────────────────────────────────
+
+const spool = (id: string, status: string, free: number) => ({ spool_asset_id: id, status, free });
+
+test("spoolTier: mounted or open is operational, sealed stock is storage", () => {
+  assert.equal(spoolTier("installed"), "operational");
+  assert.equal(spoolTier("in_use"), "operational");
+  assert.equal(spoolTier("available"), "storage");
+  assert.equal(spoolTier(null), "storage");
+});
+
+test("bestSingleSpool: an operational spool beats a fuller one in storage", () => {
+  // The shelf spool has more headroom, but the open one already covers the job —
+  // no reason to crack a new spool.
+  const best = bestSingleSpool([
+    spool("shelf", "available", 900),
+    spool("open", "in_use", 400),
+  ], 300);
+  assert.equal(best?.spool_asset_id, "open");
+});
+
+test("bestSingleSpool: within a tier, the freest wins (not the tightest fit)", () => {
+  const best = bestSingleSpool([
+    spool("nearly-spent", "in_use", 310),
+    spool("roomy", "in_use", 800),
+  ], 300);
+  assert.equal(best?.spool_asset_id, "roomy");
+});
+
+test("bestSingleSpool: falls through to storage when nothing open can cover it", () => {
+  const best = bestSingleSpool([
+    spool("open", "in_use", 100),
+    spool("shelf", "available", 900),
+  ], 300);
+  assert.equal(best?.spool_asset_id, "shelf");
+});
+
+test("bestSingleSpool: null when no single spool covers the job", () => {
+  assert.equal(bestSingleSpool([spool("a", "in_use", 100), spool("b", "available", 150)], 300), null);
+});
+
+test("combineOrder: drains what's open before opening stock", () => {
+  const order = combineOrder([
+    spool("shelf-big", "available", 1000),
+    spool("open-small", "in_use", 120),
+    spool("open-big", "installed", 500),
+  ]).map((s) => s.spool_asset_id);
+  assert.deepEqual(order, ["open-big", "open-small", "shelf-big"]);
+});
+
+test("compareSpoolPreference: identical inventory always plans identically", () => {
+  // A plan that reshuffles between two dry runs is impossible to review, so
+  // equal-tier equal-free spools fall back to a stable id order.
+  const a = spool("bbb", "in_use", 500);
+  const b = spool("aaa", "in_use", 500);
+  assert.ok(compareSpoolPreference(a, b) > 0);
+  assert.ok(compareSpoolPreference(b, a) < 0);
 });
 
 // ── nozzleFits ─────────────────────────────────────────────────────────────

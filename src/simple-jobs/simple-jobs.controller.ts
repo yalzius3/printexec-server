@@ -97,6 +97,14 @@ const autoScheduleSchema = z.object({
   //   minimise_changes — one nozzle per printer per spec across the whole plan,
   //                      so a printer never rotates hardware between prints.
   nozzle_policy: z.enum(["earliest", "keep_assigned", "minimise_changes"]).optional(),
+  // Working hours, in the SHOP's local clock. A print may only be STARTED
+  // inside this window; a long print then runs on unattended past closing,
+  // which is normal. Omit both for round-the-clock; equal values = no limit.
+  // tz_offset_minutes is the caller's UTC offset (Cairo = 120), so the hours
+  // never silently mean the server's timezone.
+  work_start_hour: z.number().int().min(0).max(23).optional(),
+  work_latest_start_hour: z.number().int().min(0).max(23).optional(),
+  tz_offset_minutes: z.number().int().min(-840).max(840).optional(),
   /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
   allow_nozzle_swap: z.boolean().optional(),
 });
@@ -107,6 +115,14 @@ const autoScheduleAllSchema = z.object({
   dry_run: z.boolean().optional().default(false),
   min_margin_minutes: z.number().int().min(0).max(1440).optional(),
   nozzle_policy: z.enum(["earliest", "keep_assigned", "minimise_changes"]).optional(),
+  // Working hours, in the SHOP's local clock. A print may only be STARTED
+  // inside this window; a long print then runs on unattended past closing,
+  // which is normal. Omit both for round-the-clock; equal values = no limit.
+  // tz_offset_minutes is the caller's UTC offset (Cairo = 120), so the hours
+  // never silently mean the server's timezone.
+  work_start_hour: z.number().int().min(0).max(23).optional(),
+  work_latest_start_hour: z.number().int().min(0).max(23).optional(),
+  tz_offset_minutes: z.number().int().min(-840).max(840).optional(),
   /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
   allow_nozzle_swap: z.boolean().optional(),
   // Restrict to specific printers; omitted or empty = the whole fleet.

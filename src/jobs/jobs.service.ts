@@ -6,6 +6,7 @@ import {
 } from "@nestjs/common";
 import type { QueryResult, QueryResultRow } from "pg";
 import { DatabaseService } from "../database/database.service";
+import { compareSpoolPreference, bestSingleSpool, combineOrder } from "../common/spool-choice";
 import {
   reevaluateBedAfterPieceRemoval,
   recomputeOrderStatusTx,
@@ -2656,21 +2657,24 @@ export class JobsService {
       const reserved = Number(r.reserved_grams ?? 0);
       return { spool_asset_id: r.asset_id, label: r.label, marker: r.marker, remaining, reserved, status: r.status, free: Math.max(0, remaining - reserved) };
     });
-    spools.sort((a, b) => b.free - a.free);
+    // Preference order (see common/spool-choice.ts): the spool that is already
+    // mounted or open beats one sealed on a shelf, and within a tier the one
+    // with the most unreserved grams wins — least likely to run out mid-print
+    // and least likely to force every job onto the same spool.
+    spools.sort(compareSpoolPreference);
 
-    // Single best-fit: smallest spool that still covers the job (minimises waste).
-    const fits = spools.filter((s) => s.free >= needed).sort((a, b) => a.free - b.free);
-    if (fits.length > 0) {
-      const s = fits[0]!;
-      return { ...base, spools, plan: "single" as const, allocation: [{ spool_asset_id: s.spool_asset_id, label: s.label, grams: needed, sequence: 1 }] };
+    const best = bestSingleSpool(spools, needed);
+    if (best) {
+      return { ...base, spools, plan: "single" as const, allocation: [{ spool_asset_id: best.spool_asset_id, label: best.label, grams: needed, sequence: 1 }] };
     }
     const totalFree = spools.reduce((sum, s) => sum + s.free, 0);
     if (totalFree >= needed) {
-      // Combine: greedily draw from the largest spools first.
+      // Combine: draw in the same preference order — finish what's open before
+      // opening something new.
       const allocation: typeof base.allocation = [];
       let remaining = needed;
       let seq = 1;
-      for (const s of spools) {
+      for (const s of combineOrder(spools)) {
         if (remaining <= 0) break;
         const take = Math.min(s.free, remaining);
         if (take > 0) {

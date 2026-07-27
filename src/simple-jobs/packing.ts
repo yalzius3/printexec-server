@@ -63,6 +63,98 @@ export function earliestFit(
   return start;
 }
 
+/* ── Working hours ─────────────────────────────────────────────────────────
+   A shop that isn't staffed round the clock needs prints to START while
+   somebody is there to load the plate and press go. A long print may then run
+   unattended past closing — that's normal and explicitly allowed. So the
+   window constrains the START instant only, never the finish.
+
+   Hours are the SHOP's local hours. The server may well run in UTC in another
+   country, so the caller supplies its own UTC offset rather than the process
+   trusting its own timezone.
+
+   A window whose latest start is before its earliest start wraps midnight
+   (a night shift, 22:00 → 06:00). */
+export interface WorkWindow {
+  /** Earliest local hour a print may start, 0–23. */
+  startHour: number;
+  /** Latest local hour a print may start, 0–23. Exclusive. */
+  latestStartHour: number;
+  /** Minutes to ADD to UTC to reach the shop's local time (Cairo = +120). */
+  tzOffsetMinutes: number;
+}
+
+const HOUR_MS = 3_600_000;
+const DAY_MS_LOCAL = 86_400_000;
+
+/** Local hour-of-day (fractional) for an instant, in the shop's timezone. */
+function localHourOf(ms: number, w: WorkWindow): number {
+  const shifted = ms + w.tzOffsetMinutes * 60_000;
+  const intoDay = ((shifted % DAY_MS_LOCAL) + DAY_MS_LOCAL) % DAY_MS_LOCAL;
+  return intoDay / HOUR_MS;
+}
+
+/** Instant of the given local hour on the same local day as `ms`. */
+function localHourInstant(ms: number, hour: number, w: WorkWindow): number {
+  const shifted = ms + w.tzOffsetMinutes * 60_000;
+  const dayStart = Math.floor(shifted / DAY_MS_LOCAL) * DAY_MS_LOCAL;
+  return dayStart + hour * HOUR_MS - w.tzOffsetMinutes * 60_000;
+}
+
+/** True when a print may be STARTED at this instant. */
+export function isWithinWorkWindow(ms: number, w: WorkWindow | null | undefined): boolean {
+  if (!w) return true;
+  const h = localHourOf(ms, w);
+  // A full-day window (or a nonsensical equal pair) never blocks anything.
+  if (w.startHour === w.latestStartHour) return true;
+  return w.startHour < w.latestStartHour
+    ? h >= w.startHour && h < w.latestStartHour
+    : h >= w.startHour || h < w.latestStartHour;   // wraps midnight
+}
+
+/**
+ * The first instant at or after `ms` when a print may be started.
+ * Returns `ms` unchanged when it's already inside the window.
+ */
+export function nextAllowedStart(ms: number, w: WorkWindow | null | undefined): number {
+  if (!w || isWithinWorkWindow(ms, w)) return ms;
+  const opensToday = localHourInstant(ms, w.startHour, w);
+  // Before this morning's opening → wait for it. Otherwise the day is done and
+  // the next opening is tomorrow's.
+  return opensToday > ms ? opensToday : opensToday + DAY_MS_LOCAL;
+}
+
+/**
+ * Earliest start that clears every busy interval AND falls inside the shop's
+ * working hours.
+ *
+ * The two constraints interact: opening the doors can land you on top of a
+ * booked block, and dodging a booked block can push you past closing. Both
+ * only ever move the candidate FORWARD, so alternating them converges — and
+ * because each pass either returns or strictly advances, it terminates.
+ *
+ * The iteration cap is a safety net, not a limit reached in practice: a job is
+ * only re-examined once per conflict and once per day of the horizon, and the
+ * caller rejects anything beyond 60 days anyway.
+ */
+export function earliestFitWithin(
+  busy: readonly Interval[],
+  durMs: number,
+  notBefore: number,
+  gapMs: number,
+  window: WorkWindow | null | undefined,
+): number {
+  if (!window) return earliestFit(busy, durMs, notBefore, gapMs);
+  let start = notBefore;
+  for (let guard = 0; guard < 512; guard++) {
+    const opened = nextAllowedStart(start, window);
+    const fitted = earliestFit(busy, durMs, opened, gapMs);
+    if (fitted === opened) return fitted;   // inside the window and conflict-free
+    start = fitted;
+  }
+  return start;
+}
+
 export interface NozzleOption {
   nozzle_asset_id: string;
   nozzle_diameter_mm: number | null;

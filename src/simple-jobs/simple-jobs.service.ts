@@ -13,6 +13,7 @@ import {
 // test/packing.test.ts). autoSchedule keeps the I/O and calls in here to decide.
 import {
   earliestFit,
+  earliestFitWithin,
   chooseNozzle,
   nozzleFits,
   nozzleSpecKey,
@@ -21,6 +22,7 @@ import {
   type Interval,
   type NozzleOption,
   type NozzlePolicy,
+  type WorkWindow,
 } from "./packing";
 
 // Simple mode treats both resin technologies as one family — assigning an SLA
@@ -1113,6 +1115,11 @@ export class SimpleJobsService {
       dry_run?: boolean | undefined;
       min_margin_minutes?: number | undefined;
       nozzle_policy?: NozzlePolicy | undefined;
+      /** Earliest / latest LOCAL hour a print may be started, plus the caller's
+       *  UTC offset so the hours mean the shop's clock, not the server's. */
+      work_start_hour?: number | undefined;
+      work_latest_start_hour?: number | undefined;
+      tz_offset_minutes?: number | undefined;
       /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
       printer_ids?: string[] | undefined;
@@ -1133,6 +1140,9 @@ export class SimpleJobsService {
       ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
       ...(input.min_margin_minutes !== undefined ? { min_margin_minutes: input.min_margin_minutes } : {}),
       ...(input.nozzle_policy !== undefined ? { nozzle_policy: input.nozzle_policy } : {}),
+      ...(input.work_start_hour !== undefined ? { work_start_hour: input.work_start_hour } : {}),
+      ...(input.work_latest_start_hour !== undefined ? { work_latest_start_hour: input.work_latest_start_hour } : {}),
+      ...(input.tz_offset_minutes !== undefined ? { tz_offset_minutes: input.tz_offset_minutes } : {}),
       ...(input.allow_nozzle_swap !== undefined ? { allow_nozzle_swap: input.allow_nozzle_swap } : {}),
     });
     // Carry the printer roster through so the review step can label lanes
@@ -1147,6 +1157,11 @@ export class SimpleJobsService {
       dry_run?: boolean | undefined;
       min_margin_minutes?: number | undefined;
       nozzle_policy?: NozzlePolicy | undefined;
+      /** Earliest / latest LOCAL hour a print may be started, plus the caller's
+       *  UTC offset so the hours mean the shop's clock, not the server's. */
+      work_start_hour?: number | undefined;
+      work_latest_start_hour?: number | undefined;
+      tz_offset_minutes?: number | undefined;
       /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
     }
@@ -1181,6 +1196,20 @@ export class SimpleJobsService {
       input.nozzle_policy ?? (input.allow_nozzle_swap === false ? "keep_assigned" : "earliest");
     // minimise_changes only: printer+spec → the nozzle that printer is keeping.
     const pinnedNozzleBySpec = new Map<string, string>();
+    // Working hours. Constrains when a print may be STARTED — a long print runs
+    // on unattended past closing, which is normal. Absent = round the clock.
+    // A window covering the whole day is the same as none, so it's dropped
+    // rather than carried through every placement as a no-op.
+    const workWindow: WorkWindow | null =
+      input.work_start_hour != null &&
+      input.work_latest_start_hour != null &&
+      input.work_start_hour !== input.work_latest_start_hour
+        ? {
+            startHour: input.work_start_hour,
+            latestStartHour: input.work_latest_start_hour,
+            tzOffsetMinutes: input.tz_offset_minutes ?? 0,
+          }
+        : null;
     const HORIZON_MS = 60 * 24 * 60 * 60_000;
     const now = Date.now();
 
@@ -1519,11 +1548,12 @@ export class SimpleJobsService {
       const printerIvs = printerBusy.get(c.printer_id) ?? [];
       const spoolIvs = mySpools.flatMap((sid) => spoolBusy.get(sid) ?? []);
       const earliestWith = (nozzleId: string | null): number =>
-        earliestFit(
+        earliestFitWithin(
           [...printerIvs, ...(nozzleId ? nozzleBusy.get(nozzleId) ?? [] : []), ...spoolIvs],
           durMs,
           now + LEAD_MS,
           GAP_MS,
+          workWindow,
         );
 
       // ── Nozzle substitution. The assigned nozzle is one option, not the only
@@ -1688,6 +1718,9 @@ export class SimpleJobsService {
       // what it's reviewing and re-run with a different margin.
       min_margin_minutes: Math.round(GAP_MS / 60_000),
       nozzle_policy: nozzlePolicy,
+      work_window: workWindow
+        ? { start_hour: workWindow.startHour, latest_start_hour: workWindow.latestStartHour }
+        : null,
       nozzle_swaps: placed.filter((p) => p.nozzle_swapped).length,
       // Total physical swaps across the fleet — the number the operator feels.
       nozzle_changes: Array.from(changesByPrinter.values()).reduce((a, b) => a + b, 0),
