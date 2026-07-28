@@ -356,6 +356,12 @@ export class SimpleJobsService {
       slicer_file_url: string | null;
       slicer_print_time_minutes?: number | undefined;
       slicer_filament_used_grams?: number | undefined;
+      // Resin's counterparts. A resin print is measured in millilitres and draws
+      // from one tank; without these the simple path could never take a resin
+      // piece past 'assigned', which is what forced resin through the
+      // assignment wizard instead of this flow.
+      slicer_resin_used_ml?: number | undefined;
+      resin_tank_id?: string | undefined;
     }[]
   ) {
     const ids = items.map((i) => i.piece_id);
@@ -365,9 +371,12 @@ export class SimpleJobsService {
       status: string;
       assigned_printer_id: string | null;
       assigned_nozzle_asset_id: string | null;
+      required_print_technology: string | null;
+      resin_tank_id: string | null;
     }>(
       `
-        SELECT piece_id, piece_name, status, assigned_printer_id, assigned_nozzle_asset_id
+        SELECT piece_id, piece_name, status, assigned_printer_id, assigned_nozzle_asset_id,
+               required_print_technology, resin_tank_id
         FROM order_pieces
         WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
       `,
@@ -387,7 +396,11 @@ export class SimpleJobsService {
         skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "already in production" });
         continue;
       }
-      if (!piece.assigned_printer_id || !piece.assigned_nozzle_asset_id) {
+      // A resin printer has no nozzle, so requiring one here skipped every resin
+      // piece with "assign a printer first" — the block that made this path
+      // unusable for resin.
+      const isResin = isResinTech(piece.required_print_technology);
+      if (!piece.assigned_printer_id || (!isResin && !piece.assigned_nozzle_asset_id)) {
         skipped.push({ piece_id: piece.piece_id, piece_name: piece.piece_name, reason: "assign a printer first" });
         continue;
       }
@@ -400,9 +413,17 @@ export class SimpleJobsService {
               slicer_file_uploaded_at    = CASE WHEN $3::text IS NOT NULL THEN now() ELSE NULL END,
               slicer_print_time_minutes  = COALESCE($4, slicer_print_time_minutes),
               slicer_filament_used_grams = COALESCE($5, slicer_filament_used_grams),
+              slicer_resin_used_ml       = COALESCE($6, slicer_resin_used_ml),
+              resin_tank_id              = COALESCE($7, resin_tank_id),
+              -- Readiness in the job's own unit. The resin arm ALSO requires a
+              -- tank, matching chk_ready_requires_core_data exactly — promoting
+              -- without one would trip the constraint rather than land 'assigned'.
               status                     = CASE
-                WHEN COALESCE($4, slicer_print_time_minutes) IS NOT NULL
-                 AND COALESCE($5, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
+                WHEN COALESCE($4, slicer_print_time_minutes) IS NULL THEN 'assigned'
+                WHEN required_print_technology IN ('MSLA', 'SLA') THEN
+                  CASE WHEN COALESCE($6, slicer_resin_used_ml) IS NOT NULL
+                        AND COALESCE($7, resin_tank_id) IS NOT NULL THEN 'ready' ELSE 'assigned' END
+                WHEN COALESCE($5, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
                 ELSE 'assigned'
               END
           WHERE company_id = $1 AND piece_id = $2
@@ -413,6 +434,8 @@ export class SimpleJobsService {
           item.slicer_file_url,
           item.slicer_print_time_minutes ?? null,
           item.slicer_filament_used_grams ?? null,
+          item.slicer_resin_used_ml ?? null,
+          item.resin_tank_id ?? null,
         ]
       );
       updated.push(item.piece_id);

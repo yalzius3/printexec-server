@@ -72,6 +72,10 @@ const attachSlicerSchema = z.object({
         slicer_file_url: z.string().min(1).max(1000).nullable(),
         slicer_print_time_minutes: z.number().int().positive().max(10_000_000).optional(),
         slicer_filament_used_grams: z.number().nonnegative().max(10_000_000).optional(),
+        // Resin's counterparts — the volume a print draws and the tank it draws
+        // from. Both are needed for a resin piece to reach 'ready'.
+        slicer_resin_used_ml: z.number().nonnegative().max(10_000_000).optional(),
+        resin_tank_id: z.string().uuid().optional(),
       })
     )
     .min(1)
