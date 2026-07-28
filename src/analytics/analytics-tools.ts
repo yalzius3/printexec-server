@@ -144,7 +144,7 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
     name: "kpi_summary",
     title: "KPI summary",
     description:
-      "Headline numbers for a period WITH the previous same-length period for comparison: billed revenue, invoice count, average order value (AOV), orders created/fulfilled, fleet booked print-hours + utilization %, waste cost/grams, open receivables, and posted-ledger revenue/COGS/waste (gross margin). Call this first for any overview question.",
+      "Headline numbers for a period WITH the previous same-length period for comparison: billed revenue, invoice count, average order value (AOV), orders created/fulfilled, fleet booked print-hours + utilization %, waste cost plus scrapped filament grams and resin millilitres separately, open receivables, and posted-ledger revenue/COGS/waste (gross margin). Call this first for any overview question.",
     financial: true,
     params: periodParamsSchema,
     jsonSchema: periodJsonSchema,
@@ -169,9 +169,15 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
               WHERE op.company_id = $1
                 AND op.scheduled_start_at < ($3::date + 1)::timestamptz
                 AND op.scheduled_end_at > $2::date::timestamptz)::float8 AS booked_hours,
+            -- COST is unit-agnostic (money), so it deliberately spans filament AND
+            -- resin. QUANTITY is not: filament_waste_events stores grams and
+            -- millilitres in one column, discriminated by fw.unit, so every SUM of
+            -- fw.grams must be scoped or it silently adds ml to g. See
+            -- FinanceService.bookMaterialWaste.
             (SELECT COALESCE(SUM(fw.cost), 0) FROM filament_waste_events fw WHERE fw.company_id = $1 AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1))::text AS waste_cost,
             (SELECT COALESCE(SUM(fw.cost), 0) FROM filament_waste_events fw WHERE fw.company_id = $1 AND fw.created_at >= $4::date AND fw.created_at < ($5::date + 1))::text AS waste_cost_prev,
-            (SELECT COALESCE(SUM(fw.grams), 0) FROM filament_waste_events fw WHERE fw.company_id = $1 AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1))::text AS waste_grams,
+            (SELECT COALESCE(SUM(fw.grams), 0) FROM filament_waste_events fw WHERE fw.company_id = $1 AND fw.unit = 'g' AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1))::text AS waste_grams,
+            (SELECT COALESCE(SUM(fw.grams), 0) FROM filament_waste_events fw WHERE fw.company_id = $1 AND fw.unit = 'ml' AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1))::text AS waste_resin_ml,
             (SELECT COALESCE(SUM(i.balance_due), 0) FROM ${INV} WHERE i.company_id = $1 AND i.status IN ('open', 'partial'))::text AS ar_open_balance,
             (SELECT COALESCE(SUM(l.credit - l.debit), 0)
                FROM journal_lines l
@@ -516,6 +522,7 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
         pieces_done: number;
         waste_events: number;
         waste_grams: number;
+        waste_resin_ml: number;
       }>(
         `
           SELECT pi.printer_id,
@@ -523,7 +530,8 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
                  COALESCE(bh.hours, 0)::float8 AS booked_hours,
                  COALESCE(pc.n, 0)::int AS pieces_done,
                  COALESCE(w.events, 0)::int AS waste_events,
-                 COALESCE(w.grams, 0)::float8 AS waste_grams
+                 COALESCE(w.grams, 0)::float8 AS waste_grams,
+                 COALESCE(w.ml, 0)::float8 AS waste_resin_ml
           FROM printer_instances pi
           LEFT JOIN LATERAL (
             SELECT SUM(${OVERLAP_HOURS("$2", "$3")}) AS hours
@@ -539,7 +547,11 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
               AND op.print_completed_at >= $2::date AND op.print_completed_at < ($3::date + 1)
           ) pc ON TRUE
           LEFT JOIN LATERAL (
-            SELECT COUNT(*) AS events, SUM(fw.grams) AS grams
+            -- waste_grams is grams; a resin printer's scrap is millilitres and is
+            -- reported alongside rather than folded in (see fw.unit).
+            SELECT COUNT(*) AS events,
+                   SUM(fw.grams) FILTER (WHERE fw.unit = 'g')  AS grams,
+                   SUM(fw.grams) FILTER (WHERE fw.unit = 'ml') AS ml
             FROM filament_waste_events fw
             JOIN order_pieces op2 ON op2.piece_id = fw.piece_id
             WHERE fw.company_id = $1 AND op2.assigned_printer_id = pi.printer_id
@@ -558,6 +570,7 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
           ...r,
           booked_hours: round1(num(r.booked_hours)),
           waste_grams: round1(num(r.waste_grams)),
+          waste_resin_ml: round1(num(r.waste_resin_ml)),
           utilization_pct: capacityPerPrinter > 0 ? round1((num(r.booked_hours) / capacityPerPrinter) * 100) : null
         }))
       };
@@ -739,9 +752,13 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
             GROUP BY 1
           ),
           waste AS (
+            -- Scoped to grams: this burn rate is joined to FILAMENT stock (spools,
+            -- by material) and drives a g/day figure, so resin millilitres would
+            -- both mis-add and mis-attribute.
             SELECT COALESCE(fw.material_type, 'Unknown') AS material, SUM(fw.grams)::float8 AS g
             FROM filament_waste_events fw
-            WHERE fw.company_id = $1 AND fw.created_at >= now() - interval '30 days'
+            WHERE fw.company_id = $1 AND fw.unit = 'g'
+              AND fw.created_at >= now() - interval '30 days'
             GROUP BY 1
           )
           SELECT s.material,
@@ -779,20 +796,26 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
     name: "waste_summary",
     title: "Waste summary",
     description:
-      "Failed-print material waste over a period vs the previous same-length period: total grams, cost and event count, broken down by material and by printer. Use for scrap/failure questions.",
+      "Failed-print material waste over a period vs the previous same-length period: cost and event count (spanning all materials), plus scrapped quantity reported per unit — grams for filament, resin_ml for resin — broken down by material and by printer. Rankings are by cost, since grams and millilitres are not comparable. Use for scrap/failure questions.",
     financial: false,
     params: periodParamsSchema,
     jsonSchema: periodJsonSchema,
     async run(db, companyId, params) {
       const p = resolvePeriod(params as { from?: string; to?: string });
       const [totals, byMaterial, byPrinter] = await Promise.all([
-        db.query<{ grams: string; cost: string; events: number; grams_prev: string; cost_prev: string; events_prev: number }>(
+        db.query<{ grams: string; resin_ml: string; cost: string; events: number; grams_prev: string; resin_ml_prev: string; cost_prev: string; events_prev: number }>(
           `
+            -- QUANTITY is per-unit, COST is not. grams/ml are reported separately
+            -- (fw.unit discriminates them in the shared column); cost and the
+            -- event count deliberately span both materials, because "what did
+            -- scrap cost us" has one answer regardless of technology.
             SELECT
-              COALESCE(SUM(fw.grams) FILTER (WHERE fw.created_at >= $2::date AND fw.created_at < ($3::date + 1)), 0)::text AS grams,
+              COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'g' AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1)), 0)::text AS grams,
+              COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'ml' AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1)), 0)::text AS resin_ml,
               COALESCE(SUM(fw.cost) FILTER (WHERE fw.created_at >= $2::date AND fw.created_at < ($3::date + 1)), 0)::text AS cost,
               COUNT(*) FILTER (WHERE fw.created_at >= $2::date AND fw.created_at < ($3::date + 1))::int AS events,
-              COALESCE(SUM(fw.grams) FILTER (WHERE fw.created_at >= $4::date AND fw.created_at < ($5::date + 1)), 0)::text AS grams_prev,
+              COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'g' AND fw.created_at >= $4::date AND fw.created_at < ($5::date + 1)), 0)::text AS grams_prev,
+              COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'ml' AND fw.created_at >= $4::date AND fw.created_at < ($5::date + 1)), 0)::text AS resin_ml_prev,
               COALESCE(SUM(fw.cost) FILTER (WHERE fw.created_at >= $4::date AND fw.created_at < ($5::date + 1)), 0)::text AS cost_prev,
               COUNT(*) FILTER (WHERE fw.created_at >= $4::date AND fw.created_at < ($5::date + 1))::int AS events_prev
             FROM filament_waste_events fw
@@ -800,25 +823,36 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
           `,
           [companyId, p.from, p.to, p.prevFrom, p.prevTo]
         ),
-        db.query<{ material: string; grams: string; cost: string; events: number }>(
+        db.query<{ material: string; unit: string | null; grams: string; resin_ml: string; cost: string; events: number }>(
           `
+            -- One row per material with its own unit: a filament material reports
+            -- grams and 0 ml, a resin type the reverse. Ordered by COST so the
+            -- ranking is comparable across units — ordering by the shared quantity
+            -- column would rank 200 ml above 100 g for no meaningful reason.
             SELECT COALESCE(fw.material_type, 'Unknown') AS material,
-                   SUM(fw.grams)::text AS grams, SUM(fw.cost)::text AS cost, COUNT(*)::int AS events
+                   MIN(fw.unit) AS unit,
+                   COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'g'), 0)::text  AS grams,
+                   COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'ml'), 0)::text AS resin_ml,
+                   SUM(fw.cost)::text AS cost, COUNT(*)::int AS events
             FROM filament_waste_events fw
             WHERE fw.company_id = $1 AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1)
-            GROUP BY 1 ORDER BY SUM(fw.grams) DESC LIMIT 12
+            GROUP BY 1 ORDER BY SUM(fw.cost) DESC LIMIT 12
           `,
           [companyId, p.from, p.to]
         ),
-        db.query<{ label: string | null; grams: string; cost: string; events: number }>(
+        db.query<{ label: string | null; grams: string; resin_ml: string; cost: string; events: number }>(
           `
+            -- Same split per printer, and ordered by cost for the same reason:
+            -- a resin machine and an FDM machine are only comparable in money.
             SELECT NULLIF(TRIM(CONCAT_WS(' ', pi.brand, pi.model)), '') AS label,
-                   SUM(fw.grams)::text AS grams, SUM(fw.cost)::text AS cost, COUNT(*)::int AS events
+                   COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'g'), 0)::text  AS grams,
+                   COALESCE(SUM(fw.grams) FILTER (WHERE fw.unit = 'ml'), 0)::text AS resin_ml,
+                   SUM(fw.cost)::text AS cost, COUNT(*)::int AS events
             FROM filament_waste_events fw
             LEFT JOIN order_pieces op ON op.piece_id = fw.piece_id
             LEFT JOIN printer_instances pi ON pi.printer_id = op.assigned_printer_id
             WHERE fw.company_id = $1 AND fw.created_at >= $2::date AND fw.created_at < ($3::date + 1)
-            GROUP BY 1 ORDER BY SUM(fw.grams) DESC LIMIT 12
+            GROUP BY 1 ORDER BY SUM(fw.cost) DESC LIMIT 12
           `,
           [companyId, p.from, p.to]
         )

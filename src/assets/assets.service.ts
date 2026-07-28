@@ -11,7 +11,7 @@ import {
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
   listFilamentReferencesQuerySchema,
-  splitSpoolSchema,
+  splitAssetSchema,
   updateAssetSchema,
   updateAssetStockSchema
 } from "./assets.schemas";
@@ -27,7 +27,7 @@ type UpdateAssetInput = z.infer<typeof updateAssetSchema>;
 type UpdateAssetStockInput = z.infer<typeof updateAssetStockSchema>;
 type ListFilamentReferencesQuery = z.infer<typeof listFilamentReferencesQuerySchema>;
 type ListAssetHistoryQuery = z.infer<typeof listAssetHistoryQuerySchema>;
-type SplitSpoolInput = z.infer<typeof splitSpoolSchema>;
+type SplitAssetInput = z.infer<typeof splitAssetSchema>;
 
 type AssetRow = {
   asset_id: string;
@@ -52,12 +52,17 @@ type AssetRow = {
   resin_type: string | null;
   resin_color: string | null;
   resin_hex: string | null;
+  resin_tech_compat: string | null;
   resin_uv_wavelength_nm: number | null;
   resin_uv_reactive: boolean;
   resin_density: string | null;
   resin_initial_volume_ml: string | null;
+  resin_total_volume_ml: string | null;
   resin_purchase_date: string | null;
   resin_production_date: string | null;
+  resin_opened_at: string | null;
+  resin_expiry_date: string | null;
+  resin_datasheet_url: string | null;
   location: string | null;
   marker: string | null;
   notes: string | null;
@@ -330,6 +335,108 @@ export class AssetsService {
     });
   }
 
+  // Physical resin-tank inventory — the resin counterpart of listSpoolInventory,
+  // and what the piece editor's tank picker reads. Carries everything needed to
+  // pick a tank without a second round-trip: free volume, which light source it
+  // suits, and whether it has expired (resin is the only material we stock that
+  // goes off, so an operator must see that at the moment of choosing).
+  async listResinTankInventory(companyId: string) {
+    const res = await this.databaseService.query<{
+      asset_id: string;
+      resin_brand: string | null;
+      resin_type: string | null;
+      resin_color: string | null;
+      resin_hex: string | null;
+      resin_tech_compat: string | null;
+      resin_density: string | null;
+      resin_initial_volume_ml: string | null;
+      remaining_volume_ml: string | null;
+      reserved_volume_ml: string | null;
+      purchase_price: string | null;
+      location: string | null;
+      marker: string | null;
+      resin_expiry_date: string | null;
+      is_expired: boolean;
+      status: string;
+    }>(
+      `SELECT ai.asset_id, ai.resin_brand, ai.resin_type, ai.resin_color, ai.resin_hex,
+              ai.resin_tech_compat, ai.resin_density, ai.resin_initial_volume_ml,
+              ai.purchase_price, ai.location, ai.marker, ai.resin_expiry_date,
+              (ai.resin_expiry_date IS NOT NULL AND ai.resin_expiry_date < CURRENT_DATE) AS is_expired,
+              COALESCE(ast.remaining_volume_ml, ai.resin_initial_volume_ml) AS remaining_volume_ml,
+              COALESCE(ast.reserved_volume_ml, 0)                           AS reserved_volume_ml,
+              COALESCE(ast.status, 'available')                             AS status
+         FROM asset_instances ai
+         LEFT JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+        WHERE ai.company_id = $1 AND ai.asset_type = 'resin_tank'
+          -- A distributed (split) parent is unusable for new assignments; only
+          -- its children carry the real, allocatable volume.
+          AND ai.split_at IS NULL
+        ORDER BY ai.resin_brand NULLS LAST, ai.resin_type, ai.resin_color, ai.created_at`,
+      [companyId]
+    );
+    return res.rows.map((r) => {
+      const remaining = r.remaining_volume_ml != null ? Number(r.remaining_volume_ml) : null;
+      const reserved = Number(r.reserved_volume_ml ?? 0);
+      const initial = r.resin_initial_volume_ml != null ? Number(r.resin_initial_volume_ml) : null;
+      const price = r.purchase_price != null ? Number(r.purchase_price) : null;
+      const baseLabel =
+        [r.resin_brand, r.resin_type].filter(Boolean).join(" ") + (r.resin_color ? ` / ${r.resin_color}` : "");
+      return {
+        asset_id: r.asset_id,
+        resin_brand: r.resin_brand,
+        resin_type: r.resin_type,
+        resin_color: r.resin_color,
+        resin_hex: r.resin_hex,
+        // 'both' is the permissive default the migration backfills.
+        tech_compat: r.resin_tech_compat ?? "both",
+        density: r.resin_density != null ? Number(r.resin_density) : null,
+        location: r.location,
+        marker: r.marker,
+        label: (baseLabel.trim() || "Unknown resin") + (r.location ? ` · ${r.location}` : ""),
+        remaining_volume_ml: remaining,
+        reserved_volume_ml: reserved,
+        free_volume_ml: remaining != null ? Math.max(0, remaining - reserved) : null,
+        initial_volume_ml: initial,
+        // Cost per ml, derived rather than stored — a second copy of the price
+        // would be free to drift from purchase_price.
+        cost_per_ml: price != null && initial != null && initial > 0 ? price / initial : null,
+        expiry_date: r.resin_expiry_date,
+        is_expired: r.is_expired,
+        status: r.status,
+      };
+    });
+  }
+
+  // Average resin price per ml per resin type — the resin analogue of
+  // listMaterialPricing, and what the separate resin cost path prices jobs from.
+  // Counts only priced tanks, and excludes split children (the parent keeps the
+  // price, exactly as with spools) so a decanted bottle isn't counted twice.
+  async listResinPricing(companyId: string) {
+    const res = await this.databaseService.query<{
+      resin_type: string | null;
+      avg_price_per_ml: string | null;
+      tank_count: string;
+    }>(
+      `SELECT ai.resin_type,
+              SUM(ai.purchase_price) / NULLIF(SUM(ai.resin_initial_volume_ml), 0) AS avg_price_per_ml,
+              COUNT(*) AS tank_count
+         FROM asset_instances ai
+        WHERE ai.company_id = $1
+          AND ai.asset_type = 'resin_tank'
+          AND ai.parent_asset_id IS NULL
+          AND ai.purchase_price > 0
+          AND ai.resin_initial_volume_ml > 0
+        GROUP BY ai.resin_type`,
+      [companyId]
+    );
+    return res.rows.map((r) => ({
+      resin_type: r.resin_type,
+      avg_price_per_ml: r.avg_price_per_ml != null ? Number(r.avg_price_per_ml) : null,
+      tank_count: Number(r.tank_count),
+    }));
+  }
+
   // Average filament price per gram for each material type:
   //   Σ(purchase_price) / Σ(initial_grams)
   // counting ONLY spools that have a positive price (so free/0-priced spools
@@ -389,7 +496,10 @@ export class AssetsService {
       wasteByMaterial,
       wasteTotals,
       sparePartTotals,
-      sparePartsByPart
+      sparePartsByPart,
+      resinByType,
+      resinFlow,
+      resinWaste
     ] = await Promise.all([
       // Filament on hand, per material+color (hex kept for swatches). The
       // client rolls colors up into per-material totals.
@@ -573,12 +683,15 @@ export class AssetsService {
       ),
       // Filament wasted per material within the window (measured failed-print
       // scrap), valued at the cost snapshotted when each loss was recorded.
+      // unit = 'g' is load-bearing: the same table now also holds resin losses in
+      // millilitres, and summing the two quantities together would be nonsense.
       this.databaseService.query<{ material_type: string | null; grams: string; cost: string }>(
         `SELECT material_type,
                 COALESCE(SUM(grams), 0) AS grams,
                 COALESCE(SUM(cost), 0)  AS cost
            FROM filament_waste_events
           WHERE company_id = $1
+            AND unit = 'g'
             AND created_at >= now() - ($2 || ' days')::interval
           GROUP BY material_type
          HAVING SUM(grams) > 0
@@ -604,7 +717,8 @@ export class AssetsService {
            COALESCE(SUM(grams), 0) AS grams_lifetime,
            COALESCE(SUM(cost), 0)  AS cost_lifetime
          FROM filament_waste_events
-        WHERE company_id = $1`,
+        WHERE company_id = $1
+          AND unit = 'g'`,
         [companyId, days, days * 2]
       ),
       // Spare-part roll-up: on-hand count/value are point-in-time inventory
@@ -654,6 +768,72 @@ export class AssetsService {
           ORDER BY count DESC, value DESC
           LIMIT 10`,
         [companyId]
+      ),
+      // Resin on hand, per resin type + color. Split parents excluded for the
+      // same reason as filament: the volume lives on the children now.
+      this.databaseService.query<{
+        resin_type: string | null;
+        color: string | null;
+        hex: string | null;
+        tank_count: string;
+        remaining_volume_ml: string;
+        reserved_volume_ml: string;
+        expired_count: string;
+      }>(
+        `SELECT ai.resin_type,
+                ai.resin_color AS color,
+                MAX(ai.resin_hex) AS hex,
+                COUNT(*)::int AS tank_count,
+                COALESCE(SUM(COALESCE(ast.remaining_volume_ml, ai.resin_initial_volume_ml)), 0) AS remaining_volume_ml,
+                COALESCE(SUM(COALESCE(ast.reserved_volume_ml, 0)), 0) AS reserved_volume_ml,
+                COUNT(*) FILTER (WHERE ai.resin_expiry_date IS NOT NULL
+                                   AND ai.resin_expiry_date < CURRENT_DATE)::int AS expired_count
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'resin_tank'
+            AND ai.split_at IS NULL
+          GROUP BY ai.resin_type, ai.resin_color
+         HAVING COALESCE(SUM(COALESCE(ast.remaining_volume_ml, ai.resin_initial_volume_ml)), 0) > 0
+          ORDER BY remaining_volume_ml DESC`,
+        [companyId]
+      ),
+      // Resin consumed over the window + the post-processing backlog. Both come
+      // off order_pieces, so they cost one scan rather than two.
+      this.databaseService.query<{
+        consumed_ml: string;
+        jobs_period: string;
+        awaiting_wash: string;
+        awaiting_cure: string;
+        oldest_waiting_at: string | null;
+      }>(
+        `SELECT
+           COALESCE(SUM(op.slicer_resin_used_ml) FILTER (
+             WHERE op.status = 'done'
+               AND op.print_completed_at >= now() - ($2 || ' days')::interval), 0) AS consumed_ml,
+           COUNT(*) FILTER (
+             WHERE op.status = 'done'
+               AND op.print_completed_at >= now() - ($2 || ' days')::interval)::int AS jobs_period,
+           COUNT(*) FILTER (WHERE op.post_process_state = 'print_done')::int        AS awaiting_wash,
+           COUNT(*) FILTER (WHERE op.post_process_state = 'washed')::int            AS awaiting_cure,
+           MIN(op.post_process_state_entered_at) FILTER (
+             WHERE op.post_process_state IN ('print_done', 'washed'))               AS oldest_waiting_at
+         FROM order_pieces op
+        WHERE op.company_id = $1
+          AND op.required_print_technology IN ('MSLA', 'SLA')`,
+        [companyId, days]
+      ),
+      // Resin scrapped on failed prints over the window. Same table as filament
+      // waste, separated by unit — see the note on the filament query above.
+      this.databaseService.query<{ ml_period: string; cost_period: string; events_period: string }>(
+        `SELECT COALESCE(SUM(grams), 0) AS ml_period,
+                COALESCE(SUM(cost), 0)  AS cost_period,
+                COUNT(*)::int           AS events_period
+           FROM filament_waste_events
+          WHERE company_id = $1
+            AND unit = 'ml'
+            AND created_at >= now() - ($2 || ' days')::interval`,
+        [companyId, days]
       )
     ]);
 
@@ -731,6 +911,26 @@ export class AssetsService {
           damaged_count: num(r.damaged_count),
           value: num(r.value)
         }))
+      },
+      resin: {
+        by_type: resinByType.rows.map((r) => ({
+          resin_type: r.resin_type,
+          color: r.color,
+          hex: r.hex,
+          tank_count: num(r.tank_count),
+          remaining_volume_ml: num(r.remaining_volume_ml),
+          reserved_volume_ml: num(r.reserved_volume_ml),
+          expired_count: num(r.expired_count)
+        })),
+        consumed_ml_period: num(resinFlow.rows[0]?.consumed_ml),
+        jobs_period: num(resinFlow.rows[0]?.jobs_period),
+        // The post-processing backlog: prints off the machine but not finished.
+        awaiting_wash: num(resinFlow.rows[0]?.awaiting_wash),
+        awaiting_cure: num(resinFlow.rows[0]?.awaiting_cure),
+        oldest_waiting_at: resinFlow.rows[0]?.oldest_waiting_at ?? null,
+        wasted_ml_period: num(resinWaste.rows[0]?.ml_period),
+        wasted_cost_period: num(resinWaste.rows[0]?.cost_period),
+        wasted_events_period: num(resinWaste.rows[0]?.events_period)
       }
     };
   }
@@ -768,6 +968,7 @@ export class AssetsService {
           OR ai.spare_part_brand ILIKE $${values.length}
           OR ai.resin_brand ILIKE $${values.length}
           OR ai.resin_type ILIKE $${values.length}
+          OR ai.resin_color ILIKE $${values.length}
         )
       `);
     }
@@ -916,190 +1117,253 @@ export class AssetsService {
 
     // Assets → Finance: best-effort, post-commit. A finance hiccup must never
     // undo the spools the operator just added, so failures are logged, not thrown.
-    await this.recordSpoolPurchaseInFinance(companyId, userId, input, spools);
+    const spoolLabel =
+      [spools[0]?.filament_brand, spools[0]?.filament_material_type, spools[0]?.filament_color]
+        .filter(Boolean)
+        .join(" ")
+        .trim() || "Filament spool";
+    await this.recordAssetPurchaseInFinance(companyId, userId, input, spools, {
+      noun: "Spool",
+      description: input.initial_grams
+        ? `${spoolLabel} — spool (${input.initial_grams} g)`
+        : `${spoolLabel} — spool`,
+      purchaseDate: input.purchase_date ?? null
+    });
 
     // Stay backwards-compatible: a single spool returns the asset object, while
     // a multiplier batch returns the array of created spools.
     return (input.quantity ?? 1) > 1 ? spools : spools[0];
   }
 
-  // Book the just-added spool(s) as an itemized filament-purchase bill in
-  // Finance. Only fires when a vendor name was supplied and there is something
-  // billable (a spool price and/or a delivery cost). The spool line's quantity is
-  // the ×N multiplier, so a "box of 4" reads as one line of qty 4. Best-effort:
-  // any failure (e.g. books locked for that date) is logged and swallowed so the
+  // Book a just-completed asset intake as an itemized purchase bill in Finance.
+  // Shared by every asset type that carries the vendor/delivery/tax/paid rider —
+  // spools, spare parts and resin tanks all book the same shape of bill, and the
+  // only things that differ are the line's wording and the reference prefix.
+  //
+  // Only fires when a vendor name was supplied and there is something billable
+  // (a unit price and/or a delivery cost). The line's quantity is the ×N
+  // multiplier, so a "box of 4" reads as one line of qty 4. Best-effort: any
+  // failure (e.g. books locked for that date) is logged and swallowed so the
   // physical inventory the operator created is never rolled back.
-  private async recordSpoolPurchaseInFinance(
+  private async recordAssetPurchaseInFinance(
     companyId: string,
     userId: string,
-    input: CreateSpoolInput,
-    spools: AssetRow[]
+    rider: {
+      vendor_name?: string | undefined;
+      purchase_price?: number | null | undefined;
+      delivery_cost?: number | undefined;
+      price_includes_tax?: boolean | undefined;
+      already_paid?: boolean | undefined;
+      quantity?: number | undefined;
+    },
+    assets: AssetRow[],
+    line: { noun: string; description: string; purchaseDate: string | null }
   ): Promise<void> {
-    const vendorName = input.vendor_name?.trim();
+    const vendorName = rider.vendor_name?.trim();
     if (!vendorName) return;
 
-    const unitPrice = input.purchase_price ?? 0;
-    const deliveryCost = input.delivery_cost ?? 0;
+    const unitPrice = rider.purchase_price ?? 0;
+    const deliveryCost = rider.delivery_cost ?? 0;
     if (unitPrice <= 0 && deliveryCost <= 0) return;
 
-    const first = spools[0];
-    const label =
-      [first?.filament_brand, first?.filament_material_type, first?.filament_color]
-        .filter(Boolean)
-        .join(" ")
-        .trim() || "Filament spool";
-    const grams = input.initial_grams;
-    const description = grams ? `${label} — spool (${grams} g)` : `${label} — spool`;
-    // Cross-reference the created inventory rows so the bill is traceable back to
-    // the physical spools (and vice-versa via the vendor_reference column).
-    const reference = spools.length
-      ? `Spool ${spools.map((s) => s.asset_id).join(", ")}`.slice(0, 200)
+    // Cross-reference the created inventory rows so the bill is traceable back
+    // to the physical assets (and vice-versa via the vendor_reference column).
+    const reference = assets.length
+      ? `${line.noun} ${assets.map((a) => a.asset_id).join(", ")}`.slice(0, 200)
       : null;
 
     try {
       const result = await this.financeService.recordInventoryPurchase(companyId, userId, {
         vendorName,
-        description,
+        description: line.description,
         unitPrice,
-        quantity: input.quantity ?? 1,
+        quantity: rider.quantity ?? 1,
         deliveryCost,
-        priceIncludesTax: input.price_includes_tax ?? false,
-        alreadyPaid: input.already_paid ?? false,
-        purchaseDate: input.purchase_date ?? null,
+        priceIncludesTax: rider.price_includes_tax ?? false,
+        alreadyPaid: rider.already_paid ?? false,
+        purchaseDate: line.purchaseDate,
         reference,
-        memo: "Filament spool purchase"
+        memo: `${line.noun} purchase`
       });
       if (result) {
         this.logger.log(
-          `Recorded filament purchase ${result.bill_number} (${result.status}) for company ${companyId}.`
+          `Recorded ${line.noun.toLowerCase()} purchase ${result.bill_number} (${result.status}) for company ${companyId}.`
         );
       }
     } catch (error) {
       this.logger.error(
-        `Failed to auto-record filament purchase for company ${companyId}: ${
+        `Failed to auto-record ${line.noun.toLowerCase()} purchase for company ${companyId}: ${
           error instanceof Error ? error.message : String(error)
         }`
       );
     }
   }
 
-  // Split one idle spool into N child spools. The parent is kept intact but
-  // marked distributed (split_at) so it's unusable for new assignments, while
-  // the children become the real, allocatable spools. Eligibility: a filament
-  // spool that isn't already split/child, isn't in use, has no reservation and
-  // no scheduled commitment, and has remaining grams to divide. The per-child
-  // grams must sum to the parent's current remaining grams.
-  async splitSpool(companyId: string, assetId: string, input: SplitSpoolInput) {
+  // Per-type facts a split needs. Filament and resin are the same operation in
+  // two units: decant a bulk container into smaller ones. Everything that
+  // differs — which stock column holds the quantity, how a commitment is found,
+  // which identity columns a child inherits — lives here, so the split itself is
+  // written once.
+  private static readonly SPLITTABLE = {
+    filament_spool: {
+      noun: "spool",
+      unit: "g",
+      // asset_stock columns holding this type's quantity + reservation.
+      remainingColumn: "remaining_grams",
+      reservedColumn: "reserved_grams",
+      // Which asset_instances column a child's starting quantity goes into.
+      childQuantityColumn: "initial_grams",
+      // Committed-to-scheduled-work probe (filament reserves via the ledger).
+      commitmentSql: `SELECT 1 FROM order_piece_spools
+                       WHERE company_id = $1 AND spool_asset_id = $2 LIMIT 1`,
+      // Identity a child inherits verbatim from its parent.
+      inheritedColumns: ["filament_ref_id", "purchase_date", "production_date", "location"]
+    },
+    resin_tank: {
+      noun: "tank",
+      unit: "ml",
+      remainingColumn: "remaining_volume_ml",
+      reservedColumn: "reserved_volume_ml",
+      childQuantityColumn: "resin_initial_volume_ml",
+      // Resin reserves through a column on the piece, not a join table.
+      commitmentSql: `SELECT 1 FROM order_pieces
+                       WHERE company_id = $1 AND resin_tank_id = $2
+                         AND status IN ('scheduled', 'printing') LIMIT 1`,
+      inheritedColumns: [
+        "resin_brand", "resin_type", "resin_color", "resin_hex", "resin_tech_compat",
+        "resin_uv_wavelength_nm", "resin_uv_reactive", "resin_density",
+        "resin_total_volume_ml", "resin_purchase_date", "resin_production_date",
+        "resin_opened_at", "resin_expiry_date", "resin_datasheet_url", "location"
+      ]
+    }
+  } as const;
+
+  // Split one idle bulk consumable into N children. The parent is kept intact
+  // but marked distributed (split_at) so it's unusable for new assignments,
+  // while the children become the real, allocatable containers. Eligibility: a
+  // splittable asset that isn't already split, isn't in use, has no reservation
+  // and no scheduled commitment, and has quantity left to divide. The per-child
+  // amounts must sum to the parent's current remaining quantity.
+  //
+  // A child is otherwise a normal container — it may be split again. Any
+  // descendant keeps a non-null parent_asset_id, so it stays excluded from cost
+  // averaging and the original top parent remains the only priced one.
+  async splitAsset(companyId: string, assetId: string, input: SplitAssetInput) {
     return this.databaseService.transaction(async (client) => {
       const parent = await this.getAssetById(companyId, assetId, client);
+      const spec =
+        AssetsService.SPLITTABLE[parent.asset_type as keyof typeof AssetsService.SPLITTABLE];
 
-      if (parent.asset_type !== "filament_spool") {
-        throw new BadRequestException("Only filament spools can be split.");
+      if (!spec) {
+        throw new BadRequestException("Only filament spools and resin tanks can be split.");
       }
       if (parent.split_at) {
-        throw new BadRequestException("This spool has already been split.");
+        throw new BadRequestException(`This ${spec.noun} has already been split.`);
       }
-      // A child spool is otherwise a normal spool — it may be split again. Any
-      // descendant keeps a non-null parent_asset_id, so it stays excluded from
-      // cost averaging and the original top parent remains the only priced spool.
       if (parent.currently_used_in_piece_id) {
-        throw new BadRequestException("Cannot split a spool that is currently in use.");
-      }
-      if (Number(parent.reserved_grams ?? 0) > 0) {
-        throw new BadRequestException("Cannot split a spool that has reserved grams.");
+        throw new BadRequestException(`Cannot split a ${spec.noun} that is currently in use.`);
       }
 
-      const commitments = await client.query(
-        `SELECT 1 FROM order_piece_spools
-          WHERE company_id = $1 AND spool_asset_id = $2 LIMIT 1`,
-        [companyId, assetId]
+      const reserved = Number(
+        (parent as unknown as Record<string, string | null>)[spec.reservedColumn] ?? 0
       );
-      if (commitments.rowCount) {
+      if (reserved > 0) {
         throw new BadRequestException(
-          "Cannot split a spool that is reserved for scheduled work."
+          `Cannot split a ${spec.noun} that has reserved ${spec.unit === "g" ? "grams" : "volume"}.`
         );
       }
 
-      const remaining = parent.remaining_grams != null ? Number(parent.remaining_grams) : null;
+      const commitments = await client.query(spec.commitmentSql, [companyId, assetId]);
+      if (commitments.rowCount) {
+        throw new BadRequestException(
+          `Cannot split a ${spec.noun} that is reserved for scheduled work.`
+        );
+      }
+
+      const rawRemaining = (parent as unknown as Record<string, string | null>)[spec.remainingColumn];
+      const remaining = rawRemaining != null ? Number(rawRemaining) : null;
       if (remaining == null || !Number.isFinite(remaining) || remaining <= 0) {
-        throw new BadRequestException("This spool has no remaining grams to split.");
+        throw new BadRequestException(`This ${spec.noun} has nothing left to split.`);
       }
 
       const sum = input.children.reduce((acc, g) => acc + g, 0);
-      // Half-gram tolerance absorbs the rounding of an even distribution.
+      // Half-unit tolerance absorbs the rounding of an even distribution.
       if (Math.abs(sum - remaining) > 0.5) {
         throw new BadRequestException(
-          `Child grams must sum to the spool's current ${remaining} g (got ${Math.round(sum * 100) / 100} g).`
+          `Child amounts must sum to the ${spec.noun}'s current ${remaining} ${spec.unit} (got ${
+            Math.round(sum * 100) / 100
+          } ${spec.unit}).`
         );
       }
 
       const parentName = this.buildAssetName(parent);
       const total = input.children.length;
+      const inherited = spec.inheritedColumns as readonly string[];
+      // company_id, asset_type, parent_asset_id, <quantity>, notes, then the
+      // inherited identity columns — built once, reused for every child.
+      const childColumns = [
+        "company_id", "asset_type", "parent_asset_id", spec.childQuantityColumn, "notes",
+        ...inherited
+      ];
+      const childPlaceholders = childColumns.map((_, i) => `$${i + 1}`).join(", ");
+      const inheritedValues = inherited.map(
+        (col) => (parent as unknown as Record<string, unknown>)[col] ?? null
+      );
 
       for (let i = 0; i < total; i++) {
-        const grams = input.children[i]!;
+        const amount = input.children[i]!;
         const createdAsset = await client.query<{ asset_id: string }>(
-          `
-            INSERT INTO asset_instances (
-              company_id, asset_type, filament_ref_id, parent_asset_id,
-              initial_grams, purchase_price, purchase_date, production_date,
-              location, notes
-            )
-            VALUES ($1, 'filament_spool', $2, $3, $4, NULL, $5, $6, $7, $8)
-            RETURNING asset_id
-          `,
+          `INSERT INTO asset_instances (${childColumns.join(", ")})
+           VALUES (${childPlaceholders})
+           RETURNING asset_id`,
           [
             companyId,
-            parent.filament_ref_id,
+            parent.asset_type,
             assetId,
-            grams,
-            parent.purchase_date,
-            parent.production_date,
-            parent.location,
-            `Split from parent spool ${assetId} (${i + 1} of ${total})`
+            amount,
+            `Split from parent ${spec.noun} ${assetId} (${i + 1} of ${total})`,
+            ...inheritedValues
           ]
         );
 
         const childRow = createdAsset.rows[0];
         if (!childRow) {
-          throw new BadRequestException("Child spool insert failed.");
+          throw new BadRequestException(`Child ${spec.noun} insert failed.`);
         }
 
         await client.query(
-          `
-            INSERT INTO asset_stock (
-              asset_id, company_id, status, remaining_grams, remaining_volume_ml,
-              currently_used_in_piece_id, in_use_since, installed_on_asset_id, next_free_at
-            )
-            VALUES ($1, $2, 'available', $3, NULL, NULL, NULL, NULL, NULL)
-          `,
-          [childRow.asset_id, companyId, grams]
+          `INSERT INTO asset_stock (
+             asset_id, company_id, status, ${spec.remainingColumn},
+             currently_used_in_piece_id, in_use_since, installed_on_asset_id, next_free_at
+           )
+           VALUES ($1, $2, 'available', $3, NULL, NULL, NULL, NULL)`,
+          [childRow.asset_id, companyId, amount]
         );
 
         await this.logAssetEvent(
           companyId,
           childRow.asset_id,
-          "filament_spool",
+          parent.asset_type,
           "addition",
           parentName,
-          `Child spool from split (${grams} g)`,
+          `Child ${spec.noun} from split (${amount} ${spec.unit})`,
           client
         );
       }
 
-      // Flag the parent distributed/unusable and empty its current grams — the
-      // physical filament now lives on the children. Its initial_grams +
-      // purchase_price are untouched, so it stays the spool counted in cost
-      // averaging. Mirror the depleted-spool convention (status → 'empty').
+      // Flag the parent distributed/unusable and empty it — the physical
+      // material now lives on the children. Its initial quantity +
+      // purchase_price are untouched, so it stays the row counted in cost
+      // averaging. Mirror the depleted convention (status → 'empty').
       await client.query(
         `UPDATE asset_instances SET split_at = now() WHERE company_id = $1 AND asset_id = $2`,
         [companyId, assetId]
       );
       await client.query(
         `UPDATE asset_stock
-            SET remaining_grams = 0,
-                reserved_grams  = 0,
-                status          = 'empty'
+            SET ${spec.remainingColumn} = 0,
+                ${spec.reservedColumn}  = 0,
+                status                  = 'empty'
           WHERE company_id = $1 AND asset_id = $2`,
         [companyId, assetId]
       );
@@ -1107,10 +1371,10 @@ export class AssetsService {
       await this.logAssetEvent(
         companyId,
         assetId,
-        "filament_spool",
+        parent.asset_type,
         "edit",
         parentName,
-        `Split into ${total} child spools`,
+        `Split into ${total} child ${spec.noun}s`,
         client
       );
 
@@ -1295,146 +1559,139 @@ export class AssetsService {
 
     // Assets → Finance: best-effort, post-commit — a finance hiccup must never
     // undo the parts the operator just added (same discipline as spools).
-    await this.recordSparePartPurchaseInFinance(companyId, userId, input, parts);
+    const partLabel =
+      [input.spare_part_brand, input.spare_part_name].filter(Boolean).join(" ").trim() || "Spare part";
+    await this.recordAssetPurchaseInFinance(companyId, userId, input, parts, {
+      noun: "Spare part",
+      description: `${partLabel} — spare part`,
+      purchaseDate: null
+    });
 
     // Same backwards-compat convention as spools/nozzles: single create returns
     // the asset object, a multiplier batch returns the array.
     return (input.quantity ?? 1) > 1 ? parts : parts[0];
   }
 
-  // Book the just-added spare part(s) as an itemized purchase bill in Finance.
-  // Mirrors recordSpoolPurchaseInFinance: only fires when a vendor name was
-  // supplied and there is something billable; the part line's quantity is the
-  // ×N multiplier. Best-effort — failures are logged, never thrown.
-  private async recordSparePartPurchaseInFinance(
-    companyId: string,
-    userId: string,
-    input: CreateSparePartInput,
-    parts: AssetRow[]
-  ): Promise<void> {
-    const vendorName = input.vendor_name?.trim();
-    if (!vendorName) return;
+  // Resin tanks: the resin-side counterpart of createSpool. Same ×N multiplier,
+  // same marker, same post-commit finance rider — the differences are the unit
+  // (millilitres, held in asset_stock.remaining_volume_ml rather than
+  // remaining_grams) and the shelf-life fields, because resin starts ageing the
+  // day the bottle is opened.
+  async createResinTank(companyId: string, userId: string, input: CreateResinTankInput) {
+    const tanks = await this.databaseService.transaction(async (client) => {
+      const quantity = input.quantity ?? 1;
+      const createdAssetIds: string[] = [];
 
-    const unitPrice = input.purchase_price ?? 0;
-    const deliveryCost = input.delivery_cost ?? 0;
-    if (unitPrice <= 0 && deliveryCost <= 0) return;
-
-    const label = [input.spare_part_brand, input.spare_part_name]
-      .filter(Boolean)
-      .join(" ")
-      .trim() || "Spare part";
-    const description = `${label} — spare part`;
-    // Cross-reference the created inventory rows so the bill is traceable back
-    // to the physical parts (and vice-versa via the vendor_reference column).
-    const reference = parts.length
-      ? `Spare part ${parts.map((p) => p.asset_id).join(", ")}`.slice(0, 200)
-      : null;
-
-    try {
-      const result = await this.financeService.recordInventoryPurchase(companyId, userId, {
-        vendorName,
-        description,
-        unitPrice,
-        quantity: input.quantity ?? 1,
-        deliveryCost,
-        priceIncludesTax: input.price_includes_tax ?? false,
-        alreadyPaid: input.already_paid ?? false,
-        purchaseDate: null,
-        reference,
-        memo: "Spare part purchase"
-      });
-      if (result) {
-        this.logger.log(
-          `Recorded spare part purchase ${result.bill_number} (${result.status}) for company ${companyId}.`
+      for (let i = 0; i < quantity; i++) {
+        const createdAsset = await this.databaseService.query<{ asset_id: string }>(
+          `
+            INSERT INTO asset_instances (
+              company_id,
+              asset_type,
+              resin_brand,
+              resin_type,
+              resin_color,
+              resin_hex,
+              resin_tech_compat,
+              resin_uv_wavelength_nm,
+              resin_uv_reactive,
+              resin_density,
+              resin_initial_volume_ml,
+              resin_total_volume_ml,
+              resin_purchase_date,
+              resin_production_date,
+              resin_opened_at,
+              resin_expiry_date,
+              resin_datasheet_url,
+              purchase_price,
+              location,
+              marker,
+              notes
+            )
+            VALUES ($1, 'resin_tank', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            RETURNING asset_id
+          `,
+          [
+            companyId,
+            input.resin_brand,
+            input.resin_type,
+            input.resin_color ?? null,
+            input.resin_hex ?? null,
+            input.resin_tech_compat ?? "both",
+            input.resin_uv_wavelength_nm ?? null,
+            input.resin_uv_reactive ?? false,
+            input.resin_density ?? null,
+            input.resin_initial_volume_ml,
+            // Bottle size defaults to what this tank was filled with.
+            input.resin_total_volume_ml ?? input.resin_initial_volume_ml,
+            input.resin_purchase_date ?? null,
+            input.resin_production_date ?? null,
+            input.resin_opened_at ?? null,
+            input.resin_expiry_date ?? null,
+            input.resin_datasheet_url ?? null,
+            input.purchase_price ?? null,
+            input.location ?? null,
+            input.marker ?? null,
+            input.notes ?? null
+          ],
+          client
         );
-      }
-    } catch (error) {
-      this.logger.error(
-        `Failed to auto-record spare part purchase for company ${companyId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
-  }
 
-  async createResinTank(companyId: string, input: CreateResinTankInput) {
-    return this.databaseService.transaction(async (client) => {
-      const createdAsset = await this.databaseService.query<{ asset_id: string }>(
-        `
-          INSERT INTO asset_instances (
-            company_id,
-            asset_type,
-            resin_brand,
-            resin_type,
-            resin_color,
-            resin_hex,
-            resin_uv_wavelength_nm,
-            resin_uv_reactive,
-            resin_density,
-            resin_initial_volume_ml,
-            resin_purchase_date,
-            resin_production_date,
-            location,
-            notes
-          )
-          VALUES ($1, 'resin_tank', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-          RETURNING asset_id
-        `,
-        [
+        const createdAssetRow = createdAsset.rows[0];
+
+        if (!createdAssetRow) {
+          throw new BadRequestException("Resin tank insert failed.");
+        }
+
+        await this.databaseService.query(
+          `
+            INSERT INTO asset_stock (
+              asset_id,
+              company_id,
+              status,
+              remaining_grams,
+              remaining_volume_ml,
+              currently_used_in_piece_id,
+              in_use_since,
+              installed_on_asset_id,
+              next_free_at
+            )
+            VALUES ($1, $2, 'available', NULL, $3, NULL, NULL, NULL, NULL)
+          `,
+          [createdAssetRow.asset_id, companyId, input.resin_initial_volume_ml],
+          client
+        );
+
+        await this.logAssetEvent(
           companyId,
-          input.resin_brand,
-          input.resin_type,
-          input.resin_color ?? null,
-          input.resin_hex ?? null,
-          input.resin_uv_wavelength_nm ?? null,
-          input.resin_uv_reactive ?? false,
-          input.resin_density ?? null,
-          input.resin_initial_volume_ml,
-          input.resin_purchase_date ?? null,
-          input.resin_production_date ?? null,
-          input.location ?? null,
-          input.notes ?? null
-        ],
-        client
-      );
+          createdAssetRow.asset_id,
+          "resin_tank",
+          "addition",
+          `${input.resin_brand} ${input.resin_type} ${input.resin_color ?? ""} Tank`.trim(),
+          quantity > 1
+            ? `New resin tank added to inventory (${i + 1} of ${quantity})`
+            : "New resin tank added to inventory",
+          client
+        );
 
-      const createdAssetRow = createdAsset.rows[0];
-
-      if (!createdAssetRow) {
-        throw new BadRequestException("Resin tank insert failed.");
+        createdAssetIds.push(createdAssetRow.asset_id);
       }
 
-      await this.databaseService.query(
-        `
-          INSERT INTO asset_stock (
-            asset_id,
-            company_id,
-            status,
-            remaining_grams,
-            remaining_volume_ml,
-            currently_used_in_piece_id,
-            in_use_since,
-            installed_on_asset_id,
-            next_free_at
-          )
-          VALUES ($1, $2, 'available', NULL, $3, NULL, NULL, NULL, NULL)
-        `,
-        [createdAssetRow.asset_id, companyId, input.resin_initial_volume_ml],
-        client
-      );
-
-      await this.logAssetEvent(
-        companyId,
-        createdAssetRow.asset_id,
-        "resin_tank",
-        "addition",
-        `${input.resin_brand} ${input.resin_type} ${input.resin_color ?? ""} Tank`.trim(),
-        "New resin tank added to inventory",
-        client
-      );
-
-      return this.getAssetById(companyId, createdAssetRow.asset_id, client);
+      return Promise.all(createdAssetIds.map((id) => this.getAssetById(companyId, id, client)));
     });
+
+    const tankLabel =
+      [input.resin_brand, input.resin_type, input.resin_color].filter(Boolean).join(" ").trim() ||
+      "Resin";
+    await this.recordAssetPurchaseInFinance(companyId, userId, input, tanks, {
+      noun: "Resin tank",
+      description: `${tankLabel} — resin (${input.resin_initial_volume_ml} ml)`,
+      purchaseDate: input.resin_purchase_date ?? null
+    });
+
+    // Same backwards-compat convention as spools/nozzles/spare parts: a single
+    // create returns the asset object, a multiplier batch the array.
+    return (input.quantity ?? 1) > 1 ? tanks : tanks[0];
   }
 
   async updateAsset(companyId: string, assetId: string, input: UpdateAssetInput) {
@@ -1472,13 +1729,20 @@ export class AssetsService {
         "resin_type",
         "resin_color",
         "resin_hex",
+        "resin_tech_compat",
         "resin_uv_wavelength_nm",
         "resin_uv_reactive",
         "resin_density",
         "resin_initial_volume_ml",
+        "resin_total_volume_ml",
         "resin_purchase_date",
         "resin_production_date",
+        "resin_opened_at",
+        "resin_expiry_date",
+        "resin_datasheet_url",
+        "purchase_price",
         "location",
+        "marker",
         "notes"
       ]
     } as const;
@@ -1584,6 +1848,16 @@ export class AssetsService {
          WHERE current_nozzle_asset_id = $1
       `, [assetId]);
 
+      // 2b. Same for resin jobs pointing at this tank. Also ON DELETE SET NULL;
+      //     explicit for the same RLS reason. The piece keeps its recorded
+      //     slicer_resin_used_ml, so what it consumed survives the tank.
+      await client.query(`
+        UPDATE order_pieces
+           SET resin_tank_id = NULL
+         WHERE resin_tank_id = $1
+           AND company_id = $2
+      `, [assetId, companyId]);
+
       // 3. Delete asset stock (FK is ON DELETE CASCADE from asset_instances,
       //    but explicit delete prevents RLS from blocking the cascade).
       await client.query(`
@@ -1677,12 +1951,17 @@ export class AssetsService {
         ai.resin_type,
         ai.resin_color,
         ai.resin_hex,
+        ai.resin_tech_compat,
         ai.resin_uv_wavelength_nm,
         ai.resin_uv_reactive,
         ai.resin_density,
         ai.resin_initial_volume_ml,
+        ai.resin_total_volume_ml,
         ai.resin_purchase_date,
         ai.resin_production_date,
+        ai.resin_opened_at,
+        ai.resin_expiry_date,
+        ai.resin_datasheet_url,
         ai.location,
         ai.marker,
         ai.notes,
@@ -1707,73 +1986,12 @@ export class AssetsService {
         -- A spool links to pieces via order_piece_spools; a nozzle via
         -- order_pieces.assigned_nozzle_asset_id. Bedded pieces carry their
         -- schedule on the parent print_beds row, so we fall back to it.
-        COALESCE(
-          (SELECT op.piece_id
-             FROM order_piece_spools ops
-             JOIN order_pieces op ON op.piece_id = ops.piece_id AND op.company_id = ops.company_id
-            WHERE ops.spool_asset_id = ai.asset_id AND op.status = 'printing'
-            ORDER BY op.print_started_at DESC NULLS LAST
-            LIMIT 1),
-          (SELECT op.piece_id
-             FROM order_pieces op
-            WHERE op.assigned_nozzle_asset_id = ai.asset_id
-              AND op.company_id = ai.company_id
-              AND op.bed_id IS NULL
-              AND op.status = 'printing'
-            ORDER BY op.print_started_at DESC NULLS LAST
-            LIMIT 1)
-        ) AS currently_used_in_piece_id,
+        live.piece_id AS currently_used_in_piece_id,
         -- Human-readable resolution of the piece above (name + its order) so the
         -- UI can show a clickable name instead of a raw UUID.
-        COALESCE(
-          (SELECT op.piece_name
-             FROM order_piece_spools ops
-             JOIN order_pieces op ON op.piece_id = ops.piece_id AND op.company_id = ops.company_id
-            WHERE ops.spool_asset_id = ai.asset_id AND op.status = 'printing'
-            ORDER BY op.print_started_at DESC NULLS LAST
-            LIMIT 1),
-          (SELECT op.piece_name
-             FROM order_pieces op
-            WHERE op.assigned_nozzle_asset_id = ai.asset_id
-              AND op.company_id = ai.company_id
-              AND op.bed_id IS NULL
-              AND op.status = 'printing'
-            ORDER BY op.print_started_at DESC NULLS LAST
-            LIMIT 1)
-        ) AS currently_used_in_piece_name,
-        COALESCE(
-          (SELECT op.order_id
-             FROM order_piece_spools ops
-             JOIN order_pieces op ON op.piece_id = ops.piece_id AND op.company_id = ops.company_id
-            WHERE ops.spool_asset_id = ai.asset_id AND op.status = 'printing'
-            ORDER BY op.print_started_at DESC NULLS LAST
-            LIMIT 1),
-          (SELECT op.order_id
-             FROM order_pieces op
-            WHERE op.assigned_nozzle_asset_id = ai.asset_id
-              AND op.company_id = ai.company_id
-              AND op.bed_id IS NULL
-              AND op.status = 'printing'
-            ORDER BY op.print_started_at DESC NULLS LAST
-            LIMIT 1)
-        ) AS currently_used_in_order_id,
-        COALESCE(
-          (SELECT COALESCE(op.print_started_at, op.scheduled_start_at, pb.scheduled_start_at, pb.print_started_at)
-             FROM order_piece_spools ops
-             JOIN order_pieces op ON op.piece_id = ops.piece_id AND op.company_id = ops.company_id
-             LEFT JOIN print_beds pb ON pb.bed_id = op.bed_id AND pb.company_id = op.company_id
-            WHERE ops.spool_asset_id = ai.asset_id AND op.status = 'printing'
-            ORDER BY COALESCE(op.print_started_at, op.scheduled_start_at) DESC NULLS LAST
-            LIMIT 1),
-          (SELECT COALESCE(op.print_started_at, op.scheduled_start_at, pb.scheduled_start_at, pb.print_started_at)
-             FROM order_pieces op
-             LEFT JOIN print_beds pb ON pb.bed_id = op.bed_id AND pb.company_id = op.company_id
-            WHERE op.assigned_nozzle_asset_id = ai.asset_id
-              AND op.company_id = ai.company_id
-              AND op.status = 'printing'
-            ORDER BY COALESCE(op.print_started_at, op.scheduled_start_at) DESC NULLS LAST
-            LIMIT 1)
-        ) AS in_use_since,
+        live.piece_name AS currently_used_in_piece_name,
+        live.order_id AS currently_used_in_order_id,
+        live.in_use_since,
         COALESCE(
           ast.installed_on_asset_id,
           -- A nozzle is "installed on" the printer that currently mounts it.
@@ -1790,19 +2008,12 @@ export class AssetsService {
            JOIN printer_instances p2 ON p2.printer_id = ps2.printer_id
            LEFT JOIN printer_reference pr2 ON pr2.printer_ref_id = p2.printer_ref_id
           WHERE ps2.current_nozzle_asset_id = ai.asset_id LIMIT 1) AS installed_on_printer_name,
-        COALESCE(
-          (SELECT MAX(COALESCE(op.scheduled_end_at, pb.scheduled_end_at))
-             FROM order_piece_spools ops
-             JOIN order_pieces op ON op.piece_id = ops.piece_id AND op.company_id = ops.company_id
-             LEFT JOIN print_beds pb ON pb.bed_id = op.bed_id AND pb.company_id = op.company_id
-            WHERE ops.spool_asset_id = ai.asset_id AND op.status IN ('scheduled', 'printing')),
-          (SELECT MAX(COALESCE(op.scheduled_end_at, pb.scheduled_end_at))
-             FROM order_pieces op
-             LEFT JOIN print_beds pb ON pb.bed_id = op.bed_id AND pb.company_id = op.company_id
-            WHERE op.assigned_nozzle_asset_id = ai.asset_id
-              AND op.company_id = ai.company_id
-              AND op.status IN ('scheduled', 'printing'))
-        ) AS next_free_at,
+        (SELECT MAX(COALESCE(op.scheduled_end_at, pb.scheduled_end_at))
+           FROM order_pieces op
+           LEFT JOIN print_beds pb ON pb.bed_id = op.bed_id AND pb.company_id = op.company_id
+          WHERE op.company_id = ai.company_id
+            AND op.status IN ('scheduled', 'printing')
+            AND ${this.assetFeedsPieceSql()}) AS next_free_at,
         ast.last_updated_at AS stock_last_updated_at,
         fr.brand AS filament_brand,
         fr.material_type AS filament_material_type,
@@ -1829,7 +2040,43 @@ export class AssetsService {
         ON ast.asset_id = ai.asset_id
       LEFT JOIN filament_reference fr
         ON fr.filament_ref_id = ai.filament_ref_id
+      -- ── The job this asset is feeding RIGHT NOW ──────────────────────────
+      -- One lateral instead of a COALESCE pair per column: the "is this asset
+      -- attached to this piece?" test differs per asset kind, but everything
+      -- derived from the match (piece, order, since-when) does not.
+      LEFT JOIN LATERAL (
+        SELECT
+          op.piece_id,
+          op.piece_name,
+          op.order_id,
+          COALESCE(op.print_started_at, op.scheduled_start_at, pb.scheduled_start_at, pb.print_started_at)
+            AS in_use_since
+          FROM order_pieces op
+          LEFT JOIN print_beds pb ON pb.bed_id = op.bed_id AND pb.company_id = op.company_id
+         WHERE op.company_id = ai.company_id
+           AND op.status = 'printing'
+           AND ${this.assetFeedsPieceSql()}
+         ORDER BY COALESCE(op.print_started_at, op.scheduled_start_at) DESC NULLS LAST
+         LIMIT 1
+      ) live ON TRUE
     `;
+  }
+
+  /** Does asset `ai` supply piece `op`? The three attachment shapes we have:
+   *  a filament spool through the order_piece_spools reservation ledger, and a
+   *  nozzle or a resin tank stamped directly on the piece. Correlated on both
+   *  aliases, so it drops into any query that has `ai` and `op` in scope. */
+  private assetFeedsPieceSql() {
+    return `(
+      EXISTS (
+        SELECT 1 FROM order_piece_spools ops
+         WHERE ops.piece_id = op.piece_id
+           AND ops.company_id = op.company_id
+           AND ops.spool_asset_id = ai.asset_id
+      )
+      OR (op.bed_id IS NULL AND op.assigned_nozzle_asset_id = ai.asset_id)
+      OR op.resin_tank_id = ai.asset_id
+    )`;
   }
 
   // ── History ─────────────────────────────────────────────────────────────────
@@ -1900,8 +2147,9 @@ export class AssetsService {
     if (asset.asset_type === "nozzle") {
       // A user-given name wins; otherwise derive "<brand> <material> <dia>mm Nozzle".
       if (asset.nozzle_name) return asset.nozzle_name;
-      return [asset.nozzle_brand, asset.nozzle_material, asset.nozzle_diameter_mm ? `${asset.nozzle_diameter_mm}mm` : null]
-        .filter(Boolean).join(" ") + " Nozzle" || "Nozzle";
+      const spec = [asset.nozzle_brand, asset.nozzle_material, asset.nozzle_diameter_mm ? `${asset.nozzle_diameter_mm}mm` : null]
+        .filter(Boolean).join(" ");
+      return spec ? `${spec} Nozzle` : "Nozzle";
     }
     if (asset.asset_type === "spare_part") {
       // The name IS the identity (required on create); brand is a prefix bonus.
@@ -1911,8 +2159,9 @@ export class AssetsService {
       return "Spare Part";
     }
     if (asset.asset_type === "resin_tank") {
-      return [asset.resin_brand, asset.resin_type, asset.resin_color]
-        .filter(Boolean).join(" ") + " Tank" || "Resin Tank";
+      const spec = [asset.resin_brand, asset.resin_type, asset.resin_color]
+        .filter(Boolean).join(" ");
+      return spec ? `${spec} Tank` : "Resin Tank";
     }
     return "Asset";
   }

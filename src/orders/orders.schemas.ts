@@ -88,6 +88,25 @@ export const transitionPieceFulfilmentSchema = z.object({
   status: pieceFulfilmentTargetSchema
 });
 
+// Resin post-processing. A resin print isn't a finished part when the printer
+// stops — it comes off the plate coated in uncured resin and has to be washed,
+// then cured. Tracked separately from production `status` (the piece stays
+// 'done') for the same reason fulfilment is: it is an orthogonal lifecycle, and
+// forcing it into `status` would break every existing status query.
+//
+// Every transition is a manual operator action. No durations, no thresholds,
+// no overdue flags — deliberately, because wash and cure times vary by resin,
+// part geometry and equipment, and a wrong automatic deadline is worse than none.
+export const postProcessStateSchema = z.enum(["print_done", "washed", "cured"]);
+
+// Forward-only, and 'print_done' is never an accepted target: it is stamped by
+// the system when a resin print completes, not chosen by an operator.
+export const postProcessTargetSchema = z.enum(["washed", "cured"]);
+
+export const transitionPiecePostProcessSchema = z.object({
+  state: postProcessTargetSchema
+});
+
 export const listOrdersQuerySchema = z.object({
   customer_id: uuidSchema.optional(),
   status: orderStatusSchema.optional(),
@@ -237,6 +256,15 @@ export const pieceObjectSchema = z
     required_print_technology: z.enum(["FDM", "MSLA", "SLA", "SLS"]).optional(),
     required_multicolor_capable: z.boolean().optional(),
     assigned_printer_id: uuidSchema.optional(),
+    // ── Resin (MSLA/SLA) ────────────────────────────────────────────────────
+    // The physical tank feeding this job — the resin analogue of a spool
+    // reservation, except a resin job draws from exactly one tank, so it lives
+    // on the piece rather than in a join table.
+    resin_tank_id: uuidSchema.optional(),
+    // The slicer's volume estimate. Resin slicers report millilitres, and resin
+    // is bought by the litre, so mL is the unit end to end — it is never
+    // converted into slicer_filament_used_grams.
+    slicer_resin_used_ml: boundedNumber(0.01, 100000).optional(),
     slicer_file_url: z.string().trim().min(1).max(2000).optional(),
     slicer_file_uploaded_at: timestampSchema.optional(),
     // Source 3D model — distinct from the slicer output. Nullable so the
@@ -361,6 +389,27 @@ const pieceSuperRefine = (value: any, ctx: z.RefinementCtx) => {
       });
     }
 
+    // Resin fields belong to resin jobs, exactly as nozzle fields belong to FDM
+    // ones. Enforced symmetrically so a piece can never carry both a spool
+    // allocation and a tank.
+    const usesResinFields =
+      value.resin_tank_id !== undefined && value.resin_tank_id !== null
+        ? true
+        : value.slicer_resin_used_ml !== undefined && value.slicer_resin_used_ml !== null;
+
+    if (
+      usesResinFields &&
+      value.required_print_technology &&
+      value.required_print_technology !== "MSLA" &&
+      value.required_print_technology !== "SLA"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["required_print_technology"],
+        message: "Resin tanks and resin volume only apply to MSLA/SLA pieces."
+      });
+    }
+
     if (value.print_completed_at && !value.print_started_at) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -412,6 +461,9 @@ export const updateOrderPieceSchema = pieceObjectSchema
       .nullable()
       .optional(),
     assigned_printer_id: uuidSchema.nullable().optional(),
+    // Nullable so the editor can UNLINK the tank / clear the volume.
+    resin_tank_id: uuidSchema.nullable().optional(),
+    slicer_resin_used_ml: boundedNumber(0.01, 100000).nullable().optional(),
     slicer_file_url: z.string().trim().min(1).nullable().optional(),
     slicer_file_uploaded_at: timestampSchema.nullable().optional(),
     stl_file_url: z.string().trim().min(1).nullable().optional(),

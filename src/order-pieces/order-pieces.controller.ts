@@ -17,6 +17,7 @@ import {
   listOrderPiecesQuerySchema,
   replacePieceSpoolsSchema,
   transitionPieceFulfilmentSchema,
+  transitionPiecePostProcessSchema,
   updateOrderPieceSchema
 } from "../orders/orders.schemas";
 import { OrderPiecesService } from "./order-pieces.service";
@@ -55,6 +56,14 @@ export class OrderPiecesController {
   ) {
     const { piece_ids, force } = parseWithSchema(bulkDeletePiecesSchema, body);
     return this.orderPiecesService.deletePieces(companyId, piece_ids, { force: force ?? false });
+  }
+
+  // Resin prints that are off the machine but not finished parts yet, oldest
+  // wait first. Static path, declared before :pieceId so it isn't read as an id.
+  @Get("post-process-queue")
+  @RequirePermission("view_orders")
+  postProcessQueue(@CompanyId() companyId: string) {
+    return this.orderPiecesService.listPostProcessQueue(companyId);
   }
 
   @Get()
@@ -153,6 +162,19 @@ export class OrderPiecesController {
   ) {
     const { status } = parseWithSchema(transitionPieceFulfilmentSchema, body);
     return this.orderPiecesService.transitionPieceFulfilment(companyId, pieceId, status);
+  }
+
+  // Walk a done resin print forward through wash → cure. Manual operator action
+  // by design: no durations, no thresholds, no automatic advancement.
+  @Post(":pieceId/post-process")
+  @RequirePermission("action_orders")
+  transitionPostProcess(
+    @CompanyId() companyId: string,
+    @Param("pieceId") pieceId: string,
+    @Body() body: unknown
+  ) {
+    const { state } = parseWithSchema(transitionPiecePostProcessSchema, body);
+    return this.orderPiecesService.transitionPiecePostProcess(companyId, pieceId, state);
   }
 
   // Persist a client-rendered STL thumbnail (small PNG) for a piece. The client

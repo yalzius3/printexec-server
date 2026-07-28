@@ -335,10 +335,116 @@ export class FinanceService {
       };
     });
 
+    return this.bookMaterialWaste(client, companyId, userId, params, rows, "g", "Filament");
+  }
+
+  /**
+   * Resin wasted on a failed print — the resin counterpart of
+   * recordFilamentWaste. A resin job draws from exactly ONE tank, so this takes
+   * a single quantity rather than a per-asset list.
+   *
+   * Priced from the tank's own cost per ml (purchase_price / initial volume),
+   * falling back to the company's average price per ml for that resin type —
+   * exactly the two-tier rule filament uses, in millilitres.
+   */
+  async recordResinWaste(
+    client: PoolClient,
+    companyId: string,
+    userId: string | null,
+    params: {
+      pieceId: string;
+      orderId: string;
+      tankAssetId: string;
+      ml: number;
+    }
+  ): Promise<{ grams: number; cost: number }> {
+    if (!(params.ml > 0)) return { grams: 0, cost: 0 };
+
+    const tankRes = await this.databaseService.query<{
+      resin_type: string | null;
+      tank_ppml: string | null;
+    }>(
+      `SELECT ai.resin_type,
+              CASE WHEN ai.resin_initial_volume_ml > 0 AND ai.purchase_price > 0
+                   THEN ai.purchase_price / ai.resin_initial_volume_ml END AS tank_ppml
+         FROM asset_instances ai
+        WHERE ai.company_id = $1 AND ai.asset_id = $2 AND ai.asset_type = 'resin_tank'`,
+      [companyId, params.tankAssetId],
+      client
+    );
+    const tank = tankRes.rows[0];
+    const resinType = tank?.resin_type ?? null;
+    const tankPpml = tank?.tank_ppml != null ? Number(tank.tank_ppml) : NaN;
+
+    let unit = Number.isFinite(tankPpml) && tankPpml > 0 ? tankPpml : 0;
+    if (unit <= 0 && resinType) {
+      // Fallback: the company's average price per ml for this resin type.
+      // Mirrors AssetsService.listResinPricing exactly.
+      const avgRes = await this.databaseService.query<{ p: string | null }>(
+        `SELECT SUM(ai.purchase_price) / NULLIF(SUM(ai.resin_initial_volume_ml), 0) AS p
+           FROM asset_instances ai
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'resin_tank'
+            AND ai.parent_asset_id IS NULL
+            AND ai.purchase_price > 0
+            AND ai.resin_initial_volume_ml > 0
+            AND ai.resin_type = $2`,
+        [companyId, resinType],
+        client
+      );
+      const p = avgRes.rows[0]?.p;
+      if (p != null && Number.isFinite(Number(p))) unit = Number(p);
+    }
+
+    return this.bookMaterialWaste(
+      client,
+      companyId,
+      userId,
+      params,
+      [{
+        spoolAssetId: params.tankAssetId,
+        materialType: resinType,
+        grams: params.ml,
+        unit,
+        costCents: Math.round(params.ml * unit * 100),
+      }],
+      "ml",
+      "Resin"
+    );
+  }
+
+  /**
+   * Shared tail of both waste recorders: post one DR Material Waste / CR
+   * Inventory entry for the priced total, then persist a waste-event row per
+   * asset. Filament and resin differ only in how a unit cost is looked up (see
+   * the two callers) — the ledger mechanics are identical, so they live here once.
+   *
+   * `unitLabel` goes into the quantity column's UNIT, and every reader of
+   * filament_waste_events must filter on it: summing grams and millilitres
+   * together would produce a meaningless number.
+   */
+  private async bookMaterialWaste(
+    client: PoolClient,
+    companyId: string,
+    userId: string | null,
+    params: { pieceId: string; orderId: string },
+    rows: Array<{
+      spoolAssetId: string;
+      materialType: string | null;
+      grams: number;
+      unit: number;
+      costCents: number;
+    }>,
+    unitLabel: "g" | "ml",
+    noun: "Filament" | "Resin"
+  ): Promise<{ grams: number; cost: number }> {
     const totalCents = rows.reduce((s, r) => s + r.costCents, 0);
 
     // Book DR Filament Waste / CR Inventory for the priced total (skip when
     // nothing could be priced — postEntry requires a positive, balanced entry).
+    // Resin shares the filament_waste account deliberately: both are abnormal
+    // spoilage of print material, and splitting them would fragment one P&L line
+    // for no analytical gain (the events table still distinguishes them).
     let entryId: string | null = null;
     if (totalCents > 0) {
       const wasteAccount = await this.systemAccount(client, companyId, "filament_waste");
@@ -346,11 +452,11 @@ export class FinanceService {
       const today = new Date().toISOString().slice(0, 10);
       const entry = await this.postEntry(client, companyId, userId, {
         entryDate: today,
-        memo: "Filament wasted on a failed print",
+        memo: `${noun} wasted on a failed print`,
         sourceType: "waste",
         sourceId: params.pieceId,
         lines: [
-          { accountId: wasteAccount, debit: totalCents, credit: 0, description: "Filament waste (spoilage)" },
+          { accountId: wasteAccount, debit: totalCents, credit: 0, description: `${noun} waste (spoilage)` },
           { accountId: inventoryAccount, debit: 0, credit: totalCents, description: "Inventory / production consumed" }
         ]
       });
@@ -366,8 +472,8 @@ export class FinanceService {
         `
           INSERT INTO filament_waste_events
             (company_id, order_id, piece_id, spool_asset_id, material_type,
-             grams, unit_cost_per_gram, cost, source, journal_entry_id, created_by)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'simple_failed', $9, $10)
+             grams, unit_cost_per_gram, cost, source, journal_entry_id, created_by, unit)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'simple_failed', $9, $10, $11)
         `,
         [
           companyId,
@@ -380,7 +486,8 @@ export class FinanceService {
           r.costCents / 100,
           // Only priced rows are covered by the entry; unpriced rows book nothing.
           r.costCents > 0 ? entryId : null,
-          userId
+          userId,
+          unitLabel
         ],
         client
       );

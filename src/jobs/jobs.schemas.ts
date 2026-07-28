@@ -74,10 +74,17 @@ const fileUrl = z
 
 export const assignJobSchema = z.object({
   printer_id: uuid,
-  nozzle_asset_id: uuid,
+  // Nullable/optional because a resin printer has no nozzle at all. The service
+  // still requires one for FDM work.
+  nozzle_asset_id: uuid.nullable().optional(),
   slicer_print_time_minutes: z.number().int().positive().max(100_000),
   slicer_file_url: fileUrl.nullable().optional(),
   slicer_filament_used_grams: z.number().positive().max(100_000).nullable().optional(),
+  // ── Resin (MSLA/SLA) ──────────────────────────────────────────────────────
+  // Resin's counterparts of grams + spool: the volume the print draws and the
+  // physical tank it draws from.
+  slicer_resin_used_ml: z.number().positive().max(100_000).nullable().optional(),
+  resin_tank_id: uuid.nullable().optional(),
   // STL is the source mesh file — distinct from the slicer file. Optional;
   // operators often have it from order intake. Stored on order_pieces.stl_file_url.
   stl_file_url: fileUrl.nullable().optional(),

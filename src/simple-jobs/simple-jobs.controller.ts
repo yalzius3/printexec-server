@@ -39,11 +39,12 @@ const bulkUnassignSchema = z
     message: "Select at least one piece or printer to unassign.",
   });
 
-// Mark a printing/done piece as a failed run: record the wasted filament per
-// reserved spool, then re-queue the piece to 'assigned' or 'pending'.
+// Mark a printing/done piece as a failed run: record the wasted material, then
+// re-queue the piece to 'assigned' or 'pending'.
 const markFailedSchema = z.object({
   piece_id: z.string().uuid(),
   requeue_to: z.enum(["assigned", "pending"]),
+  // FDM: grams per reserved spool.
   spool_waste: z
     .array(
       z.object({
@@ -53,6 +54,11 @@ const markFailedSchema = z.object({
     )
     .max(50)
     .default([]),
+  // Resin: one volume, because a resin job draws from one tank. OMITTED means
+  // "the whole planned draw was lost", which is the usual outcome — the service
+  // treats absent and 0 differently on purpose, so an operator can also record a
+  // failure that wasted nothing (an aborted print that never exposed).
+  resin_waste_ml: z.number().nonnegative().max(10_000_000).optional(),
 });
 
 // Bulk-attach slicer files to already-assigned pieces (the bulk g-code drop).
@@ -182,8 +188,10 @@ export class SimpleJobsController {
   @Post("mark-failed")
   @RequirePermission("action_orders")
   markFailed(@CompanyId() companyId: string, @UserId() userId: string, @Body() body: unknown) {
-    const { piece_id, requeue_to, spool_waste } = parseWithSchema(markFailedSchema, body);
-    return this.simpleJobsService.markFailed(companyId, userId, piece_id, requeue_to, spool_waste);
+    const { piece_id, requeue_to, spool_waste, resin_waste_ml } = parseWithSchema(markFailedSchema, body);
+    return this.simpleJobsService.markFailed(
+      companyId, userId, piece_id, requeue_to, spool_waste, resin_waste_ml
+    );
   }
 
   // One-click constraint-satisfying packer: earliest slot per item where its

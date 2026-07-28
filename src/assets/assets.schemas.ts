@@ -40,8 +40,30 @@ const nozzleMaterialSchema = z.enum([
 // Nullable, non-mandatory — just a meaningful identifier for duplicate assets.
 const locationSchema = z.string().trim().min(1).max(120).optional();
 // Optional short freeform marker to physically distinguish otherwise-identical
-// spools in real life (e.g. "A2", "1B", "X"). Kept short so it reads as a tag.
+// spools/tanks in real life (e.g. "A2", "1B", "X"). Kept short so it reads as a tag.
 const markerSchema = z.string().trim().min(1).max(16).optional();
+// A resin tank is not universally compatible: some resins are formulated for a
+// specific light source. "both" is the permissive default.
+const resinTechCompatSchema = z.enum(["MSLA", "SLA", "both"]);
+// Multiplier shared by every asset intake: create N identical instances from one
+// form submission (a box of four spools, four tanks, four nozzles).
+const quantitySchema = z.coerce.number().int().min(1).max(100).optional();
+// Assets → Finance rider. Naming a vendor books the intake as an itemized
+// purchase bill (see FinanceService.recordInventoryPurchase); every field is
+// optional so plain intake is unaffected.
+const purchaseBillFields = {
+  // Free-text vendor; matched case-insensitively against existing finance
+  // vendors, registering a new one when nothing matches.
+  vendor_name: z.string().trim().min(1).max(200).optional(),
+  // Optional shipping/handling charge, booked as its own bill line.
+  delivery_cost: z.coerce.number().min(0).max(999999999).optional(),
+  // "Purchase Price already includes tax" — true suppresses tax (the price is
+  // the gross line total); false/absent adds the company default tax rate.
+  price_includes_tax: z.boolean().optional(),
+  // "Already paid" — true posts the bill AND settles it from Cash in one step;
+  // false/absent leaves it as an open payable.
+  already_paid: z.boolean().optional()
+} as const;
 
 export const listAssetsQuerySchema = z.object({
   asset_type: z.enum(["filament_spool", "nozzle", "resin_tank", "spare_part"]).optional(),
@@ -118,24 +140,9 @@ export const createSpoolSchema = z
     // Multiplier: create this many identical spool instances from one form
     // submission (e.g. a box of 4). Defaults to 1. Each spool becomes its own
     // physical inventory row; they share the resolved filament reference.
-    quantity: z.coerce.number().int().min(1).max(100).optional(),
+    quantity: quantitySchema,
     notes: z.string().optional(),
-    // ── Finance integration (Assets → Finance) ──────────────────────────────
-    // When a vendor name is supplied, adding the spool also books an itemized
-    // filament-purchase bill (see FinanceService.recordFilamentPurchase). All
-    // fields are optional so plain spool intake — and other callers such as the
-    // bulk piece editor — are unchanged.
-    // Free-text vendor; matched case-insensitively against existing finance
-    // vendors, registering a new one when nothing matches.
-    vendor_name: z.string().trim().min(1).max(200).optional(),
-    // Optional shipping/handling charge, booked as its own bill line.
-    delivery_cost: z.coerce.number().min(0).max(999999999).optional(),
-    // "Purchase Price already includes tax" — true suppresses tax (the price is
-    // the gross line total); false/absent adds the company default tax rate.
-    price_includes_tax: z.boolean().optional(),
-    // "Already paid" — true posts the bill AND settles it from Cash in one step;
-    // false/absent leaves it as an open payable.
-    already_paid: z.boolean().optional()
+    ...purchaseBillFields
   })
   .superRefine((value, ctx) => {
     if (!value.filament_ref_id && !value.custom_reference) {
@@ -190,35 +197,47 @@ export const createSparePartSchema = z.object({
   location: locationSchema,
   // Multiplier: create this many identical spare-part instances from one form
   // submission (same convention as spools/nozzles). Defaults to 1.
-  quantity: z.coerce.number().int().min(1).max(100).optional(),
+  quantity: quantitySchema,
   // The form's "Description" — persisted in asset_instances.notes like every
   // other asset's freeform text.
   notes: z.string().optional(),
-  // ── Finance integration (Assets → Finance) ──────────────────────────────
-  // Identical mechanism to spools: a vendor name books the purchase as an
-  // itemized bill (part line ×N → Inventory, optional delivery line, tax/paid
-  // toggles). The client's "record a purchase bill" switch simply omits these
-  // fields, so intake without a bill needs no special casing here.
-  vendor_name: z.string().trim().min(1).max(200).optional(),
-  delivery_cost: z.coerce.number().min(0).max(999999999).optional(),
-  price_includes_tax: z.boolean().optional(),
-  already_paid: z.boolean().optional()
+  ...purchaseBillFields
 });
 
+// A resin tank is the resin analogue of a filament spool: a consumable bought
+// by the bottle, drawn down by jobs, and worth exactly the same intake
+// affordances (×N multiplier, marker, price, purchase bill). The one thing it
+// has that filament doesn't is a shelf life that starts when the bottle is
+// opened, not when it was bought.
 export const createResinTankSchema = z
   .object({
     resin_brand: z.string().trim().min(1),
     resin_type: z.string().trim().min(1),
     resin_color: z.string().trim().min(1).optional(),
     resin_hex: hexColorSchema.optional(),
+    // Which light source this resin is formulated for. Defaults to "both".
+    resin_tech_compat: resinTechCompatSchema.optional(),
     resin_uv_wavelength_nm: boundedInt(200, 600).optional(),
     resin_uv_reactive: z.boolean().optional(),
+    // g/ml — varies per material (standard ≈ 1.1, tough ≈ 1.05), so it is a
+    // per-tank field and never a hardcoded constant.
     resin_density: boundedNumber(0.1, 10).optional(),
     resin_initial_volume_ml: boundedNumber(1, 100000),
+    // Bottle size, for restock reference. Defaults to the initial volume.
+    resin_total_volume_ml: boundedNumber(1, 100000).optional(),
+    purchase_price: z.coerce.number().min(0).nullable().optional(),
     resin_purchase_date: dateSchema,
     resin_production_date: dateSchema,
+    resin_opened_at: dateSchema,
+    resin_expiry_date: dateSchema,
+    resin_datasheet_url: z.string().trim().url().max(2000).optional(),
     location: locationSchema,
-    notes: z.string().optional()
+    marker: markerSchema,
+    // Multiplier: create this many identical tanks from one submission (same
+    // convention as spools/nozzles/spare parts). Defaults to 1.
+    quantity: quantitySchema,
+    notes: z.string().optional(),
+    ...purchaseBillFields
   })
   .superRefine((value, ctx) => {
     if (
@@ -230,6 +249,29 @@ export const createResinTankSchema = z
         code: z.ZodIssueCode.custom,
         path: ["resin_purchase_date"],
         message: "resin_purchase_date cannot be earlier than resin_production_date."
+      });
+    }
+
+    if (
+      value.resin_expiry_date &&
+      value.resin_opened_at &&
+      value.resin_expiry_date < value.resin_opened_at
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["resin_expiry_date"],
+        message: "resin_expiry_date cannot be earlier than resin_opened_at."
+      });
+    }
+
+    if (
+      value.resin_total_volume_ml !== undefined &&
+      value.resin_total_volume_ml < value.resin_initial_volume_ml
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["resin_total_volume_ml"],
+        message: "resin_total_volume_ml cannot be smaller than the volume this tank was filled with."
       });
     }
   });
@@ -253,14 +295,22 @@ export const updateAssetSchema = z
     spare_part_brand: z.string().trim().min(1).max(120).nullable().optional(),
     resin_brand: z.string().trim().min(1).optional(),
     resin_type: z.string().trim().min(1).optional(),
-    resin_color: z.string().trim().min(1).optional(),
-    resin_hex: hexColorSchema.optional(),
-    resin_uv_wavelength_nm: boundedInt(200, 600).optional(),
+    // Nullable so the editor can CLEAR an optional resin descriptor.
+    resin_color: z.string().trim().min(1).nullable().optional(),
+    resin_hex: hexColorSchema.nullable().optional(),
+    resin_tech_compat: resinTechCompatSchema.optional(),
+    resin_uv_wavelength_nm: boundedInt(200, 600).nullable().optional(),
     resin_uv_reactive: z.boolean().optional(),
-    resin_density: boundedNumber(0.1, 10).optional(),
+    resin_density: boundedNumber(0.1, 10).nullable().optional(),
     resin_initial_volume_ml: boundedNumber(1, 100000).optional(),
+    resin_total_volume_ml: boundedNumber(1, 100000).nullable().optional(),
     resin_purchase_date: dateSchema,
     resin_production_date: dateSchema,
+    // Opening a tank starts its shelf life, so both are editable after intake —
+    // an operator typically opens a tank days after buying it.
+    resin_opened_at: baseDateSchema.nullable().optional(),
+    resin_expiry_date: baseDateSchema.nullable().optional(),
+    resin_datasheet_url: z.string().trim().url().max(2000).nullable().optional(),
     location: z.string().trim().min(1).max(120).nullable().optional(),
     // Nullable so the editor can CLEAR the marker (client sends null for empty).
     marker: z.string().trim().min(1).max(16).nullable().optional(),
@@ -371,12 +421,15 @@ export const assetsOverviewQuerySchema = z.object({
   period: z.enum(["week", "month", "year", "all"]).optional().default("week")
 });
 
-// Split an idle spool into N child spools. `children` is the per-child gram
-// allocation; its sum must equal the parent's current remaining grams (enforced
-// in the service against the live stock value, with a small rounding tolerance).
-export const splitSpoolSchema = z.object({
+// Split an idle bulk consumable into N children — a filament spool decanted into
+// smaller spools, or a resin bottle poured into several tanks. `children` is the
+// per-child allocation in the parent's own unit (grams for a spool, millilitres
+// for a tank); its sum must equal the parent's current remaining quantity
+// (enforced in the service against the live stock value, with a small rounding
+// tolerance).
+export const splitAssetSchema = z.object({
   children: z
     .array(boundedNumber(0.01, 100000))
-    .min(2, "A split must produce at least 2 child spools.")
-    .max(50, "A split can produce at most 50 child spools.")
+    .min(2, "A split must produce at least 2 children.")
+    .max(50, "A split can produce at most 50 children.")
 });

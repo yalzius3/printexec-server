@@ -13,6 +13,7 @@ import {
   releasePrinterTx
 } from "../common/cascade";
 import { JobsService, materialFamily } from "../jobs/jobs.service";
+import { PIECE_POST_PROCESS_TRANSITIONS } from "../order-pieces/order-pieces.service";
 import type { FindCandidatesInput, ReserveSpoolsInput } from "../jobs/jobs.schemas";
 import type {
   CreateBedInput,
@@ -59,6 +60,11 @@ export interface BedRow {
   // fulfilled), so the bed reads as "done" until every piece has shipped.
   // 'none' when the bed has no done pieces. Mirrors a piece's fulfilment_status.
   fulfilment_status: string;
+  // Aggregate resin post-processing stage, derived by the same least-advanced
+  // rule. NULL on any bed with no resin pieces, which is what keeps FDM beds
+  // free of a wash/cure affordance.
+  post_process_state: string | null;
+  post_process_state_entered_at: string | null;
   // Source orders / customers of this bed's constituent pieces (a bed may span
   // more than one order). Comma-joined, distinct, ordered. NULL if no pieces.
   order_references: string | null;
@@ -362,6 +368,8 @@ export class BedsService {
         pb.created_at, pb.last_updated_at,
         COALESCE(c.piece_count, 0)::int AS piece_count,
         COALESCE(ful.fulfilment_status, 'none') AS fulfilment_status,
+        pp.post_process_state,
+        pp.post_process_state_entered_at,
         src.order_references,
         src.customer_names
       FROM print_beds pb
@@ -384,6 +392,22 @@ export class BedsService {
         FROM order_pieces opf
         WHERE opf.bed_id = pb.bed_id AND opf.status = 'done'
       ) ful ON TRUE
+      LEFT JOIN LATERAL (
+        -- Same least-advanced rule for resin post-processing: a bed is only
+        -- "cured" once every piece on it is. NULL when the bed holds no resin
+        -- pieces, which is what keeps FDM beds free of a wash/cure badge.
+        SELECT (ARRAY['print_done','washed','cured'])[
+          MIN(CASE opp.post_process_state
+                WHEN 'cured' THEN 3
+                WHEN 'washed' THEN 2
+                ELSE 1 END)
+        ] AS post_process_state,
+        MIN(opp.post_process_state_entered_at) AS post_process_state_entered_at
+        FROM order_pieces opp
+        WHERE opp.bed_id = pb.bed_id
+          AND opp.status = 'done'
+          AND opp.post_process_state IS NOT NULL
+      ) pp ON TRUE
       LEFT JOIN LATERAL (
         -- Distinct source orders + customers of this bed's pieces (may span
         -- multiple orders), comma-joined for display.
@@ -1235,6 +1259,83 @@ export class BedsService {
       // Re-derive each touched order's status so it mirrors shipping progress.
       for (const orderId of affectedOrders) {
         await recomputeOrderStatusTx(client, companyId, orderId);
+      }
+    });
+
+    return this.loadBed(companyId, bedId);
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/beds/:bedId/post-process — walk a DONE resin bed through
+  // wash → cure. Structurally identical to transitionBedFulfilment above and
+  // for the same reason: a bed owns no post-process column, it walks the
+  // orthogonal state of every constituent done piece in lockstep. Validated
+  // against the bed's aggregate (least-advanced) stage, then applied to each
+  // piece for which the target is a valid next step — laggards catch up,
+  // leaders are left alone. No order re-sync: post-processing doesn't move the
+  // order's status the way shipping does.
+  // ──────────────────────────────────────────────────────────
+  async transitionBedPostProcess(
+    companyId: string,
+    bedId: string,
+    target: string
+  ): Promise<BedRow> {
+    const bed = await this.loadBed(companyId, bedId);
+
+    if (bed.status !== "done") {
+      throw new ConflictException("Only a done bed can be washed or cured.");
+    }
+
+    const current = bed.post_process_state;
+    if (!current) {
+      throw new BadRequestException(
+        "This bed has no post-processing stage — only resin (MSLA/SLA) prints are washed and cured."
+      );
+    }
+
+    const allowed = PIECE_POST_PROCESS_TRANSITIONS[current] ?? [];
+    if (!allowed.includes(target)) {
+      throw new BadRequestException(
+        `A bed that is ${current.replace("_", " ")} cannot be marked ${target}.`
+      );
+    }
+
+    await this.databaseService.transaction(async (client) => {
+      const pieces = await client.query<{
+        piece_id: string;
+        order_id: string;
+        order_number: string;
+        piece_name: string;
+        post_process_state: string;
+      }>(
+        `SELECT op.piece_id, op.order_id, o.order_number, op.piece_name, op.post_process_state
+           FROM order_pieces op
+           JOIN orders o ON o.order_id = op.order_id
+          WHERE op.company_id = $1 AND op.bed_id = $2 AND op.status = 'done'
+            AND op.post_process_state IS NOT NULL`,
+        [companyId, bedId]
+      );
+
+      for (const p of pieces.rows) {
+        const pieceAllowed = PIECE_POST_PROCESS_TRANSITIONS[p.post_process_state] ?? [];
+        if (!pieceAllowed.includes(target)) continue;
+
+        await client.query(
+          `UPDATE order_pieces
+              SET post_process_state            = $3,
+                  post_process_state_entered_at = now()
+            WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, p.piece_id, target]
+        );
+        await recordOrderHistory(client, companyId, {
+          entityType: "piece",
+          eventType: "post_process_changed",
+          orderId: p.order_id,
+          orderNumber: p.order_number,
+          pieceId: p.piece_id,
+          pieceName: p.piece_name,
+          description: `Piece "${p.piece_name}" marked ${target} (via bed "${bed.bed_name}").`
+        });
       }
     });
 

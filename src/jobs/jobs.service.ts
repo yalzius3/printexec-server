@@ -62,6 +62,15 @@ function materialsCompatible(filamentMaterial: string, printerMaterial: string):
 // regardless of case ("Black" == "BLACK" == "black"), but distinct names stay
 // distinct ("green" != "blue"). Trim + lowercase is enough for the free-text
 // color field; operators who need finer distinction just type different names.
+/** The two resin technologies. A resin job is stocked, scheduled and finished
+ *  differently from an FDM one — it draws millilitres from a tank instead of
+ *  grams from a spool, and it isn't done when the printer stops. */
+export function isResinTech(tech: string | null | undefined): boolean {
+  if (!tech) return false;
+  const t = tech.trim().toUpperCase();
+  return t === "MSLA" || t === "SLA";
+}
+
 export function sameColor(a: string | null | undefined, b: string | null | undefined): boolean {
   return (a ?? "").trim().toLowerCase() === (b ?? "").trim().toLowerCase();
 }
@@ -112,6 +121,16 @@ interface JobRow {
   slicer_print_time_minutes: number | null;
   slicer_filament_used_grams: number | null;
   slicer_file_url: string | null;
+  // ── Resin (MSLA/SLA) ──────────────────────────────────────────────────────
+  // The tank feeding this job + the slicer's volume estimate in millilitres.
+  // Both null on FDM pieces and on bed rows.
+  resin_tank_id?: string | null;
+  slicer_resin_used_ml?: number | string | null;
+  resin_tank_label?: string | null;
+  // Post-processing lifecycle, orthogonal to `status` (the piece stays 'done'):
+  // print_done → washed → cured. Null on anything that isn't a resin print.
+  post_process_state?: string | null;
+  post_process_state_entered_at?: string | null;
   // STL (or 3MF mesh) — source 3D model. Tracked independently from the
   // slicer file. Nullable until the operator uploads one.
   stl_file_url: string | null;
@@ -568,6 +587,18 @@ export class JobsService {
         op.slicer_print_time_minutes,
         op.slicer_filament_used_grams,
         op.slicer_file_url,
+        -- ── Resin (MSLA/SLA) ──────────────────────────────────────────────
+        op.resin_tank_id,
+        op.slicer_resin_used_ml,
+        -- Post-processing: orthogonal to status, exactly like
+        -- fulfilment_status. NULL on every FDM piece.
+        op.post_process_state,
+        op.post_process_state_entered_at,
+        CASE
+          WHEN rt.asset_id IS NOT NULL
+            THEN NULLIF(TRIM(CONCAT_WS(' ', rt.resin_brand, rt.resin_type, rt.resin_color)), '')
+          ELSE NULL
+        END AS resin_tank_label,
         op.cost,
         -- Quote inputs (time minutes + per-slot grams) captured while costing
         -- the piece — the client uses them as ASSUMED slicer values until a
@@ -594,6 +625,7 @@ export class JobsService {
       LEFT JOIN customers cu   ON cu.customer_id = o.customer_id
       LEFT JOIN printer_instances pi  ON pi.printer_id = op.assigned_printer_id
       LEFT JOIN filament_reference fr ON fr.filament_ref_id = op.required_filament_ref_id
+      LEFT JOIN asset_instances rt    ON rt.asset_id = op.resin_tank_id
       ${whereClause}
       ${orderStatusClause}
       ORDER BY ${orderBy}
@@ -1098,9 +1130,11 @@ export class JobsService {
         `Cannot assign a piece in status '${piece.status}'. Unschedule or cancel it first.`
       );
     }
+    const isResin = isResinTech(piece.required_print_technology);
     // A filament MATERIAL is required BEFORE assignment — the printer/material
-    // compatibility check depends on it.
-    if (!piece.required_filament_material) {
+    // compatibility check depends on it. A resin job has no filament material at
+    // all; its material identity lives on the tank it's linked to.
+    if (!isResin && !piece.required_filament_material) {
       throw new BadRequestException(
         "Choose a filament material for this piece before assigning a printer — compatibility is checked against it."
       );
@@ -1156,17 +1190,53 @@ export class JobsService {
     }
 
     // Verify the nozzle still belongs to a compatible row before locking it in.
-    const nozzleRes = await this.databaseService.query<{ exists: boolean }>(
-      `SELECT EXISTS(
-         SELECT 1 FROM printer_nozzle_compatibility
-          WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
-       ) AS exists`,
-      [companyId, input.printer_id, input.nozzle_asset_id]
-    );
-    if (!nozzleRes.rows[0]?.exists) {
-      throw new BadRequestException(
-        "Selected nozzle is not compatible with the selected printer."
+    // Skipped for resin, which has no nozzle to verify.
+    if (isResin) {
+      if (input.nozzle_asset_id) {
+        throw new BadRequestException("A resin printer has no nozzle — omit nozzle_asset_id.");
+      }
+    } else {
+      if (!input.nozzle_asset_id) {
+        throw new BadRequestException("Pick a nozzle for this piece before assigning a printer.");
+      }
+      const nozzleRes = await this.databaseService.query<{ exists: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1 FROM printer_nozzle_compatibility
+            WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
+         ) AS exists`,
+        [companyId, input.printer_id, input.nozzle_asset_id]
       );
+      if (!nozzleRes.rows[0]?.exists) {
+        throw new BadRequestException(
+          "Selected nozzle is not compatible with the selected printer."
+        );
+      }
+    }
+
+    // A linked tank must be a real resin tank in this company, and it must suit
+    // the piece's light source — checked here rather than at schedule time so the
+    // operator learns at the moment of choosing.
+    if (input.resin_tank_id) {
+      if (!isResin) {
+        throw new BadRequestException("Resin tanks only apply to MSLA/SLA pieces.");
+      }
+      const tankRes = await this.databaseService.query<{ tech_compat: string | null }>(
+        `SELECT COALESCE(resin_tech_compat, 'both') AS tech_compat
+           FROM asset_instances
+          WHERE company_id = $1 AND asset_id = $2 AND asset_type = 'resin_tank'
+            AND split_at IS NULL`,
+        [companyId, input.resin_tank_id]
+      );
+      const compat = tankRes.rows[0]?.tech_compat;
+      if (!compat) {
+        throw new BadRequestException("Selected resin tank does not exist, or has been split into child tanks.");
+      }
+      const tech = (piece.required_print_technology ?? "").trim().toUpperCase();
+      if (compat !== "both" && compat !== tech) {
+        throw new BadRequestException(
+          `That resin is formulated for ${compat} printers, but this piece is ${tech}.`
+        );
+      }
     }
 
     const hasStl = await this.hasStlColumn();
@@ -1180,12 +1250,18 @@ export class JobsService {
       companyId,
       pieceId,
       input.printer_id,
-      input.nozzle_asset_id,
+      input.nozzle_asset_id ?? null,
       input.slicer_print_time_minutes,
       input.slicer_file_url ?? null,
       input.slicer_filament_used_grams ?? null,
     ];
     if (hasStl) values.push(input.stl_file_url ?? null);
+    // Resin's quantity + tank ride at the end so the FDM placeholders above keep
+    // their numbers (and the optional STL slot stays where it is).
+    const resinBase = values.length;
+    values.push(input.slicer_resin_used_ml ?? null, input.resin_tank_id ?? null);
+    const mlParam = `$${resinBase + 1}`;
+    const tankParam = `$${resinBase + 2}`;
 
     // Status decision is a function of the slicer METADATA, not the file. The
     // DB's chk_ready_requires_core_data constraint enforces that status='ready'
@@ -1201,11 +1277,20 @@ export class JobsService {
                slicer_print_time_minutes  = $5,
                slicer_file_url            = COALESCE($6, slicer_file_url),
                slicer_file_uploaded_at    = CASE WHEN $6 IS NOT NULL THEN now() ELSE slicer_file_uploaded_at END,
-               slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams)
+               slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams),
+               slicer_resin_used_ml       = COALESCE(${mlParam}, slicer_resin_used_ml),
+               resin_tank_id              = COALESCE(${tankParam}, resin_tank_id)
                ${stlSet},
+               -- Readiness is a function of the slicer METADATA in the job's own
+               -- unit: grams for filament, millilitres for resin. Gating a resin
+               -- piece on filament grams would leave it permanently un-ready.
                status = CASE
                  WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
-                  AND COALESCE($7, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
+                  AND CASE
+                        WHEN required_print_technology IN ('MSLA', 'SLA')
+                          THEN COALESCE(${mlParam}, slicer_resin_used_ml) IS NOT NULL
+                        ELSE COALESCE($7, slicer_filament_used_grams) IS NOT NULL
+                      END THEN 'ready'
                  ELSE 'assigned'
                END
          WHERE company_id = $1 AND piece_id = $2
@@ -1496,7 +1581,11 @@ export class JobsService {
         "Piece has no assigned printer — assign one before scheduling."
       );
     }
-    if (!piece.assigned_nozzle_asset_id) {
+    // A resin printer has no nozzle and no spool. The two technologies have the
+    // SAME shape of prerequisite — a machine, a material source, and a quantity
+    // — so the checks below branch on unit rather than duplicating the flow.
+    const isResin = isResinTech(piece.required_print_technology);
+    if (!isResin && !piece.assigned_nozzle_asset_id) {
       throw new BadRequestException(
         "Piece has no assigned nozzle — assign one before scheduling."
       );
@@ -1506,18 +1595,33 @@ export class JobsService {
         "Piece has no slicer print time — re-run the assignment flow."
       );
     }
-    if (piece.slicer_filament_used_grams == null) {
-      throw new BadRequestException(
-        "Piece has no slicer filament usage — re-run the assignment flow. (Scheduling is gated on the slicer metadata, not the file.)"
-      );
-    }
-    // Filament is optional while editing/assigning, but MANDATORY to schedule:
-    // committing a print window reserves filament across the spool timeline, so
-    // the piece must declare which filament it consumes.
-    if (!piece.required_filament_material) {
-      throw new BadRequestException(
-        "Set a filament material before scheduling."
-      );
+    if (isResin) {
+      if (piece.slicer_resin_used_ml == null) {
+        throw new BadRequestException(
+          "Piece has no slicer resin volume — enter the millilitres this print consumes. (Scheduling is gated on the slicer metadata, not the file.)"
+        );
+      }
+      // The tank is resin's third timeline, exactly as the spool is filament's:
+      // committing a window reserves volume against a specific physical tank.
+      if (!piece.resin_tank_id) {
+        throw new BadRequestException(
+          "Link a resin tank from inventory before scheduling (a resin print draws from one physical tank)."
+        );
+      }
+    } else {
+      if (piece.slicer_filament_used_grams == null) {
+        throw new BadRequestException(
+          "Piece has no slicer filament usage — re-run the assignment flow. (Scheduling is gated on the slicer metadata, not the file.)"
+        );
+      }
+      // Filament is optional while editing/assigning, but MANDATORY to schedule:
+      // committing a print window reserves filament across the spool timeline, so
+      // the piece must declare which filament it consumes.
+      if (!piece.required_filament_material) {
+        throw new BadRequestException(
+          "Set a filament material before scheduling."
+        );
+      }
     }
     // A physical spool instance must be reserved (assigned from stock) before
     // scheduling — that's the third timeline (printer + nozzle + spool).
@@ -1525,7 +1629,7 @@ export class JobsService {
       `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
       [companyId, pieceId]
     );
-    if (reservedSpools.rowCount === 0) {
+    if (!isResin && reservedSpools.rowCount === 0) {
       throw new BadRequestException(
         "Reserve a filament spool from inventory before scheduling (assign a physical spool instance)."
       );
@@ -1581,6 +1685,51 @@ export class JobsService {
       if (bedSpoolOverlap.rowCount && bedSpoolOverlap.rowCount > 0) {
         throw new ConflictException(
           "A reserved spool is already feeding a scheduled print bed in this time slot — a spool can't be on two printers at once."
+        );
+      }
+    }
+
+    // Same rule for resin: a tank is poured into ONE vat, so it can't feed two
+    // overlapping prints. No bed variant — a bed carries no tank of its own.
+    if (piece.resin_tank_id) {
+      const tankOverlap = await this.databaseService.query<{ piece_id: string }>(
+        `SELECT op.piece_id
+           FROM order_pieces op
+          WHERE op.company_id = $1
+            AND op.piece_id <> $2
+            AND op.resin_tank_id = $3
+            AND op.status IN ('scheduled','printing')
+            AND op.scheduled_start_at < $5
+            AND op.scheduled_end_at   > $4
+          LIMIT 1`,
+        [companyId, pieceId, piece.resin_tank_id, start.toISOString(), end.toISOString()]
+      );
+      if (tankOverlap.rowCount && tankOverlap.rowCount > 0) {
+        throw new ConflictException(
+          "That resin tank is already feeding another print in this time slot — a tank can't be in two vats at once."
+        );
+      }
+
+      // Volume check: the tank must physically hold what this print will draw,
+      // over and above what its other committed jobs have already reserved.
+      const tankStock = await this.databaseService.query<{
+        free_ml: string | null;
+        label: string | null;
+      }>(
+        `SELECT COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0) AS free_ml,
+                NULLIF(TRIM(CONCAT_WS(' ', ai.resin_brand, ai.resin_type, ai.resin_color)), '') AS label
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1 AND ai.asset_id = $2`,
+        [companyId, piece.resin_tank_id]
+      );
+      const free = Number(tankStock.rows[0]?.free_ml ?? 0);
+      const needed = Number(piece.slicer_resin_used_ml ?? 0);
+      if (needed > free) {
+        throw new ConflictException(
+          `${tankStock.rows[0]?.label ?? "That resin tank"} has ${Math.round(free)} ml free but this print needs ${Math.round(
+            needed
+          )} ml — top it up or pick another tank.`
         );
       }
     }
@@ -1696,6 +1845,7 @@ export class JobsService {
       printerId?: string | null;
       nozzleAssetId?: string | null;
       spoolIds?: string[];
+      resinTankId?: string | null;
       startIso: string;
       endIso: string;
     }
@@ -1711,7 +1861,10 @@ export class JobsService {
         )
       ).rows.map((r) => r.spool_asset_id);
 
-    const pieceHit = async (col: "assigned_printer_id" | "assigned_nozzle_asset_id", id: string) =>
+    const pieceHit = async (
+      col: "assigned_printer_id" | "assigned_nozzle_asset_id" | "resin_tank_id",
+      id: string
+    ) =>
       (
         await this.databaseService.query<{ piece_name: string }>(
           `SELECT piece_name FROM order_pieces
@@ -1748,6 +1901,14 @@ export class JobsService {
       const b = await bedHit("assigned_nozzle_asset_id", opts.nozzleAssetId);
       if (b) return `the nozzle is committed to bed "${b}" in that window`;
     }
+    // A resin tank sits in ONE vat at a time, so two overlapping resin jobs
+    // drawing from the same tank is as physically impossible as sharing a
+    // nozzle. Beds are not checked: a bed carries no tank of its own — its
+    // pieces do, and those pieces are already covered by the piece probe.
+    if (opts.resinTankId) {
+      const p = await pieceHit("resin_tank_id", opts.resinTankId);
+      if (p) return `the resin tank is committed to "${p}" in that window`;
+    }
     if (spoolIds.length > 0) {
       const p = await this.databaseService.query<{ piece_name: string }>(
         `SELECT op.piece_name
@@ -1780,14 +1941,26 @@ export class JobsService {
     return null;
   }
 
-  /** Readiness/scheduling is gated on slicer METADATA (print time + filament
-   *  grams) plus an assigned printer + nozzle — never on the slicer file, which
-   *  is an optional attachment the system never feeds to a printer. */
+  /** Readiness/scheduling is gated on slicer METADATA (print time + how much
+   *  material the job consumes) plus an assigned printer + nozzle — never on the
+   *  slicer file, which is an optional attachment the system never feeds to a
+   *  printer.
+   *
+   *  "How much material" is measured in the technology's own unit: grams of
+   *  filament for FDM, millilitres of resin for MSLA/SLA. A resin job has no
+   *  gram figure at all (resin is priced and stocked by volume), so gating it on
+   *  slicer_filament_used_grams would make every resin piece permanently
+   *  un-ready. */
   private hasSlicerCoreData(piece: {
     slicer_print_time_minutes: number | null;
     slicer_filament_used_grams: number | null;
+    required_print_technology?: string | null;
+    slicer_resin_used_ml?: number | string | null;
   }): boolean {
-    return piece.slicer_print_time_minutes != null && piece.slicer_filament_used_grams != null;
+    if (piece.slicer_print_time_minutes == null) return false;
+    return isResinTech(piece.required_print_technology)
+      ? piece.slicer_resin_used_ml != null
+      : piece.slicer_filament_used_grams != null;
   }
 
   async unschedule(companyId: string, pieceId: string): Promise<JobRow> {
@@ -1837,9 +2010,10 @@ export class JobsService {
       );
     }
     // Starting means the machine physically runs NOW. Verify the printer, the
-    // nozzle, and every reserved spool are free for the whole run window —
-    // "start now" must respect ALL involved timelines, not just this piece's.
-    // (The piece's own scheduled block is excluded; it's the run being started.)
+    // nozzle, every reserved spool and the resin tank are free for the whole run
+    // window — "start now" must respect ALL involved timelines, not just this
+    // piece's. (The piece's own scheduled block is excluded; it's the run being
+    // started.)
     {
       const durMin = piece.slicer_print_time_minutes != null ? Number(piece.slicer_print_time_minutes) : 1;
       const runStart = new Date();
@@ -1847,6 +2021,7 @@ export class JobsService {
       const conflict = await this.findResourceConflict(companyId, pieceId, {
         printerId: piece.assigned_printer_id,
         nozzleAssetId: piece.assigned_nozzle_asset_id,
+        resinTankId: piece.resin_tank_id ?? null,
         startIso: runStart.toISOString(),
         endIso: runEnd.toISOString(),
       });
@@ -1892,6 +2067,13 @@ export class JobsService {
         `Only scheduled/printing pieces can be completed (current: '${piece.status}').`
       );
     }
+    // A finished resin print is not a finished PART — it comes off the plate
+    // wet and enters the wash/cure queue. Stamping 'print_done' here (and only
+    // here) is what puts it in front of an operator; a failed run never enters
+    // the queue, because there is nothing worth washing.
+    const entersPostProcess =
+      input.outcome === "done" && isResinTech(piece.required_print_technology);
+
     await this.databaseService.query(
       `
         UPDATE order_pieces
@@ -1899,7 +2081,9 @@ export class JobsService {
                print_started_at           = COALESCE(print_started_at, scheduled_start_at, now()),
                print_completed_at         = now(),
                actual_print_time_minutes  = COALESCE($4, actual_print_time_minutes),
-               actual_filament_used_grams = COALESCE($5, actual_filament_used_grams)
+               actual_filament_used_grams = COALESCE($5, actual_filament_used_grams),
+               post_process_state            = CASE WHEN $6 THEN 'print_done' ELSE post_process_state END,
+               post_process_state_entered_at = CASE WHEN $6 THEN now() ELSE post_process_state_entered_at END
          WHERE company_id = $1 AND piece_id = $2
       `,
       [
@@ -1908,15 +2092,18 @@ export class JobsService {
         input.outcome,
         input.actual_print_time_minutes ?? null,
         input.actual_filament_used_grams ?? null,
+        entersPostProcess,
       ]
     );
-    // The print ran (done or failed) → the reserved filament is consumed:
-    // deduct it from the spool's remaining grams and release the reservation,
-    // and free the assigned printer (live counterpart of the old
-    // releaseExecutionResources). No-op for a never-started 'scheduled' piece.
+    // The print ran (done or failed) → the reserved material is consumed:
+    // deduct it from the spool's remaining grams / the tank's remaining
+    // millilitres and release the reservation, and free the assigned printer
+    // (live counterpart of the old releaseExecutionResources). No-op for a
+    // never-started 'scheduled' piece.
     const completePrinterId = piece.assigned_printer_id;
     await this.databaseService.transaction(async (c) => {
       await this.consumeSpoolsTx(c, companyId, pieceId);
+      await this.consumeResinTx(c, companyId, pieceId);
       if (completePrinterId) {
         await releasePrinterForPieceTx(c, companyId, completePrinterId, pieceId);
       }
@@ -1961,7 +2148,12 @@ export class JobsService {
               print_started_at           = NULL,
               print_completed_at         = NULL,
               actual_print_time_minutes  = NULL,
-              actual_filament_used_grams = NULL
+              actual_filament_used_grams = NULL,
+              -- A re-queued print has nothing to wash yet. Clearing this pulls
+              -- the old run out of the post-processing queue; the reprint
+              -- re-enters it when it completes.
+              post_process_state            = NULL,
+              post_process_state_entered_at = NULL
         WHERE company_id = $1 AND piece_id = $2`,
       [companyId, pieceId, target]
     );
@@ -2520,6 +2712,88 @@ export class JobsService {
     };
   }
 
+  // The resin counterpart of spoolTimeline, and markedly simpler: a job's tank
+  // is a column on the piece rather than a join-table reservation, and a bed
+  // never carries a tank of its own — so there is no bed-anchoring fallback and
+  // no per-slot sequence. Same response shape, so one client panel renders both.
+  async tankTimeline(companyId: string, tankAssetId: string, query: TimelineQuery) {
+    const hasStl = await this.hasStlColumn();
+    const [tankRes, scheduledRes, ledgerRes] = await Promise.all([
+      this.databaseService.query<{
+        tank_asset_id: string;
+        initial_volume_ml: number | null;
+        remaining_volume_ml: number | null;
+        reserved_volume_ml: number | null;
+        status: string;
+        resin_label: string | null;
+        expiry_date: string | null;
+      }>(
+        `SELECT ai.asset_id AS tank_asset_id,
+                ai.resin_initial_volume_ml AS initial_volume_ml,
+                ast.remaining_volume_ml, ast.reserved_volume_ml,
+                COALESCE(ast.status, 'available') AS status,
+                NULLIF(TRIM(CONCAT_WS(' · ', NULLIF(TRIM(CONCAT_WS(' ', ai.resin_brand, ai.resin_type)), ''), ai.resin_color)), '') AS resin_label,
+                ai.resin_expiry_date::text AS expiry_date
+           FROM asset_instances ai
+           LEFT JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1 AND ai.asset_id = $2 AND ai.asset_type = 'resin_tank'`,
+        [companyId, tankAssetId]
+      ),
+      this.databaseService.query<JobRow>(
+        this.jobSelectSql(
+          hasStl,
+          `WHERE op.company_id = $1
+             AND op.resin_tank_id = $2
+             AND op.status IN ('scheduled','printing','done','failed')
+             AND op.scheduled_start_at < $4
+             AND op.scheduled_end_at   > $3`,
+          "op.scheduled_start_at ASC",
+          true
+        ),
+        [companyId, tankAssetId, query.from, query.to]
+      ),
+      // Full draw ledger (every job that ever pointed at this tank), ordered by
+      // run time — the tank's depletion history.
+      this.databaseService.query<{
+        piece_id: string;
+        piece_name: string;
+        planned_ml: string | null;
+        status: JobStatus;
+        scheduled_start_at: string | null;
+      }>(
+        `SELECT op.piece_id, op.piece_name,
+                op.slicer_resin_used_ml AS planned_ml,
+                op.status,
+                COALESCE(op.scheduled_start_at, op.print_started_at) AS scheduled_start_at
+           FROM order_pieces op
+          WHERE op.company_id = $1 AND op.resin_tank_id = $2
+          ORDER BY COALESCE(op.scheduled_start_at, op.print_started_at) ASC NULLS LAST`,
+        [companyId, tankAssetId]
+      ),
+    ]);
+    if (tankRes.rowCount === 0) throw new NotFoundException("Resin tank not found.");
+
+    const mlByPiece = new Map<string, number>();
+    for (const r of ledgerRes.rows) {
+      if (r.planned_ml != null) mlByPiece.set(r.piece_id, Number(r.planned_ml));
+    }
+
+    return {
+      tank: tankRes.rows[0]!,
+      scheduled: scheduledRes.rows.map((r) => ({
+        ...r,
+        planned_ml: mlByPiece.get(r.piece_id) ?? null,
+      })),
+      ledger: ledgerRes.rows.map((r) => ({
+        piece_id: r.piece_id,
+        piece_name: r.piece_name,
+        planned_ml: r.planned_ml != null ? Number(r.planned_ml) : null,
+        status: r.status,
+        scheduled_start_at: r.scheduled_start_at,
+      })),
+    };
+  }
+
   // ──────────────────────────────────────────────────────────
   // FILAMENT PLAN — for a given piece, which physical spool(s) will feed it.
   //   single        → one compatible spool has enough free grams (best-fit).
@@ -2937,6 +3211,30 @@ export class JobsService {
         [r.spool_asset_id, g]
       );
     }
+  }
+
+  /** Consume reserved resin on completion: the linked tank's remaining volume
+   *  drops by the millilitres this print drew. The resin counterpart of
+   *  consumeSpoolsTx, with the same division of labour — reserved_volume_ml is
+   *  owned by fn_recalc_reserved_volume_for_tank (the piece's status flip to
+   *  done/failed already fired it), so this only deducts what was physically
+   *  used and flags a drained tank. */
+  private async consumeResinTx(client: import("pg").PoolClient, companyId: string, pieceId: string): Promise<void> {
+    await client.query(
+      `UPDATE asset_stock ast
+          SET remaining_volume_ml = GREATEST(0, COALESCE(ast.remaining_volume_ml, 0) - op.slicer_resin_used_ml),
+              status = CASE
+                         WHEN GREATEST(0, COALESCE(ast.remaining_volume_ml, 0) - op.slicer_resin_used_ml) <= 0
+                           THEN 'empty'
+                         ELSE ast.status
+                       END
+         FROM order_pieces op
+        WHERE op.company_id = $1
+          AND op.piece_id = $2
+          AND op.resin_tank_id = ast.asset_id
+          AND op.slicer_resin_used_ml IS NOT NULL`,
+      [companyId, pieceId]
+    );
   }
 
   async timeline(companyId: string, query: TimelineQuery) {

@@ -66,13 +66,20 @@ type PieceRow = {
   cost: string | null;
   cost_inputs: { grams?: string[]; time?: string; failure?: string } | null;
   required_filament_material: string | null;
+  required_print_technology: string | null;
   requires_multicolor: boolean;
   color_slots: { slot_material: string }[] | null;
 };
 
+// Resin technologies — their cost_inputs.grams holds MILLILITRES.
+const ORDER_RESIN_TECHS = new Set(['MSLA', 'SLA']);
+
 // The shared pricing inputs, loaded once per batch and reused by priceOrder.
 type CostingLookups = {
   matMap: Map<string, number>;
+  /** Company average resin price per ml — the single rate every resin piece is
+   *  priced at. Mirrors AssetsService.listResinPricing, averaged across types. */
+  resinPricePerMl: number;
   elecRate: number;
   variableValues: Map<string, number>;
   presetFormulas: Map<string, string>;
@@ -199,7 +206,8 @@ export class OrderCostingService {
   // ── internals ───────────────────────────────────────────────────────────────
 
   private pieceSelectSql(where: string, orderBy = ""): string {
-    return `SELECT op.order_id, op.piece_name, op.cost, op.cost_inputs, op.required_filament_material, op.requires_multicolor,
+    return `SELECT op.order_id, op.piece_name, op.cost, op.cost_inputs, op.required_filament_material,
+              op.required_print_technology, op.requires_multicolor,
               (
                 SELECT COALESCE(json_agg(json_build_object('slot_material', cs.slot_material) ORDER BY cs.sequence_order), '[]'::json)
                 FROM order_piece_color_slots cs WHERE cs.piece_id = op.piece_id
@@ -240,6 +248,27 @@ export class OrderCostingService {
     for (const r of matRes.rows) {
       if (r.p != null && Number.isFinite(Number(r.p))) matMap.set(r.material_type, Number(r.p));
     }
+
+    // One average resin price per ml across every priced tank, regardless of
+    // resin type — the rate every resin piece is quoted at. Deliberately NOT
+    // per-type: a shop quoting a resin job charges for resin, and a per-type
+    // split would make two identical prints on different bottles quote
+    // differently. Same exclusions as the filament average (priced parents only,
+    // so a decanted bottle isn't counted twice).
+    const resinRes = await this.databaseService.query<{ p: string | null }>(
+      `SELECT SUM(ai.purchase_price) / NULLIF(SUM(ai.resin_initial_volume_ml), 0) AS p
+         FROM asset_instances ai
+        WHERE ai.company_id = $1
+          AND ai.asset_type = 'resin_tank'
+          AND ai.parent_asset_id IS NULL
+          AND ai.purchase_price > 0
+          AND ai.resin_initial_volume_ml > 0`,
+      [companyId],
+      executor
+    );
+    const resinRaw = resinRes.rows[0]?.p;
+    const resinPricePerMl =
+      resinRaw != null && Number.isFinite(Number(resinRaw)) ? Number(resinRaw) : 0;
 
     const compRes = await this.databaseService.query<{ electricity_price_per_kwh: string | null }>(
       "SELECT electricity_price_per_kwh FROM companies WHERE company_id = $1",
@@ -289,7 +318,7 @@ export class OrderCostingService {
       if (Number.isFinite(opmNum) && opmNum > 0) ordersPerMonth = opmNum;
     }
 
-    return { matMap, elecRate, variableValues, presetFormulas, ordersPerMonth };
+    return { matMap, resinPricePerMl, elecRate, variableValues, presetFormulas, ordersPerMonth };
   }
 
   // Price ONE order from its pieces + costing config — the shared core every
@@ -309,7 +338,7 @@ export class OrderCostingService {
     let anyPriced = false;
     const pricedPieces: InvoiceLinePiece[] = [];
     for (const p of pieces) {
-      const bd = this.pieceCostBreakdown(p, laborPerPiece, lk.matMap, lk.elecRate);
+      const bd = this.pieceCostBreakdown(p, laborPerPiece, lk.matMap, lk.elecRate, lk.resinPricePerMl);
       if (bd != null) {
         anyPriced = true;
         base += bd.total;
@@ -389,19 +418,28 @@ export class OrderCostingService {
     p: PieceRow,
     laborPerPiece: number,
     matMap: Map<string, number>,
-    elecRate: number
+    elecRate: number,
+    // Company average resin price per ml. A resin piece's cost_inputs.grams holds
+    // MILLILITRES and is priced at this one rate — see costing.ts for the why.
+    resinPricePerMl = 0
   ): { material: number; electricity: number; labor: number; total: number } | null {
     const ci = p.cost_inputs;
     if (ci) {
       const minutes = Number(ci.time);
       if (Number.isFinite(minutes) && minutes > 0) {
         const grams = (ci.grams ?? []).map((g) => Number(g) || 0);
+        const isResin = ORDER_RESIN_TECHS.has((p.required_print_technology ?? "").trim().toUpperCase());
         let material = 0;
         let totalGrams = 0;
         for (let j = 0; j < grams.length; j += 1) {
           const g = grams[j] || 0;
           if (g <= 0) continue;
           totalGrams += g;
+          if (isResin) {
+            // One rate for the whole draw; resin has no per-slot material.
+            material += resinPricePerMl * g;
+            continue;
+          }
           const mat = p.requires_multicolor && p.color_slots?.[j]
             ? p.color_slots[j]!.slot_material
             : p.required_filament_material ?? undefined;

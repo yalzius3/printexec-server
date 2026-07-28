@@ -103,6 +103,20 @@ export class JobsController {
     );
   }
 
+  @Get("resin-tanks/:tankAssetId/timeline")
+  @RequirePermission("view_orders")
+  tankTimeline(
+    @CompanyId() companyId: string,
+    @Param("tankAssetId") tankAssetId: string,
+    @Query() query: unknown
+  ) {
+    return this.jobsService.tankTimeline(
+      companyId,
+      tankAssetId,
+      parseWithSchema(timelineQuerySchema, query)
+    );
+  }
+
   @Get(":pieceId/filament-plan")
   @RequirePermission("view_orders")
   filamentPlan(

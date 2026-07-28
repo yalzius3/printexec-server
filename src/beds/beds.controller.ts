@@ -20,7 +20,10 @@ import {
 import { z } from "zod";
 import type { AuthRequest } from "../auth/supabase.guard";
 import { findCandidatesSchema, reserveSpoolsSchema } from "../jobs/jobs.schemas";
-import { transitionPieceFulfilmentSchema } from "../orders/orders.schemas";
+import {
+  transitionPieceFulfilmentSchema,
+  transitionPiecePostProcessSchema
+} from "../orders/orders.schemas";
 
 const uuid = z.string().uuid();
 const assignBedSchema = z.object({
@@ -218,6 +221,19 @@ export class BedsController {
   ) {
     const { status } = parseWithSchema(transitionPieceFulfilmentSchema, body);
     return this.beds.transitionBedFulfilment(companyId, bedId, status);
+  }
+
+  // Walk a done resin bed through wash → cure, moving every constituent done
+  // piece's post_process_state forward in lockstep.
+  @Post(":bedId/post-process")
+  @RequirePermission("action_orders")
+  transitionPostProcess(
+    @CompanyId() companyId: string,
+    @Param("bedId") bedId: string,
+    @Body() body: unknown
+  ) {
+    const { state } = parseWithSchema(transitionPiecePostProcessSchema, body);
+    return this.beds.transitionBedPostProcess(companyId, bedId, state);
   }
 
   @Post(":bedId/restore")

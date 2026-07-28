@@ -22,7 +22,7 @@ import {
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
   listFilamentReferencesQuerySchema,
-  splitSpoolSchema,
+  splitAssetSchema,
   updateAssetSchema,
   updateAssetStockSchema
 } from "./assets.schemas";
@@ -87,6 +87,14 @@ export class AssetsController {
     return this.assetsService.listSpoolInventory(companyId);
   }
 
+  // Owned resin tanks with remaining/reserved millilitres — the resin
+  // counterpart of /spools, read by the piece editor's tank picker.
+  @Get("resin-tanks")
+  @RequirePermission(["view_assets", "view_orders"])
+  listResinTankInventory(@CompanyId() companyId: string) {
+    return this.assetsService.listResinTankInventory(companyId);
+  }
+
   // Average filament price per gram per material — used by piece-cost estimates.
   // Declared before :assetId so the static path isn't swallowed as an id.
   // Cross-module metadata: quotations (orders module) are priced from this —
@@ -95,6 +103,14 @@ export class AssetsController {
   @RequirePermission(["view_assets", "view_orders"])
   listMaterialPricing(@CompanyId() companyId: string) {
     return this.assetsService.listMaterialPricing(companyId);
+  }
+
+  // Average resin price per ml per resin type — the resin cost path's input.
+  // Same cross-module rule as material-pricing: quoting a resin job needs it.
+  @Get("resin-pricing")
+  @RequirePermission(["view_assets", "view_orders"])
+  listResinPricing(@CompanyId() companyId: string) {
+    return this.assetsService.listResinPricing(companyId);
   }
 
   // Aggregated insights for the Assets → Overview tab. Static path declared
@@ -157,30 +173,35 @@ export class AssetsController {
     );
   }
 
+  // Resin tanks. Carries the user id for the same reason spools/spare parts do:
+  // a vendor-named intake books a purchase bill in Finance on their behalf.
   @Post("resin-tanks")
   @RequirePermission("action_assets")
   createResinTank(
     @CompanyId() companyId: string,
+    @UserId() userId: string,
     @Body() body: unknown
   ) {
     return this.assetsService.createResinTank(
       companyId,
+      userId,
       parseWithSchema(createResinTankSchema, body)
     );
   }
 
-  // Split an idle spool into N child spools (action; service enforces eligibility).
+  // Decant an idle spool or resin tank into N children (action; the service
+  // enforces eligibility and picks the unit from the asset's type).
   @Post(":assetId/split")
   @RequirePermission("action_assets")
-  splitSpool(
+  splitAsset(
     @CompanyId() companyId: string,
     @Param("assetId") assetId: string,
     @Body() body: unknown
   ) {
-    return this.assetsService.splitSpool(
+    return this.assetsService.splitAsset(
       companyId,
       assetId,
-      parseWithSchema(splitSpoolSchema, body)
+      parseWithSchema(splitAssetSchema, body)
     );
   }
 

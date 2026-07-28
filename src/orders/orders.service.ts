@@ -166,33 +166,49 @@ export class OrdersService {
     return row;
   }
 
-  // Per-material filament waste for one order: grams + the money it cost, valued
-  // at the per-gram cost snapshotted when each failed print was recorded. Drives
-  // the small "filament wasted" line in the order detail (grams ⇄ money toggle).
+  // Per-material print waste for one order: the quantity scrapped + the money it
+  // cost, valued at the unit cost snapshotted when each failed print was
+  // recorded. Drives the small "material wasted" line in the order detail
+  // (quantity ⇄ money toggle).
+  //
+  // filament_waste_events stores grams AND millilitres in one column,
+  // discriminated by `unit` (see FinanceService.bookMaterialWaste), so the two are
+  // summed separately and reported side by side. A row carries one or the other,
+  // never both — a material is either filament or resin. `unit` on each row lets
+  // the client label it without inferring anything.
   async getOrderWaste(companyId: string, orderId: string) {
     const result = await this.databaseService.query<{
       material_type: string | null;
+      unit: string | null;
       grams: string;
+      resin_ml: string;
       cost: string;
     }>(
       `SELECT material_type,
-              COALESCE(SUM(grams), 0) AS grams,
-              COALESCE(SUM(cost), 0)  AS cost
+              MIN(unit) AS unit,
+              COALESCE(SUM(grams) FILTER (WHERE unit = 'g'), 0)  AS grams,
+              COALESCE(SUM(grams) FILTER (WHERE unit = 'ml'), 0) AS resin_ml,
+              COALESCE(SUM(cost), 0)                             AS cost
          FROM filament_waste_events
         WHERE company_id = $1 AND order_id = $2
         GROUP BY material_type
        HAVING SUM(grams) > 0
-        ORDER BY cost DESC, grams DESC`,
+        -- Cost, not quantity: grams and millilitres aren't comparable, so ranking
+        -- a mixed-technology order by the shared quantity column would be arbitrary.
+        ORDER BY cost DESC`,
       [companyId, orderId]
     );
     const byMaterial = result.rows.map((r) => ({
       material_type: r.material_type,
+      unit: r.unit ?? "g",
       grams: Number(r.grams) || 0,
+      resin_ml: Number(r.resin_ml) || 0,
       cost: Number(r.cost) || 0
     }));
     return {
       by_material: byMaterial,
       total_grams: byMaterial.reduce((s, r) => s + r.grams, 0),
+      total_resin_ml: byMaterial.reduce((s, r) => s + r.resin_ml, 0),
       total_cost: byMaterial.reduce((s, r) => s + r.cost, 0)
     };
   }

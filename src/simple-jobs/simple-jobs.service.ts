@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
-import { JobsService } from "../jobs/jobs.service";
+import { JobsService, isResinTech } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
 import { FinanceService } from "../finance/finance.service";
 import {
@@ -508,7 +508,13 @@ export class SimpleJobsService {
     userId: string,
     pieceId: string,
     requeueTo: "assigned" | "pending",
-    spoolWaste: { spool_asset_id: string; grams: number }[]
+    spoolWaste: { spool_asset_id: string; grams: number }[],
+    // Resin's counterpart of spoolWaste: the millilitres actually lost. A resin
+    // job draws from one tank, so it's one figure. Omitted (undefined) means
+    // "assume the whole planned draw", which is the physically likely outcome —
+    // a failed resin print has usually already cured most of its resin into
+    // scrap. The client pre-fills it so the operator confirms or overrides.
+    resinWasteMl?: number
   ) {
     const pieceRes = await this.db.query<{
       piece_id: string;
@@ -518,10 +524,14 @@ export class SimpleJobsService {
       status: string;
       assigned_printer_id: string | null;
       bed_id: string | null;
+      required_print_technology: string | null;
+      resin_tank_id: string | null;
+      slicer_resin_used_ml: string | null;
     }>(
       `
         SELECT op.piece_id, op.order_id, o.order_number, op.piece_name,
-               op.status, op.assigned_printer_id, op.bed_id
+               op.status, op.assigned_printer_id, op.bed_id,
+               op.required_print_technology, op.resin_tank_id, op.slicer_resin_used_ml
           FROM order_pieces op
           JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
          WHERE op.company_id = $1 AND op.piece_id = $2
@@ -558,7 +568,47 @@ export class SimpleJobsService {
     // completion; restore them so the net deduction equals the measured waste.
     const alreadyConsumed = piece.status === "done";
 
+    // ── Resin: one tank, one volume ─────────────────────────────────────────
+    const isResin = isResinTech(piece.required_print_technology);
+    const plannedMl = piece.slicer_resin_used_ml != null ? Number(piece.slicer_resin_used_ml) : 0;
+    // Default to the full planned draw, clamped to it: a failed print cannot
+    // waste more resin than it was ever going to use.
+    const resinMl = !isResin || !piece.resin_tank_id
+      ? 0
+      : Math.max(0, Math.min(plannedMl, resinWasteMl ?? plannedMl));
+    const resinTankId = piece.resin_tank_id;
+
     await this.db.transaction(async (client) => {
+      // Mirrors the spool branch below: a 'done' resin piece already had its
+      // planned volume deducted at completion, so restore that first and the net
+      // change equals the measured waste. A 'printing' piece was never deducted.
+      if (isResin && resinTankId) {
+        const restore = alreadyConsumed ? plannedMl : 0;
+        const delta = restore - resinMl;
+        if (delta !== 0) {
+          await client.query(
+            `
+              UPDATE asset_stock
+                 SET remaining_volume_ml = GREATEST(0, COALESCE(remaining_volume_ml, 0) + $2),
+                     status = CASE
+                       WHEN GREATEST(0, COALESCE(remaining_volume_ml, 0) + $2) <= 0 THEN 'empty'
+                       WHEN status = 'empty' THEN 'available'
+                       ELSE status
+                     END
+               WHERE asset_id = $1
+            `,
+            [resinTankId, delta]
+          );
+        }
+        if (resinMl > 0) {
+          await this.finance.recordResinWaste(client, companyId, userId, {
+            pieceId,
+            orderId: piece.order_id,
+            tankAssetId: resinTankId,
+            ml: resinMl,
+          });
+        }
+      }
       const reserved = await client.query<{ spool_asset_id: string; planned_grams: string | null }>(
         `SELECT spool_asset_id, planned_grams
            FROM order_piece_spools
@@ -615,22 +665,29 @@ export class SimpleJobsService {
       // Re-queue. Both targets clear the schedule + execution stamps and the
       // slicer file (a re-print starts clean). 'assigned' keeps the printer +
       // nozzle so the operator just re-drops the g-code; 'pending' wipes them.
+      // The resin volume is slicer metadata, so it clears with the rest of it;
+      // post_process_state clears because a re-queued print has nothing to wash.
+      // The TANK follows the printer: kept on 'assigned' (the operator just
+      // re-drops the file), cleared on 'pending' (a clean slate).
       if (requeueTo === "assigned") {
         await client.query(
           `
             UPDATE order_pieces
-               SET status                     = 'assigned',
-                   slicer_file_url            = NULL,
-                   slicer_file_uploaded_at    = NULL,
-                   slicer_print_time_minutes  = NULL,
-                   slicer_filament_used_grams = NULL,
-                   scheduled_at               = NULL,
-                   scheduled_start_at         = NULL,
-                   scheduled_end_at           = NULL,
-                   print_started_at           = NULL,
-                   print_completed_at         = NULL,
-                   actual_print_time_minutes  = NULL,
-                   actual_filament_used_grams = NULL
+               SET status                        = 'assigned',
+                   slicer_file_url               = NULL,
+                   slicer_file_uploaded_at       = NULL,
+                   slicer_print_time_minutes     = NULL,
+                   slicer_filament_used_grams    = NULL,
+                   slicer_resin_used_ml          = NULL,
+                   post_process_state            = NULL,
+                   post_process_state_entered_at = NULL,
+                   scheduled_at                  = NULL,
+                   scheduled_start_at            = NULL,
+                   scheduled_end_at              = NULL,
+                   print_started_at              = NULL,
+                   print_completed_at            = NULL,
+                   actual_print_time_minutes     = NULL,
+                   actual_filament_used_grams    = NULL
              WHERE company_id = $1 AND piece_id = $2
           `,
           [companyId, pieceId]
@@ -639,20 +696,24 @@ export class SimpleJobsService {
         await client.query(
           `
             UPDATE order_pieces
-               SET status                     = 'pending',
-                   assigned_printer_id        = NULL,
-                   assigned_nozzle_asset_id   = NULL,
-                   slicer_file_url            = NULL,
-                   slicer_file_uploaded_at    = NULL,
-                   slicer_print_time_minutes  = NULL,
-                   slicer_filament_used_grams = NULL,
-                   scheduled_at               = NULL,
-                   scheduled_start_at         = NULL,
-                   scheduled_end_at           = NULL,
-                   print_started_at           = NULL,
-                   print_completed_at         = NULL,
-                   actual_print_time_minutes  = NULL,
-                   actual_filament_used_grams = NULL
+               SET status                        = 'pending',
+                   assigned_printer_id           = NULL,
+                   assigned_nozzle_asset_id      = NULL,
+                   resin_tank_id                 = NULL,
+                   slicer_file_url               = NULL,
+                   slicer_file_uploaded_at       = NULL,
+                   slicer_print_time_minutes     = NULL,
+                   slicer_filament_used_grams    = NULL,
+                   slicer_resin_used_ml          = NULL,
+                   post_process_state            = NULL,
+                   post_process_state_entered_at = NULL,
+                   scheduled_at                  = NULL,
+                   scheduled_start_at            = NULL,
+                   scheduled_end_at              = NULL,
+                   print_started_at              = NULL,
+                   print_completed_at            = NULL,
+                   actual_print_time_minutes     = NULL,
+                   actual_filament_used_grams    = NULL
              WHERE company_id = $1 AND piece_id = $2
           `,
           [companyId, pieceId]
@@ -663,16 +724,26 @@ export class SimpleJobsService {
     });
 
     const totalWaste = [...wasteBySpool.values()].reduce((sum, g) => sum + g, 0);
+    // The history line quotes the material's own unit — "180 ml resin wasted" is
+    // the fact; "180 g" would be a different (and wrong) claim.
+    const wastePhrase = isResin
+      ? `${Math.round(resinMl)}ml resin wasted`
+      : `${Math.round(totalWaste)}g filament wasted`;
     await this.logFailure(
       companyId,
       piece.order_id,
       piece.order_number,
       pieceId,
       piece.piece_name,
-      `Piece "${piece.piece_name}" marked failed — ${Math.round(totalWaste)}g filament wasted, returned to ${requeueTo}.`
+      `Piece "${piece.piece_name}" marked failed — ${wastePhrase}, returned to ${requeueTo}.`
     );
 
-    return { piece_id: pieceId, status: requeueTo, waste_grams: totalWaste };
+    return {
+      piece_id: pieceId,
+      status: requeueTo,
+      waste_grams: totalWaste,
+      waste_resin_ml: resinMl,
+    };
   }
 
   /** Best-effort failure log into the shared order_history feed. Mirrors the
@@ -1254,7 +1325,11 @@ export class SimpleJobsService {
 
     const printerBusy = new Map<string, Interval[]>();
     const nozzleBusy = new Map<string, Interval[]>();
-    const spoolBusy = new Map<string, Interval[]>();
+    // Filament spools AND resin tanks. Both are material sources that can only
+    // feed one print at a time, both are keyed by asset id, and the packer's
+    // question of them is identical — "is this thing free in that window?" — so
+    // they share one map rather than duplicating the whole fit loop.
+    const materialBusy = new Map<string, Interval[]>();
     const push = (m: Map<string, Interval[]>, k: string | null, iv: Interval) => {
       if (!k) return;
       const arr = m.get(k) ?? [];
@@ -1266,9 +1341,10 @@ export class SimpleJobsService {
     const pieceWindow = new Map<string, Interval>();
     const pieceBlocks = await this.db.query<{
       piece_id: string; assigned_printer_id: string | null;
-      assigned_nozzle_asset_id: string | null; s: string; e: string;
+      assigned_nozzle_asset_id: string | null; resin_tank_id: string | null;
+      s: string; e: string;
     }>(
-      `SELECT piece_id, assigned_printer_id, assigned_nozzle_asset_id,
+      `SELECT piece_id, assigned_printer_id, assigned_nozzle_asset_id, resin_tank_id,
               scheduled_start_at::text AS s, scheduled_end_at::text AS e
          FROM order_pieces
         WHERE company_id = $1 AND status IN ('scheduled','printing')
@@ -1280,6 +1356,9 @@ export class SimpleJobsService {
       pieceWindow.set(r.piece_id, iv);
       push(printerBusy, r.assigned_printer_id, iv);
       push(nozzleBusy, r.assigned_nozzle_asset_id, iv);
+      // A committed resin job holds its tank for the whole window, same as a
+      // spool reservation below.
+      push(materialBusy, r.resin_tank_id, iv);
     }
     const bedWindow = new Map<string, Interval>();
     try {
@@ -1312,7 +1391,7 @@ export class SimpleJobsService {
     );
     for (const r of spoolRes.rows) {
       const iv = r.bed_id ? bedWindow.get(r.bed_id) : pieceWindow.get(r.piece_id);
-      if (iv) push(spoolBusy, r.spool_asset_id, iv);
+      if (iv) push(materialBusy, r.spool_asset_id, iv);
     }
 
     // ── Load the candidates (order preserved for ties; deadline rules).
@@ -1456,9 +1535,15 @@ export class SimpleJobsService {
     //    the loop's round trips were about to double. Batched here instead.
     const reservedByPiece = new Map<string, string[]>();
     if (ids.length > 0) {
+      // UNION so a resin piece's tank lands in the same per-piece material list
+      // as a filament piece's spools — the fit loop then treats them alike.
       const r = await this.db.query<{ piece_id: string; spool_asset_id: string }>(
         `SELECT piece_id, spool_asset_id FROM order_piece_spools
-          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+         UNION
+         SELECT piece_id, resin_tank_id AS spool_asset_id FROM order_pieces
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+            AND resin_tank_id IS NOT NULL`,
         [companyId, ids]
       );
       for (const row of r.rows) {
@@ -1602,10 +1687,10 @@ export class SimpleJobsService {
       //    where most of the utilisation comes from.
       const durMs = Math.max(1, c.minutes) * 60_000;
       const printerIvs = printerBusy.get(c.printer_id) ?? [];
-      const spoolIvs = mySpools.flatMap((sid) => spoolBusy.get(sid) ?? []);
+      const materialIvs = mySpools.flatMap((sid) => materialBusy.get(sid) ?? []);
       const earliestWith = (nozzleId: string | null): number =>
         earliestFitWithin(
-          [...printerIvs, ...(nozzleId ? nozzleBusy.get(nozzleId) ?? [] : []), ...spoolIvs],
+          [...printerIvs, ...(nozzleId ? nozzleBusy.get(nozzleId) ?? [] : []), ...materialIvs],
           durMs,
           now + LEAD_MS,
           GAP_MS,
@@ -1683,7 +1768,7 @@ export class SimpleJobsService {
       // Book the nozzle we actually chose, not the one that was assigned —
       // otherwise the next candidate would think the substitute is still free.
       push(nozzleBusy, chosenNozzle, iv);
-      for (const sid of mySpools) push(spoolBusy, sid, iv);
+      for (const sid of mySpools) push(materialBusy, sid, iv);
       const dlMs = c.deadline ? Date.parse(c.deadline) : NaN;
       const hasDl = !Number.isNaN(dlMs);
       placed.push({

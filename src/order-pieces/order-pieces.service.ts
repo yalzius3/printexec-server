@@ -42,6 +42,10 @@ type PieceRow = {
   required_print_technology: string | null;
   required_multicolor_capable: boolean;
   assigned_printer_id: string | null;
+  resin_tank_id: string | null;
+  slicer_resin_used_ml: string | null;
+  post_process_state: string | null;
+  post_process_state_entered_at: string | null;
   slicer_file_url: string | null;
   slicer_file_uploaded_at: string | null;
   slicer_profile: string | null;
@@ -131,7 +135,10 @@ const SLICER_FIELDS = [
   "slicer_support_type",
   "slicer_part_weight_grams",
   "color_slots",
-  "color_slot_grams"
+  "color_slot_grams",
+  // Resin's counterpart of slicer_filament_used_grams — same lock, same reason:
+  // once a piece is scheduled, the quantity it reserved must not move under it.
+  "slicer_resin_used_ml"
 ] as const;
 
 const TECH_LOCKED_STATUSES = new Set(["ready", "scheduled", "printing", "done", "failed", "cancelled"]);
@@ -176,6 +183,25 @@ const FULFILMENT_LABELS: Record<string, string> = {
   out_for_shipping: "out for shipping",
   fulfilled: "fulfilled"
 };
+
+// Forward-only resin post-processing NFA, keyed by the piece's current
+// post_process_state. 'print_done' is stamped by JobsService.complete when a
+// resin print finishes; the operator walks it the rest of the way by hand.
+//   print_done -> washed -> cured   (cured is terminal — the part is finished)
+export const PIECE_POST_PROCESS_TRANSITIONS: Record<string, readonly string[]> = {
+  print_done: ["washed"],
+  washed: ["cured"]
+};
+
+const POST_PROCESS_LABELS: Record<string, string> = {
+  print_done: "off the printer",
+  washed: "washed",
+  cured: "cured"
+};
+
+// The technologies that have a post-processing stage at all. FDM parts come off
+// the bed finished; SLS is out of scope for this pass.
+export const POST_PROCESS_TECHNOLOGIES = new Set(["MSLA", "SLA"]);
 
 @Injectable()
 export class OrderPiecesService {
@@ -726,6 +752,97 @@ export class OrderPiecesService {
     return this.getPieceById(companyId, pieceId);
   }
 
+  // Advance a resin piece's post-processing lifecycle (forward only). Like
+  // fulfilment, this leaves production `status` at 'done' and moves only the
+  // orthogonal post_process_state — so a washed part is still a done print, it
+  // just isn't a finished part yet.
+  //
+  // post_process_state_entered_at is re-stamped on EVERY change, because the
+  // needs-attention queue's whole job is to answer "what has been sitting the
+  // longest", and that means time in the CURRENT state, not time since the
+  // print finished.
+  async transitionPiecePostProcess(companyId: string, pieceId: string, target: string) {
+    const piece = await this.getPieceById(companyId, pieceId);
+
+    if (piece.status !== "done") {
+      throw new BadRequestException(
+        "Only a done print can be washed or cured."
+      );
+    }
+
+    const current = piece.post_process_state;
+    if (!current) {
+      throw new BadRequestException(
+        "This piece has no post-processing stage — only resin (MSLA/SLA) prints are washed and cured."
+      );
+    }
+
+    const allowed = PIECE_POST_PROCESS_TRANSITIONS[current] ?? [];
+    if (!allowed.includes(target)) {
+      throw new BadRequestException(
+        `A piece that is ${POST_PROCESS_LABELS[current] ?? current} cannot be marked ${
+          POST_PROCESS_LABELS[target] ?? target
+        }.`
+      );
+    }
+
+    await this.databaseService.transaction(async (client) => {
+      await this.databaseService.query(
+        `UPDATE order_pieces
+            SET post_process_state            = $3,
+                post_process_state_entered_at = now()
+          WHERE company_id = $1 AND piece_id = $2`,
+        [companyId, pieceId, target],
+        client
+      );
+      await this.logPieceHistory(
+        client,
+        companyId,
+        pieceId,
+        piece.order_id,
+        piece.piece_name,
+        "post_process_changed",
+        `Piece "${piece.piece_name}" marked ${POST_PROCESS_LABELS[target] ?? target}.`
+      );
+    });
+
+    return this.getPieceById(companyId, pieceId);
+  }
+
+  // The needs-attention queue: resin prints that are off the machine but not
+  // finished parts yet. Oldest wait first — that is the entire point of the
+  // view, so the sort is the server's, not a client preference.
+  async listPostProcessQueue(companyId: string) {
+    const result = await this.databaseService.query(
+      `SELECT
+         op.piece_id,
+         op.order_id,
+         op.piece_name,
+         op.post_process_state,
+         op.post_process_state_entered_at,
+         op.print_completed_at,
+         op.required_print_technology,
+         op.assigned_printer_id,
+         op.stl_thumbnail_url,
+         o.order_number,
+         o.deadline AS order_deadline,
+         CASE
+           WHEN c.customer_type = 'b2b' THEN c.business_name
+           ELSE NULLIF(concat_ws(' ', c.first_name, c.last_name), '')
+         END AS customer_name,
+         NULLIF(TRIM(CONCAT_WS(' ', pi.brand, pi.model)), '') AS assigned_printer_label
+       FROM order_pieces op
+       INNER JOIN orders o ON o.order_id = op.order_id
+       LEFT JOIN customers c ON c.customer_id = o.customer_id
+       LEFT JOIN printer_instances pi ON pi.printer_id = op.assigned_printer_id
+      WHERE op.company_id = $1
+        AND op.post_process_state IN ('print_done', 'washed')
+      ORDER BY op.post_process_state_entered_at ASC NULLS LAST`,
+      [companyId]
+    );
+    return result.rows;
+  }
+
   // Persist a client-rendered STL thumbnail URL for a piece (see
   // stlThumbnail.ts on the client). Company-scoped; 404s an unknown piece.
   async setPieceThumbnail(companyId: string, pieceId: string, url: string) {
@@ -1028,14 +1145,16 @@ export class OrderPiecesService {
           stl_file_url,
           stl_file_uploaded_at,
           cost,
-          cost_inputs
+          cost_inputs,
+          resin_tank_id,
+          slicer_resin_used_ml
         )
         VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
           $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
           $27, $28, $29, $30, $31, $32, $33, $34,
           CASE WHEN $34::text IS NOT NULL THEN now() ELSE NULL END,
-          $35, $36
+          $35, $36, $37, $38
         )
         RETURNING piece_id
       `,
@@ -1075,7 +1194,9 @@ export class OrderPiecesService {
         mirroredMaterial,
         input.stl_file_url ?? null,
         input.cost ?? null,
-        input.cost_inputs ?? null
+        input.cost_inputs ?? null,
+        input.resin_tank_id ?? null,
+        input.slicer_resin_used_ml ?? null
       ],
       executor
     );
