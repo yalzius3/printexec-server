@@ -155,6 +155,51 @@ export class SimpleJobsService {
     const compatById = new Map(printerNozzles.rows.map((n) => [n.nozzle_asset_id, n]));
     const defaultNozzleId = printerNozzles.rows[0]?.nozzle_asset_id ?? null;
 
+    // ── Resin tanks: the resin analogue of the nozzle rack above ─────────────
+    // A resin piece needs a tank the way an FDM piece needs a nozzle — it cannot
+    // reach 'ready' (or pass chk_ready_requires_core_data) without one. Assigning
+    // resolves it here, so one click does the same work for resin that it already
+    // did for filament instead of parking the piece until someone links a tank by
+    // hand in the detail window.
+    //
+    // Ordered MOST DEPLETED FIRST among tanks that can still cover the job: a
+    // shop should finish the bottle that is already open before breaching a
+    // sealed one. Expired, damaged and split-parent tanks are excluded outright,
+    // and a tank formulated for the other light source can't print this job.
+    const isResinPrinter = printerFamily === "RESIN";
+    const printerTech = (printer.print_technology ?? "").trim().toUpperCase();
+    const resinTanks = isResinPrinter
+      ? (
+          await this.db.query<{ asset_id: string; free_ml: string | null }>(
+            `
+              SELECT ai.asset_id,
+                     COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0) AS free_ml
+                FROM asset_instances ai
+                JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+               WHERE ai.company_id = $1
+                 AND ai.asset_type = 'resin_tank'
+                 AND ai.split_at IS NULL
+                 AND COALESCE(ast.status, 'available') NOT IN ('damaged', 'empty')
+                 AND (ai.resin_expiry_date IS NULL OR ai.resin_expiry_date >= CURRENT_DATE)
+                 AND (COALESCE(ai.resin_tech_compat, 'both') = 'both'
+                      OR COALESCE(ai.resin_tech_compat, 'both') = $2)
+               ORDER BY free_ml ASC
+            `,
+            [companyId, printerTech]
+          )
+        ).rows
+      : [];
+    /** The emptiest tank that still covers `needMl` (any tank when the volume
+     *  isn't known yet — the operator fills it in at the slicer step). */
+    const resolveTankFor = (needMl: number | null): string | null => {
+      if (resinTanks.length === 0) return null;
+      if (needMl == null || !(needMl > 0)) return resinTanks[resinTanks.length - 1]?.asset_id ?? null;
+      const fits = resinTanks.find((t) => Number(t.free_ml ?? 0) >= needMl);
+      // Nothing covers it: leave it unlinked rather than pick a tank that will
+      // fail the volume check at schedule time with a confusing error.
+      return fits?.asset_id ?? null;
+    };
+
     // The operator's explicit picks (bulk: one per requirement). De-duped.
     // Every pick must be compatible with the chosen printer.
     const chosenIds = Array.from(new Set([...(nozzleIds ?? []), ...(nozzleId ? [nozzleId] : [])]));
@@ -213,7 +258,16 @@ export class SimpleJobsService {
     // Group assignable pieces by (nozzle, assumed time, assumed grams) so each
     // distinct combination is a single UPDATE (nozzle null = none resolved →
     // keep existing).
-    type SeedGroup = { nozzle: string | null; minutes: number | null; grams: number | null; ids: string[] };
+    // `grams` and `ml` are mutually exclusive: a piece is filament or resin, and
+    // the quote's single quantity lands in whichever column its technology uses.
+    type SeedGroup = {
+      nozzle: string | null;
+      tank: string | null;
+      minutes: number | null;
+      grams: number | null;
+      ml: number | null;
+      ids: string[];
+    };
     const groups = new Map<string, SeedGroup>();
     // Multicolor pieces whose quote grams can seed the per-slot demand.
     const slotSeeds: { piece_id: string; grams: number[] }[] = [];
@@ -250,10 +304,23 @@ export class SimpleJobsService {
       // of parking at 'assigned' until someone re-types numbers that already
       // exist. Pieces with no quote keep the old NULL wipe.
       const assumed = quoteAssumedMeta(piece.cost_inputs);
-      const key = `${nozzle ?? ""}|${assumed.minutes ?? ""}|${assumed.grams ?? ""}`;
+      // For a resin piece the quote's quantity is MILLILITRES, not grams — the
+      // piece grid's quantity column carries the row's own unit. So it seeds the
+      // resin draw, and picks the tank that can cover it.
+      const pieceIsResin = isResinTech(piece.required_print_technology);
+      const tank = pieceIsResin ? resolveTankFor(assumed.grams) : null;
+      const key = `${nozzle ?? ""}|${tank ?? ""}|${assumed.minutes ?? ""}|${assumed.grams ?? ""}|${pieceIsResin ? "r" : "f"}`;
       let g = groups.get(key);
       if (!g) {
-        g = { nozzle, minutes: assumed.minutes, grams: assumed.grams, ids: [] };
+        g = {
+          nozzle,
+          tank,
+          minutes: assumed.minutes,
+          // Resin's quantity rides the resin column; filament's the gram column.
+          grams: pieceIsResin ? null : assumed.grams,
+          ml: pieceIsResin ? assumed.grams : null,
+          ids: [],
+        };
         groups.set(key, g);
       }
       g.ids.push(piece.piece_id);
@@ -279,15 +346,27 @@ export class SimpleJobsService {
           UPDATE order_pieces
           SET assigned_printer_id = $3,
               assigned_nozzle_asset_id = COALESCE($4::uuid, assigned_nozzle_asset_id),
+              resin_tank_id              = COALESCE($7::uuid, resin_tank_id),
               slicer_file_url            = NULL,
               slicer_file_uploaded_at    = NULL,
               slicer_print_time_minutes  = $5,
               slicer_filament_used_grams = $6,
+              slicer_resin_used_ml       = $8,
               status = CASE
-                -- 'ready' needs (printer, nozzle, time, grams) per
-                -- chk_ready_requires_core_data; 'assigned' needs printer +
-                -- nozzle. If no nozzle could be resolved, leave the status
-                -- as-is rather than risk an inconsistent 'assigned'.
+                -- Each technology's own prerequisites, matching
+                -- chk_ready_requires_core_data exactly. Resin has no nozzle, so
+                -- the old nozzle-only test left every resin piece at its previous
+                -- status while stamping the printer — assigned in the UI, pending
+                -- in the database.
+                WHEN required_print_technology IN ('MSLA', 'SLA') THEN
+                  CASE
+                    WHEN $5::int IS NOT NULL AND $8::numeric IS NOT NULL
+                     AND COALESCE($7::uuid, resin_tank_id) IS NOT NULL THEN 'ready'
+                    ELSE 'assigned'
+                  END
+                -- 'ready' needs (printer, nozzle, time, grams); 'assigned' needs
+                -- printer + nozzle. If no nozzle could be resolved, leave the
+                -- status as-is rather than risk an inconsistent 'assigned'.
                 WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL
                  AND $5::int IS NOT NULL AND $6::numeric IS NOT NULL THEN 'ready'
                 WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL THEN 'assigned'
@@ -296,7 +375,7 @@ export class SimpleJobsService {
           WHERE company_id = $1
             AND piece_id = ANY($2::uuid[])
         `,
-        [companyId, g.ids, printerId, g.nozzle, g.minutes, g.grams]
+        [companyId, g.ids, printerId, g.nozzle, g.minutes, g.grams, g.tank, g.ml]
       );
     }
 
@@ -490,6 +569,11 @@ export class SimpleJobsService {
           UPDATE order_pieces
           SET assigned_printer_id        = NULL,
               assigned_nozzle_asset_id   = NULL,
+              -- Resin's counterparts of the nozzle + grams cleared above: an
+              -- unassigned piece must not keep holding a tank, or its reservation
+              -- lingers against a job that is no longer going to run.
+              resin_tank_id              = NULL,
+              slicer_resin_used_ml       = NULL,
               scheduled_start_at         = NULL,
               scheduled_end_at           = NULL,
               scheduled_at               = NULL,
