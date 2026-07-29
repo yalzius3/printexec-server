@@ -928,6 +928,12 @@ export class SimpleJobsService {
       for (const r of reqRes.rows) {
         if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
         if (r.required_multicolor_capable || r.requires_multicolor) requireMulticolor = true;
+        // A resin printer has no nozzle, so a resin piece must never contribute a
+        // nozzle requirement — otherwise the picker asks for a nozzle no resin
+        // machine can offer and returns an empty list. Checked on the TECHNOLOGY
+        // rather than on the columns being empty, because a piece switched from
+        // FDM to MSLA/SLA can still carry its old diameter/material.
+        if (isResinTech(r.required_print_technology)) continue;
         // Only pieces that actually state a nozzle need constrain the picker.
         const dia = r.required_nozzle_diameter_mm != null ? Number(r.required_nozzle_diameter_mm) : null;
         const mat = r.required_nozzle_material;
