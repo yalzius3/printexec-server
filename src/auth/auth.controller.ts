@@ -808,7 +808,9 @@ export class AuthController {
         [userId, companyName]
       );
       if (companyDupe.rows.length) {
-        throw new ConflictException("You already have a company with this name on your WRKXYZ account.");
+        // NOTE: AuthPage.tsx (client) matches this string EXACTLY to route the
+        // error onto the company-name field. Change both repos in lockstep.
+        throw new ConflictException("You already have a company with this name on your account.");
       }
 
       // (5) currency must be a 3-letter ISO 4217 code when provided
@@ -868,7 +870,7 @@ export class AuthController {
              city, address_line_1, address_line_2, postal_code,
              website, industry, company_size, tax_id,
              currency_default, timezone,
-             owner_wrkxyz_id, owner_display_name, owner_email,
+             owner_account_id, owner_display_name, owner_email,
              operation_mode
            )
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'simple')
@@ -902,7 +904,7 @@ export class AuthController {
         );
 
         await this.db.query(
-          `INSERT INTO company_memberships (company_id, wrkxyz_account_id, role, permissions)
+          `INSERT INTO company_memberships (company_id, account_id, role, permissions)
            VALUES ($1, $2, 'owner', $3)`,
           [newCompanyId, userId, JSON.stringify(ownerPerms)],
           client
@@ -989,7 +991,7 @@ export class AuthController {
 
     // (11) already a member of this company
     const member = await this.db.query(
-      "SELECT 1 FROM company_memberships WHERE wrkxyz_account_id = $1 AND company_id = $2",
+      "SELECT 1 FROM company_memberships WHERE account_id = $1 AND company_id = $2",
       [userId, companyId]
     );
     if (member.rows.length) {
@@ -1021,7 +1023,7 @@ export class AuthController {
       );
 
       await this.db.query(
-        `INSERT INTO company_memberships (company_id, wrkxyz_account_id, role, permissions)
+        `INSERT INTO company_memberships (company_id, account_id, role, permissions)
          VALUES ($1, $2, 'staff', '{}')`,
         [companyId, userId],
         client

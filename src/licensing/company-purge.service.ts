@@ -73,11 +73,11 @@ export class CompanyPurgeService {
     if (!company) return null;
 
     // 1. Member account ids, captured before the cascade removes them.
-    const { rows: memberRows } = await this.db.query<{ wrkxyz_account_id: string }>(
-      "SELECT wrkxyz_account_id FROM company_memberships WHERE company_id = $1",
+    const { rows: memberRows } = await this.db.query<{ account_id: string }>(
+      "SELECT account_id FROM company_memberships WHERE company_id = $1",
       [companyId]
     );
-    const memberIds = memberRows.map((r) => r.wrkxyz_account_id).filter(Boolean);
+    const memberIds = memberRows.map((r) => r.account_id).filter(Boolean);
 
     // 2. The delete itself. Children cascade; if a legacy foreign key still
     //    blocks it, the error surfaces to the admin rather than half-deleting.
@@ -90,11 +90,11 @@ export class CompanyPurgeService {
     let kept = 0;
 
     if (memberIds.length > 0) {
-      const { rows: stillMembers } = await this.db.query<{ wrkxyz_account_id: string }>(
-        "SELECT DISTINCT wrkxyz_account_id FROM company_memberships WHERE wrkxyz_account_id = ANY($1::uuid[])",
+      const { rows: stillMembers } = await this.db.query<{ account_id: string }>(
+        "SELECT DISTINCT account_id FROM company_memberships WHERE account_id = ANY($1::uuid[])",
         [memberIds]
       );
-      const stillActive = new Set(stillMembers.map((r) => r.wrkxyz_account_id));
+      const stillActive = new Set(stillMembers.map((r) => r.account_id));
       const orphaned = memberIds.filter((id) => !stillActive.has(id));
       kept = memberIds.length - orphaned.length;
 

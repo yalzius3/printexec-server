@@ -1,6 +1,17 @@
 -- ================================================================
 -- AUTH MIGRATION: company_memberships + schema extension
 -- Safe to re-run: all steps are idempotent
+--
+-- ⚠️  SUPERSEDED IN PART — DO NOT RE-RUN AFTER 2026-08-12.
+--     2026-08-12_retire_wrkxyz_column_names.sql renamed two columns
+--     this file creates:
+--       company_memberships.wrkxyz_account_id -> account_id
+--       companies.owner_wrkxyz_id             -> owner_account_id
+--     This file is NO LONGER idempotent against a migrated database:
+--     STEP 2's `ADD COLUMN IF NOT EXISTS owner_wrkxyz_id` would
+--     resurrect the old column, and STEP 5's
+--     `ON CONFLICT (company_id, wrkxyz_account_id)` would error.
+--     Kept verbatim as the historical record of the original schema.
 -- ================================================================
 
 BEGIN;
