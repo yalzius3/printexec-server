@@ -266,6 +266,22 @@ export class AuthController {
     } catch {
       // flags not migrated yet — client treats undefined as off
     }
+    // Best-effort automated-messages switch (2026-08-13 migration). Its own
+    // group, not folded into the flags SELECT above, so a pre-migration DB
+    // doesn't take the showcase/AI flags down with it. Absent reads as
+    // undefined, which the client treats as ON — matching the column default,
+    // so an un-migrated deployment keeps sending exactly as it does today.
+    try {
+      const messaging = await this.db.query<{ automated_messages_enabled: boolean }>(
+        `SELECT c.automated_messages_enabled
+         FROM companies c JOIN users u ON u.company_id = c.company_id
+         WHERE u.id = $1`,
+        [userId]
+      );
+      if (messaging.rows[0]) Object.assign(profile, messaging.rows[0]);
+    } catch {
+      // column not migrated yet — client treats undefined as on
+    }
     // Best-effort terms state — drives the client's re-accept interstitial.
     // Only attached when the tos columns exist (2026-07-17 migration), so a
     // pre-migration DB simply doesn't gate anyone.
@@ -406,6 +422,35 @@ export class AuthController {
     await this.db.query(
       "UPDATE companies SET store_full_slicer_files = $1 WHERE company_id = $2",
       [parsed.data.store_full, companyId]
+    );
+
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
+  }
+
+  // Owner-only: the master switch for AUTOMATIC customer messages — the order
+  // shipping-stage emails and the auto-emailed customer invoice. Off means the
+  // automatic senders skip this company entirely; it does NOT silence PrintExec's
+  // own billing mail to the owner, nor an operator pressing "send" by hand.
+  @Post("automated-messages")
+  async setAutomatedMessages(
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z.object({ automated_messages_enabled: z.boolean() }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("automated_messages_enabled must be a boolean.");
+    }
+
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change automated messages.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET automated_messages_enabled = $1 WHERE company_id = $2",
+      [parsed.data.automated_messages_enabled, companyId]
     );
 
     // Full profile, never a partial one — see composeProfile.

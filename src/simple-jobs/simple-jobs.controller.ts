@@ -59,6 +59,17 @@ const markFailedSchema = z.object({
   // treats absent and 0 differently on purpose, so an operator can also record a
   // failure that wasted nothing (an aborted print that never exposed).
   resin_waste_ml: z.number().nonnegative().max(10_000_000).optional(),
+  // Why it failed, in the operator's words. Optional so recording the loss is
+  // never blocked by not having the words yet; capped because it is one line of
+  // an audit entry, not a report. Trimmed to "" is treated as absent.
+  failure_reason: z.string().trim().max(500).optional(),
+});
+
+// Send a printing/done piece back to production with NOTHING wasted — the
+// deliberate correction, as opposed to markFailed's recorded loss.
+const sendBackSchema = z.object({
+  piece_id: z.string().uuid(),
+  requeue_to: z.enum(["assigned", "pending"]),
 });
 
 // Bulk-attach slicer files to already-assigned pieces (the bulk g-code drop).
@@ -192,10 +203,21 @@ export class SimpleJobsController {
   @Post("mark-failed")
   @RequirePermission("action_orders")
   markFailed(@CompanyId() companyId: string, @UserId() userId: string, @Body() body: unknown) {
-    const { piece_id, requeue_to, spool_waste, resin_waste_ml } = parseWithSchema(markFailedSchema, body);
+    const { piece_id, requeue_to, spool_waste, resin_waste_ml, failure_reason } =
+      parseWithSchema(markFailedSchema, body);
     return this.simpleJobsService.markFailed(
-      companyId, userId, piece_id, requeue_to, spool_waste, resin_waste_ml
+      companyId, userId, piece_id, requeue_to, spool_waste, resin_waste_ml, failure_reason
     );
+  }
+
+  // Put a piece back in the queue without recording any loss. Distinct from
+  // mark-failed on purpose: this restores the piece's material to stock in full
+  // and books no spoilage, so the two can never be confused in the ledger.
+  @Post("send-back")
+  @RequirePermission("action_orders")
+  sendBack(@CompanyId() companyId: string, @Body() body: unknown) {
+    const { piece_id, requeue_to } = parseWithSchema(sendBackSchema, body);
+    return this.simpleJobsService.sendBackToProduction(companyId, piece_id, requeue_to);
   }
 
   // One-click constraint-satisfying packer: earliest slot per item where its

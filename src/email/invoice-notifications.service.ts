@@ -88,6 +88,11 @@ type InvoiceRow = {
   customer_email: string | null;
   customer_phone: string | null;
   customer_deleted_at: string | Date | null;
+  // The company's master switch for automatic customer messages. Gates the
+  // 'invoice_issued' slot only — an operator resend is a human pressing send,
+  // which this switch has nothing to say about. Read migration-safely in
+  // loadInvoice, so it's true on a DB without the column.
+  automated_messages_enabled: boolean;
 };
 
 type LineRow = {
@@ -293,6 +298,20 @@ export class InvoiceNotificationsService implements OnModuleInit, OnModuleDestro
       return "skipped";
     }
 
+    // Automatic customer messages are switched off for this company. Only the
+    // AUTOMATIC slot is gated: 'invoice_resend' is an operator pressing send by
+    // hand, and a master switch on background senders has no business blocking a
+    // deliberate action. Recorded as settled (not left pending) for the same
+    // reason the order sweep does it — so switching back on doesn't mail out
+    // every invoice issued in the meantime.
+    if (emailType === "invoice_issued" && !row.automated_messages_enabled) {
+      await this.record(row, emailType, {
+        status: "skipped",
+        error: "automated messages are switched off for this company"
+      });
+      return "skipped";
+    }
+
     const recipient = this.resolveRecipient(row);
     if (!recipient) {
       await this.record(row, emailType, { status: "skipped", error: this.skipReason(row) });
@@ -400,6 +419,11 @@ export class InvoiceNotificationsService implements OnModuleInit, OnModuleDestro
           comp.city             AS company_city,
           comp.country_code     AS company_country,
           comp.currency_default AS company_currency,
+          -- Via to_jsonb so a deployment without the 2026-08-13 migration keeps
+          -- mailing invoices instead of throwing on an unknown column. Absent
+          -- key → NULL → COALESCE true = today's behaviour.
+          COALESCE((to_jsonb(comp) ->> 'automated_messages_enabled')::boolean, true)
+                                AS automated_messages_enabled,
           c.customer_type, c.first_name, c.last_name, c.business_name,
           c.email               AS customer_email,
           c.phone               AS customer_phone,

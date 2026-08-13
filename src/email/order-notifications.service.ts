@@ -79,6 +79,10 @@ type EligibleRow = {
   secondary_phone: string | null;
   customer_deleted_at: string | null;
   display_name: string | null;
+  // The company's master switch for automatic customer messages. Selected
+  // migration-safely (see findEligibleOrders), so it reads true on a DB where
+  // the column doesn't exist yet.
+  automated_messages_enabled: boolean;
 };
 
 @Injectable()
@@ -169,6 +173,13 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
           comp.city            AS company_city,
           comp.country_code    AS company_country,
           comp.currency_default AS company_currency,
+          -- Read through to_jsonb rather than naming the column directly: this
+          -- sweep must keep running on a deployment where the 2026-08-13
+          -- migration hasn't been applied yet, and an unknown column here would
+          -- throw on EVERY tick and stop all order mail. Absent key → NULL →
+          -- COALESCE true, i.e. today's behaviour.
+          COALESCE((to_jsonb(comp) ->> 'automated_messages_enabled')::boolean, true)
+                               AS automated_messages_enabled,
           c.customer_type, c.first_name, c.last_name, c.business_name,
           c.email              AS customer_email,
           c.phone              AS customer_phone,
@@ -210,6 +221,20 @@ export class OrderNotificationsService implements OnModuleInit, OnModuleDestroy 
   private async notifyOrder(
     row: EligibleRow
   ): Promise<"sent" | "dry_run" | "skipped" | "failed"> {
+    // The company switched automatic customer messages off. Settle the stage as
+    // 'skipped' rather than leaving it eligible: a stage missed while the switch
+    // was off is MISSED, not deferred. Leaving it un-recorded would turn
+    // switching back on into a mass-send of every stage the shop moved through
+    // in the meantime — the customer-facing version of a mail-bomb.
+    if (!row.automated_messages_enabled) {
+      await this.recordEmail(row, {
+        status: "skipped",
+        recipientEmail: row.customer_email,
+        error: "automated messages are switched off for this company"
+      });
+      return "skipped";
+    }
+
     const recipient = this.resolveRecipient(row);
 
     if (!recipient) {

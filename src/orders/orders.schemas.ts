@@ -76,9 +76,12 @@ export const pieceStatusSchema = z.enum([
 ]);
 
 // Per-piece shipping lifecycle, tracked separately from production `status`
-// (the piece stays `done`). Only the three forward targets are accepted from
-// the API; `none` is the default and is never set explicitly.
+// (the piece stays `done`). 'none' is accepted as a TARGET — that is a piece
+// being pulled back out of shipping to a plain done print, the undo of the first
+// forward step. Which pairs are actually legal is the service's call
+// (PIECE_FULFILMENT_TRANSITIONS); this only bounds the vocabulary.
 export const pieceFulfilmentTargetSchema = z.enum([
+  "none",
   "ready_for_shipping",
   "out_for_shipping",
   "fulfilled"
@@ -99,9 +102,11 @@ export const transitionPieceFulfilmentSchema = z.object({
 // part geometry and equipment, and a wrong automatic deadline is worse than none.
 export const postProcessStateSchema = z.enum(["print_done", "washed", "cured"]);
 
-// Forward-only, and 'print_done' is never an accepted target: it is stamped by
-// the system when a resin print completes, not chosen by an operator.
-export const postProcessTargetSchema = z.enum(["washed", "cured"]);
+// 'print_done' is accepted only as the undo of "marked washed" — the system
+// stamps it when a resin print completes, and an operator reaches it by walking
+// back, never by picking it as a forward step. The service's transition table
+// enforces that; this only bounds the vocabulary.
+export const postProcessTargetSchema = z.enum(["print_done", "washed", "cured"]);
 
 export const transitionPiecePostProcessSchema = z.object({
   state: postProcessTargetSchema

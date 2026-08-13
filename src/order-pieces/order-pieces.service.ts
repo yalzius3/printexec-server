@@ -167,31 +167,72 @@ const PIECE_CHANGE_LOCKED_ORDER_STATUSES = new Set<string>([
 // existing per-piece lock covers them and their behaviour is unchanged.
 const PIECE_SPEC_LOCKED_ORDER_STATUSES = new Set<string>(POST_PRODUCTION_ORDER_STATUSES);
 
-// Forward-only shipping/fulfilment NFA for a DONE piece. Keyed by the piece's
-// current fulfilment_status; the value is the set of allowed next values.
+/**
+ * Every edge of a lifecycle graph, forward AND back: the given table plus its
+ * transpose.
+ *
+ * Operators mis-click, and an order that was marked fulfilled by mistake used to
+ * be unrecoverable — the forward-only tables had no way back, so the only remedy
+ * was a support request. Rather than hand-writing a second table of reverse
+ * edges (two tables that must agree forever, and won't), the reverse set is
+ * DERIVED here. Add a forward stage and its undo appears for free; there is no
+ * second place to forget.
+ *
+ * Reversal is a correction, not a lifecycle stage of its own: it moves the same
+ * orthogonal column and books nothing. Anything with physical consequences —
+ * leaving 'done' back into production — goes through SimpleJobsService's audited
+ * re-queue instead, never through here.
+ */
+function withReverseEdges(
+  forward: Record<string, readonly string[]>
+): Record<string, readonly string[]> {
+  const graph: Record<string, string[]> = {};
+  const add = (from: string, to: string) => {
+    (graph[from] ??= []).push(to);
+  };
+  for (const [from, targets] of Object.entries(forward)) {
+    for (const to of targets) {
+      add(from, to);
+      add(to, from); // the undo
+    }
+  }
+  return graph;
+}
+
+// Forward shipping/fulfilment NFA for a DONE piece. Keyed by the piece's current
+// fulfilment_status; the value is the set of allowed next values.
 //   done(none) -> ready_for_shipping | fulfilled   (fulfilled = on-the-spot pickup)
 //   ready_for_shipping -> out_for_shipping
 //   out_for_shipping   -> fulfilled
-const PIECE_FULFILMENT_TRANSITIONS: Record<string, readonly string[]> = {
+const PIECE_FULFILMENT_FORWARD: Record<string, readonly string[]> = {
   none: ["ready_for_shipping", "fulfilled"],
   ready_for_shipping: ["out_for_shipping"],
   out_for_shipping: ["fulfilled"]
 };
 
+// The graph actually enforced: the above plus every undo. 'none' becomes a legal
+// TARGET as well as a source — that is a piece being pulled back out of shipping
+// entirely, back to a plain done print.
+const PIECE_FULFILMENT_TRANSITIONS = withReverseEdges(PIECE_FULFILMENT_FORWARD);
+
 const FULFILMENT_LABELS: Record<string, string> = {
+  none: "not in shipping",
   ready_for_shipping: "ready for shipping",
   out_for_shipping: "out for shipping",
   fulfilled: "fulfilled"
 };
 
-// Forward-only resin post-processing NFA, keyed by the piece's current
+// Forward resin post-processing NFA, keyed by the piece's current
 // post_process_state. 'print_done' is stamped by JobsService.complete when a
 // resin print finishes; the operator walks it the rest of the way by hand.
-//   print_done -> washed -> cured   (cured is terminal — the part is finished)
-export const PIECE_POST_PROCESS_TRANSITIONS: Record<string, readonly string[]> = {
+//   print_done -> washed -> cured   (cured ends the post-processing chain)
+const PIECE_POST_PROCESS_FORWARD: Record<string, readonly string[]> = {
   print_done: ["washed"],
   washed: ["cured"]
 };
+
+// Plus the undos, so a part marked cured too early can be walked back.
+export const PIECE_POST_PROCESS_TRANSITIONS = withReverseEdges(PIECE_POST_PROCESS_FORWARD);
 
 const POST_PROCESS_LABELS: Record<string, string> = {
   print_done: "off the printer",
@@ -704,10 +745,11 @@ export class OrderPiecesService {
     };
   }
 
-  // Advance a piece's shipping/fulfilment lifecycle (forward only). The piece's
-  // production status (`status`) is left at 'done' — this only moves the
-  // orthogonal `fulfilment_status`. The order status is then re-derived so it
-  // mirrors its pieces' shipping progress.
+  // Move a piece along its shipping/fulfilment lifecycle, in either direction.
+  // The piece's production status (`status`) is left at 'done' — this only moves
+  // the orthogonal `fulfilment_status`. The order status is then re-derived so it
+  // mirrors its pieces' shipping progress, which is what makes a reversal show up
+  // at order level too rather than leaving the order claiming it shipped.
   async transitionPieceFulfilment(
     companyId: string,
     pieceId: string,
@@ -718,6 +760,20 @@ export class OrderPiecesService {
     if (piece.status !== "done") {
       throw new BadRequestException(
         "Only a done piece can enter the shipping/fulfilment flow."
+      );
+    }
+
+    // Shipping is gated behind curing: an uncured resin part physically cannot
+    // be packed, so letting it enter shipping would be a lie the API tells. The
+    // undo (target 'none') is exempt — pulling a piece back OUT of shipping must
+    // stay available regardless of how it got in.
+    if (
+      target !== "none" &&
+      piece.post_process_state &&
+      piece.post_process_state !== "cured"
+    ) {
+      throw new BadRequestException(
+        "This resin print still has to be washed and cured before it can be shipped."
       );
     }
 
@@ -744,7 +800,11 @@ export class OrderPiecesService {
         piece.order_id,
         piece.piece_name,
         "fulfilment_changed",
-        `Piece "${piece.piece_name}" marked ${FULFILMENT_LABELS[target] ?? target}.`
+        // A reversal reads as one: "marked not in shipping" is not a sentence
+        // anyone wants to find in an audit trail six months later.
+        target === "none"
+          ? `Piece "${piece.piece_name}" pulled back out of shipping (was ${FULFILMENT_LABELS[current] ?? current}).`
+          : `Piece "${piece.piece_name}" marked ${FULFILMENT_LABELS[target] ?? target}.`
       );
       await this.syncOrderStatus(companyId, piece.order_id, client);
     });
@@ -752,8 +812,8 @@ export class OrderPiecesService {
     return this.getPieceById(companyId, pieceId);
   }
 
-  // Advance a resin piece's post-processing lifecycle (forward only). Like
-  // fulfilment, this leaves production `status` at 'done' and moves only the
+  // Move a resin piece along its post-processing lifecycle, in either direction.
+  // Like fulfilment, this leaves production `status` at 'done' and moves only the
   // orthogonal post_process_state — so a washed part is still a done print, it
   // just isn't a finished part yet.
   //
@@ -774,6 +834,15 @@ export class OrderPiecesService {
     if (!current) {
       throw new BadRequestException(
         "This piece has no post-processing stage — only resin (MSLA/SLA) prints are washed and cured."
+      );
+    }
+
+    // Post-processing precedes shipping, so once a part is packed there is
+    // nothing left to walk back to: "un-cure a piece that is out for delivery"
+    // describes no physical act. Pull it out of shipping first.
+    if (piece.fulfilment_status && piece.fulfilment_status !== "none") {
+      throw new BadRequestException(
+        `This piece is already ${FULFILMENT_LABELS[piece.fulfilment_status] ?? piece.fulfilment_status} — take it back out of shipping before changing its post-processing.`
       );
     }
 

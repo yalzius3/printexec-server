@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
+import type { PoolClient } from "pg";
 import { DatabaseService } from "../database/database.service";
 import { JobsService, isResinTech } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
@@ -26,6 +27,22 @@ import {
   type NozzlePolicy,
   type WorkWindow,
 } from "./packing";
+
+// The piece as the two re-queue paths (markFailed, sendBackToProduction) need to
+// see it: enough to validate the move, reconcile its material, and free what it
+// was holding. Both load it through loadRequeueablePiece.
+type RequeueablePiece = {
+  piece_id: string;
+  order_id: string;
+  order_number: string;
+  piece_name: string;
+  status: string;
+  assigned_printer_id: string | null;
+  bed_id: string | null;
+  required_print_technology: string | null;
+  resin_tank_id: string | null;
+  slicer_resin_used_ml: string | null;
+};
 
 // Simple mode treats both resin technologies as one family — assigning an SLA
 // part to an MSLA printer (or vice-versa) is fine; only cross-family is
@@ -621,49 +638,14 @@ export class SimpleJobsService {
     // "assume the whole planned draw", which is the physically likely outcome —
     // a failed resin print has usually already cured most of its resin into
     // scrap. The client pre-fills it so the operator confirms or overrides.
-    resinWasteMl?: number
+    resinWasteMl?: number,
+    // Free text: what actually went wrong. Optional — an operator in a hurry
+    // shouldn't be blocked from recording the loss — but when given it is the
+    // most useful thing in the record, so it goes into the history line rather
+    // than a field nobody reads.
+    failureReason?: string
   ) {
-    const pieceRes = await this.db.query<{
-      piece_id: string;
-      order_id: string;
-      order_number: string;
-      piece_name: string;
-      status: string;
-      assigned_printer_id: string | null;
-      bed_id: string | null;
-      required_print_technology: string | null;
-      resin_tank_id: string | null;
-      slicer_resin_used_ml: string | null;
-    }>(
-      `
-        SELECT op.piece_id, op.order_id, o.order_number, op.piece_name,
-               op.status, op.assigned_printer_id, op.bed_id,
-               op.required_print_technology, op.resin_tank_id, op.slicer_resin_used_ml
-          FROM order_pieces op
-          JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
-         WHERE op.company_id = $1 AND op.piece_id = $2
-      `,
-      [companyId, pieceId]
-    );
-    const piece = pieceRes.rows[0];
-    if (!piece) {
-      throw new NotFoundException("Piece not found.");
-    }
-    if (piece.status !== "printing" && piece.status !== "done") {
-      throw new ConflictException(
-        `Only a printing or completed piece can be marked failed (current: '${piece.status}').`
-      );
-    }
-    if (piece.bed_id) {
-      throw new BadRequestException(
-        "This piece is part of a bed — mark the bed failed from the Advanced workspace instead."
-      );
-    }
-    if (requeueTo === "assigned" && !piece.assigned_printer_id) {
-      throw new BadRequestException(
-        "This piece has no assigned printer to return to — send it back to pending instead."
-      );
-    }
+    const piece = await this.loadRequeueablePiece(companyId, pieceId, requeueTo);
 
     // Sum the operator's waste per spool (a spool can only appear once per piece
     // via uq_piece_spool_asset, but fold defensively just in case).
@@ -683,151 +665,14 @@ export class SimpleJobsService {
     const resinMl = !isResin || !piece.resin_tank_id
       ? 0
       : Math.max(0, Math.min(plannedMl, resinWasteMl ?? plannedMl));
-    const resinTankId = piece.resin_tank_id;
 
     await this.db.transaction(async (client) => {
-      // Mirrors the spool branch below: a 'done' resin piece already had its
-      // planned volume deducted at completion, so restore that first and the net
-      // change equals the measured waste. A 'printing' piece was never deducted.
-      if (isResin && resinTankId) {
-        const restore = alreadyConsumed ? plannedMl : 0;
-        const delta = restore - resinMl;
-        if (delta !== 0) {
-          await client.query(
-            `
-              UPDATE asset_stock
-                 SET remaining_volume_ml = GREATEST(0, COALESCE(remaining_volume_ml, 0) + $2),
-                     status = CASE
-                       WHEN GREATEST(0, COALESCE(remaining_volume_ml, 0) + $2) <= 0 THEN 'empty'
-                       WHEN status = 'empty' THEN 'available'
-                       ELSE status
-                     END
-               WHERE asset_id = $1
-            `,
-            [resinTankId, delta]
-          );
-        }
-        if (resinMl > 0) {
-          await this.finance.recordResinWaste(client, companyId, userId, {
-            pieceId,
-            orderId: piece.order_id,
-            tankAssetId: resinTankId,
-            ml: resinMl,
-          });
-        }
-      }
-      const reserved = await client.query<{ spool_asset_id: string; planned_grams: string | null }>(
-        `SELECT spool_asset_id, planned_grams
-           FROM order_piece_spools
-          WHERE company_id = $1 AND piece_id = $2`,
-        [companyId, pieceId]
-      );
-      // Only spools actually reserved for this piece have their stock touched;
-      // collect the same set (with waste > 0) to persist + book as loss below.
-      const wasteEvents: { spoolAssetId: string; grams: number }[] = [];
-      for (const r of reserved.rows) {
-        const planned = Number(r.planned_grams) || 0;
-        const waste = wasteBySpool.get(r.spool_asset_id) ?? 0;
-        if (waste > 0) wasteEvents.push({ spoolAssetId: r.spool_asset_id, grams: waste });
-        const restore = alreadyConsumed ? planned : 0;
-        // Net change to the spool's physical remaining grams. Floored at 0 by
-        // GREATEST so an over-estimate can't drive a spool negative.
-        const delta = restore - waste;
-        await client.query(
-          `
-            UPDATE asset_stock
-               SET remaining_grams = GREATEST(0, COALESCE(remaining_grams, 0) + $2),
-                   status = CASE
-                     WHEN GREATEST(0, COALESCE(remaining_grams, 0) + $2) <= 0 THEN 'empty'
-                     WHEN status = 'empty' THEN 'available'
-                     ELSE status
-                   END
-             WHERE asset_id = $1
-          `,
-          [r.spool_asset_id, delta]
-        );
-      }
-      // Persist the measured waste and book it to the ledger (DR Filament Waste
-      // / CR Inventory) in THIS transaction, so the loss record, its journal
-      // entry and the re-queue are all-or-nothing. Reads asset_instances cost,
-      // not the asset_stock grams we just changed, so ordering is irrelevant.
-      await this.finance.recordFilamentWaste(client, companyId, userId, {
-        pieceId,
-        orderId: piece.order_id,
-        wasteBySpool: wasteEvents
+      await this.reconcileMaterialTx(client, companyId, userId, piece, {
+        wasteBySpool,
+        resinMl,
+        alreadyConsumed,
       });
-      // Drop the reservation rows BEFORE flipping status. Deleting them lets the
-      // reserved-grams recalc trigger release the held grams; doing it first also
-      // means the trigger that fires on a 'done'→non-terminal flip finds no rows
-      // to re-reserve.
-      await client.query(
-        `DELETE FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
-        [companyId, pieceId]
-      );
-      // Free the printer this piece was holding (no-op for a 'done' piece whose
-      // printer was already released at completion).
-      if (piece.assigned_printer_id) {
-        await releasePrinterForPieceTx(client, companyId, piece.assigned_printer_id, pieceId);
-      }
-      // Re-queue. Both targets clear the schedule + execution stamps and the
-      // slicer file (a re-print starts clean). 'assigned' keeps the printer +
-      // nozzle so the operator just re-drops the g-code; 'pending' wipes them.
-      // The resin volume is slicer metadata, so it clears with the rest of it;
-      // post_process_state clears because a re-queued print has nothing to wash.
-      // The TANK follows the printer: kept on 'assigned' (the operator just
-      // re-drops the file), cleared on 'pending' (a clean slate).
-      if (requeueTo === "assigned") {
-        await client.query(
-          `
-            UPDATE order_pieces
-               SET status                        = 'assigned',
-                   slicer_file_url               = NULL,
-                   slicer_file_uploaded_at       = NULL,
-                   slicer_print_time_minutes     = NULL,
-                   slicer_filament_used_grams    = NULL,
-                   slicer_resin_used_ml          = NULL,
-                   post_process_state            = NULL,
-                   post_process_state_entered_at = NULL,
-                   scheduled_at                  = NULL,
-                   scheduled_start_at            = NULL,
-                   scheduled_end_at              = NULL,
-                   print_started_at              = NULL,
-                   print_completed_at            = NULL,
-                   actual_print_time_minutes     = NULL,
-                   actual_filament_used_grams    = NULL
-             WHERE company_id = $1 AND piece_id = $2
-          `,
-          [companyId, pieceId]
-        );
-      } else {
-        await client.query(
-          `
-            UPDATE order_pieces
-               SET status                        = 'pending',
-                   assigned_printer_id           = NULL,
-                   assigned_nozzle_asset_id      = NULL,
-                   resin_tank_id                 = NULL,
-                   slicer_file_url               = NULL,
-                   slicer_file_uploaded_at       = NULL,
-                   slicer_print_time_minutes     = NULL,
-                   slicer_filament_used_grams    = NULL,
-                   slicer_resin_used_ml          = NULL,
-                   post_process_state            = NULL,
-                   post_process_state_entered_at = NULL,
-                   scheduled_at                  = NULL,
-                   scheduled_start_at            = NULL,
-                   scheduled_end_at              = NULL,
-                   print_started_at              = NULL,
-                   print_completed_at            = NULL,
-                   actual_print_time_minutes     = NULL,
-                   actual_filament_used_grams    = NULL
-             WHERE company_id = $1 AND piece_id = $2
-          `,
-          [companyId, pieceId]
-        );
-      }
-      // Re-derive the order's rollup status inside the same transaction.
-      await recomputeOrderStatusTx(client, companyId, piece.order_id);
+      await this.requeuePieceTx(client, companyId, piece, requeueTo);
     });
 
     const totalWaste = [...wasteBySpool.values()].reduce((sum, g) => sum + g, 0);
@@ -836,13 +681,17 @@ export class SimpleJobsService {
     const wastePhrase = isResin
       ? `${Math.round(resinMl)}ml resin wasted`
       : `${Math.round(totalWaste)}g filament wasted`;
+    // The reason rides in the same history line as the loss, so the record reads
+    // as one event: what failed, what it cost, and where the piece went.
+    const reason = (failureReason ?? "").trim();
     await this.logFailure(
       companyId,
       piece.order_id,
       piece.order_number,
       pieceId,
       piece.piece_name,
-      `Piece "${piece.piece_name}" marked failed — ${wastePhrase}, returned to ${requeueTo}.`
+      `Piece "${piece.piece_name}" marked failed — ${wastePhrase}, returned to ${requeueTo}.` +
+        (reason ? ` Reason: ${reason}` : "")
     );
 
     return {
@@ -851,6 +700,275 @@ export class SimpleJobsService {
       waste_grams: totalWaste,
       waste_resin_ml: resinMl,
     };
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Send a piece BACK TO PRODUCTION.
+  //
+  // The operator marked a piece done (or started it) and needs it back in the
+  // queue — a mis-click, a part that turned out unacceptable on inspection, a
+  // customer who changed the spec after the fact. This is markFailed's sibling
+  // and shares its whole mechanism; the one difference is that NOTHING was
+  // wasted, so the planned material is restored in full and no spoilage is
+  // booked to the ledger.
+  //
+  // That distinction is the reason this is its own operation rather than a
+  // status write from the UI. A done piece has already had its grams/millilitres
+  // pulled from stock and its printer released; setting `status` back by hand
+  // would leave the material permanently deducted for a print that is about to
+  // be run again — the stock figure and the shelf would silently disagree, and
+  // every cost the shop computes downstream would inherit the error.
+  // ──────────────────────────────────────────────────────────────────
+  async sendBackToProduction(
+    companyId: string,
+    pieceId: string,
+    requeueTo: "assigned" | "pending"
+  ) {
+    const piece = await this.loadRequeueablePiece(companyId, pieceId, requeueTo);
+
+    // A 'done' piece had its planned material consumed at completion; restore it
+    // in full. A 'printing' piece was never deducted, so there is nothing to give
+    // back — the same rule markFailed applies.
+    const alreadyConsumed = piece.status === "done";
+
+    await this.db.transaction(async (client) => {
+      await this.reconcileMaterialTx(client, companyId, null, piece, {
+        // No waste: this is a piece going back to be printed, not a loss.
+        wasteBySpool: new Map(),
+        resinMl: 0,
+        alreadyConsumed,
+      });
+      await this.requeuePieceTx(client, companyId, piece, requeueTo);
+    });
+
+    await this.logFailure(
+      companyId,
+      piece.order_id,
+      piece.order_number,
+      pieceId,
+      piece.piece_name,
+      `Piece "${piece.piece_name}" sent back to production (${requeueTo})` +
+        `${alreadyConsumed ? " — its reserved material was returned to stock" : ""}.`
+    );
+
+    return { piece_id: pieceId, status: requeueTo };
+  }
+
+  /**
+   * Load the piece both re-queue paths operate on, and enforce the rules they
+   * share: only a print that is actually in or past the machine can be sent
+   * back, a bed piece is handled at bed level, and 'assigned' needs a printer to
+   * return to.
+   */
+  private async loadRequeueablePiece(
+    companyId: string,
+    pieceId: string,
+    requeueTo: "assigned" | "pending"
+  ): Promise<RequeueablePiece> {
+    const pieceRes = await this.db.query<RequeueablePiece>(
+      `
+        SELECT op.piece_id, op.order_id, o.order_number, op.piece_name,
+               op.status, op.assigned_printer_id, op.bed_id,
+               op.required_print_technology, op.resin_tank_id, op.slicer_resin_used_ml
+          FROM order_pieces op
+          JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
+         WHERE op.company_id = $1 AND op.piece_id = $2
+      `,
+      [companyId, pieceId]
+    );
+    const piece = pieceRes.rows[0];
+    if (!piece) {
+      throw new NotFoundException("Piece not found.");
+    }
+    if (piece.status !== "printing" && piece.status !== "done") {
+      throw new ConflictException(
+        `Only a printing or completed piece can be returned to the queue (current: '${piece.status}').`
+      );
+    }
+    if (piece.bed_id) {
+      throw new BadRequestException(
+        "This piece is part of a bed — move the whole bed from the Advanced workspace instead."
+      );
+    }
+    if (requeueTo === "assigned" && !piece.assigned_printer_id) {
+      throw new BadRequestException(
+        "This piece has no assigned printer to return to — send it back to pending instead."
+      );
+    }
+    return piece;
+  }
+
+  /**
+   * Reconcile a piece's material back to the spool(s) / tank it drew from, given
+   * what was actually lost.
+   *
+   * One function for both re-queue paths, because they are the same act with
+   * different numbers: the net change to stock is `restore − waste`, where
+   * `restore` is the planned draw a completed piece already had deducted, and
+   * `waste` is what the operator measured. markFailed passes real waste;
+   * sendBackToProduction passes none, which reduces to a pure restore. Keeping
+   * this in one place is what stops the two from drifting into disagreeing about
+   * what a spool's remaining grams mean.
+   *
+   * Spoilage is booked to the ledger from here too (DR Material Waste / CR
+   * Inventory), inside the caller's transaction — so the loss record, its journal
+   * entry and the re-queue are all-or-nothing. Zero waste books nothing.
+   */
+  private async reconcileMaterialTx(
+    client: PoolClient,
+    companyId: string,
+    userId: string | null,
+    piece: RequeueablePiece,
+    measured: {
+      /** Grams lost per reserved spool. Empty = nothing was wasted. */
+      wasteBySpool: Map<string, number>;
+      /** Millilitres of resin lost (already clamped to the planned draw). */
+      resinMl: number;
+      /** Whether the planned draw was already deducted (i.e. the piece is done). */
+      alreadyConsumed: boolean;
+    }
+  ): Promise<void> {
+    const { wasteBySpool, resinMl, alreadyConsumed } = measured;
+
+    // ── Resin: one tank, one volume ─────────────────────────────────────────
+    const isResin = isResinTech(piece.required_print_technology);
+    const resinTankId = piece.resin_tank_id;
+    if (isResin && resinTankId) {
+      const plannedMl = piece.slicer_resin_used_ml != null ? Number(piece.slicer_resin_used_ml) : 0;
+      const restore = alreadyConsumed ? plannedMl : 0;
+      const delta = restore - resinMl;
+      if (delta !== 0) {
+        await client.query(
+          `
+            UPDATE asset_stock
+               SET remaining_volume_ml = GREATEST(0, COALESCE(remaining_volume_ml, 0) + $2),
+                   status = CASE
+                     WHEN GREATEST(0, COALESCE(remaining_volume_ml, 0) + $2) <= 0 THEN 'empty'
+                     WHEN status = 'empty' THEN 'available'
+                     ELSE status
+                   END
+             WHERE asset_id = $1
+          `,
+          [resinTankId, delta]
+        );
+      }
+      if (resinMl > 0) {
+        await this.finance.recordResinWaste(client, companyId, userId, {
+          pieceId: piece.piece_id,
+          orderId: piece.order_id,
+          tankAssetId: resinTankId,
+          ml: resinMl,
+        });
+      }
+    }
+
+    // ── Filament: one row per reserved spool ────────────────────────────────
+    const reserved = await client.query<{ spool_asset_id: string; planned_grams: string | null }>(
+      `SELECT spool_asset_id, planned_grams
+         FROM order_piece_spools
+        WHERE company_id = $1 AND piece_id = $2`,
+      [companyId, piece.piece_id]
+    );
+    // Only spools actually reserved for this piece have their stock touched;
+    // collect the same set (with waste > 0) to persist + book as loss below.
+    const wasteEvents: { spoolAssetId: string; grams: number }[] = [];
+    for (const r of reserved.rows) {
+      const planned = Number(r.planned_grams) || 0;
+      const waste = wasteBySpool.get(r.spool_asset_id) ?? 0;
+      if (waste > 0) wasteEvents.push({ spoolAssetId: r.spool_asset_id, grams: waste });
+      const restore = alreadyConsumed ? planned : 0;
+      // Net change to the spool's physical remaining grams. Floored at 0 by
+      // GREATEST so an over-estimate can't drive a spool negative.
+      const delta = restore - waste;
+      await client.query(
+        `
+          UPDATE asset_stock
+             SET remaining_grams = GREATEST(0, COALESCE(remaining_grams, 0) + $2),
+                 status = CASE
+                   WHEN GREATEST(0, COALESCE(remaining_grams, 0) + $2) <= 0 THEN 'empty'
+                   WHEN status = 'empty' THEN 'available'
+                   ELSE status
+                 END
+           WHERE asset_id = $1
+        `,
+        [r.spool_asset_id, delta]
+      );
+    }
+    // Reads asset_instances cost, not the asset_stock grams we just changed, so
+    // ordering is irrelevant. Early-returns on an empty list.
+    await this.finance.recordFilamentWaste(client, companyId, userId, {
+      pieceId: piece.piece_id,
+      orderId: piece.order_id,
+      wasteBySpool: wasteEvents,
+    });
+  }
+
+  /**
+   * Put a piece back in the queue: release everything it was holding and clear
+   * every stamp a fresh print run must not inherit.
+   *
+   * 'assigned' keeps the printer + nozzle (+ tank) so the operator just re-drops
+   * the g-code; 'pending' wipes them for a clean slate. Everything else clears
+   * either way — a re-print starts from the same place a first print does.
+   */
+  private async requeuePieceTx(
+    client: PoolClient,
+    companyId: string,
+    piece: RequeueablePiece,
+    requeueTo: "assigned" | "pending"
+  ): Promise<void> {
+    const pieceId = piece.piece_id;
+    // Drop the reservation rows BEFORE flipping status. Deleting them lets the
+    // reserved-grams recalc trigger release the held grams; doing it first also
+    // means the trigger that fires on a 'done'→non-terminal flip finds no rows
+    // to re-reserve.
+    await client.query(
+      `DELETE FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+      [companyId, pieceId]
+    );
+    // Free the printer this piece was holding (no-op for a 'done' piece whose
+    // printer was already released at completion).
+    if (piece.assigned_printer_id) {
+      await releasePrinterForPieceTx(client, companyId, piece.assigned_printer_id, pieceId);
+    }
+    // One statement for both targets: the columns 'pending' additionally clears
+    // are the ones that name a machine, and they're cleared by a CASE on the
+    // target rather than by a second near-identical UPDATE that has to be kept
+    // in step with the first.
+    //
+    // fulfilment_status resets to 'none' unconditionally. A piece heading back to
+    // the queue is not "ready for shipping" — leaving the old value behind meant
+    // a re-queued piece silently re-entered shipping the moment it completed
+    // again, wearing a stage it never re-earned.
+    const toPending = requeueTo === "pending";
+    await client.query(
+      `
+        UPDATE order_pieces
+           SET status                        = $3,
+               assigned_printer_id           = CASE WHEN $4 THEN NULL ELSE assigned_printer_id END,
+               assigned_nozzle_asset_id      = CASE WHEN $4 THEN NULL ELSE assigned_nozzle_asset_id END,
+               resin_tank_id                 = CASE WHEN $4 THEN NULL ELSE resin_tank_id END,
+               fulfilment_status             = 'none',
+               slicer_file_url               = NULL,
+               slicer_file_uploaded_at       = NULL,
+               slicer_print_time_minutes     = NULL,
+               slicer_filament_used_grams    = NULL,
+               slicer_resin_used_ml          = NULL,
+               post_process_state            = NULL,
+               post_process_state_entered_at = NULL,
+               scheduled_at                  = NULL,
+               scheduled_start_at            = NULL,
+               scheduled_end_at              = NULL,
+               print_started_at              = NULL,
+               print_completed_at            = NULL,
+               actual_print_time_minutes     = NULL,
+               actual_filament_used_grams    = NULL
+         WHERE company_id = $1 AND piece_id = $2
+      `,
+      [companyId, pieceId, requeueTo, toPending]
+    );
+    // Re-derive the order's rollup status inside the same transaction.
+    await recomputeOrderStatusTx(client, companyId, piece.order_id);
   }
 
   /** Best-effort failure log into the shared order_history feed. Mirrors the
