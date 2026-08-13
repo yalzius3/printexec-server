@@ -34,6 +34,11 @@ export const updateBedFilesSchema = z.object({
   stl_file_url: fileUrl.nullable().optional(),
   slicer_print_time_minutes: z.number().int().positive().max(100_000).nullable().optional(),
   slicer_filament_used_grams: z.number().positive().max(100_000).nullable().optional(),
+  // Resin's counterparts. A plate is one technology, so exactly one of the two
+  // quantity fields is ever meaningful on a given bed — the service picks which
+  // by the bed's required_print_technology rather than trusting the caller.
+  slicer_resin_used_ml: z.number().positive().max(1_000_000).nullable().optional(),
+  resin_tank_id: uuid.nullable().optional(),
 }).strict().refine(
   (v) => Object.values(v).some((x) => x !== undefined),
   { message: "Provide at least one field to update." }

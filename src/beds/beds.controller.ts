@@ -28,13 +28,20 @@ import {
 const uuid = z.string().uuid();
 const assignBedSchema = z.object({
   printer_id: uuid,
-  nozzle_asset_id: uuid,
+  // Optional because a resin (MSLA/SLA) plate has no nozzle at all. The service
+  // decides which technology's fields are required from the bed's own
+  // required_print_technology, and rejects the wrong ones — so this being
+  // optional here widens the schema, never the rules.
+  nozzle_asset_id: uuid.optional(),
   // Optional: when omitted the service keeps the bed's existing time, or seeds
   // an assumed value from the constituent pieces' quote numbers.
   slicer_print_time_minutes: z.number().int().positive().max(100_000).nullable().optional(),
   slicer_file_url: z.string().min(1).nullable().optional(),
   stl_file_url: z.string().min(1).nullable().optional(),
   slicer_filament_used_grams: z.number().positive().max(100_000).nullable().optional(),
+  // Resin's counterparts of nozzle + grams.
+  slicer_resin_used_ml: z.number().positive().max(1_000_000).nullable().optional(),
+  resin_tank_id: uuid.nullable().optional(),
 }).strict();
 
 // One-field nozzle swap (assigned/ready beds; printer's compat table only).

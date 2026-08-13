@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import type { PoolClient } from "pg";
 import { DatabaseService } from "../database/database.service";
-import { JobsService, isResinTech } from "../jobs/jobs.service";
+import { JobsService, colorCompatible, isResinTech, techFamily } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
 import { FinanceService } from "../finance/finance.service";
 import {
@@ -44,15 +44,6 @@ type RequeueablePiece = {
   slicer_resin_used_ml: string | null;
 };
 
-// Simple mode treats both resin technologies as one family — assigning an SLA
-// part to an MSLA printer (or vice-versa) is fine; only cross-family is
-// physically impossible and gets blocked.
-function techFamily(tech: string): string {
-  const t = tech.trim().toUpperCase();
-  if (t === "SLA" || t === "MSLA") return "RESIN";
-  return t; // FDM, SLS, …
-}
-
 @Injectable()
 export class SimpleJobsService {
   constructor(
@@ -62,9 +53,21 @@ export class SimpleJobsService {
     private readonly finance: FinanceService
   ) {}
 
-  // Pieces for orders that live in the company's CURRENT mode — so Simple only
-  // ever sees Simple work (and vice-versa), reversibly. Shape matches the
-  // JobRow the Advanced queue returns, so the grid is interchangeable.
+  // Every piece the company has, full stop.
+  //
+  // This used to be scoped to orders whose operation_mode matched the company's
+  // — the two-workspace world, where Simple and Advanced each showed only their
+  // own work and the mode was reversible. Advanced is retired end to end: the
+  // client has no mode toggle and no Advanced workspace to switch back to. What
+  // survived was a filter that can only ever HIDE work, and it hides it with no
+  // error at all — a company still stamped 'advanced' from the pre-2026-07-21
+  // column default (that migration changed the DEFAULT, not existing rows) shows
+  // an empty queue while every order sits there in the database. Any order
+  // predating a mode flip does the same thing individually, because the insert
+  // trigger stamps the mode that was current when the order was written.
+  //
+  // There is no longer a second mode for a piece to belong to, so there is
+  // nothing left to filter on.
   async listQueue(companyId: string) {
     const result = await this.db.query(
       `
@@ -98,7 +101,6 @@ export class SimpleJobsService {
         LEFT JOIN printer_instances pi
           ON pi.printer_id = op.assigned_printer_id
         WHERE op.company_id = $1
-          AND o.operation_mode = (SELECT operation_mode FROM companies WHERE company_id = $1)
         ORDER BY LOWER(op.piece_name) ASC, op.created_at ASC
       `,
       [companyId]
@@ -125,7 +127,10 @@ export class SimpleJobsService {
     pieceIds: string[],
     printerId: string,
     nozzleId?: string,
-    nozzleIds?: string[]
+    nozzleIds?: string[],
+    /** Resin's counterpart of `nozzleId`: the operator overrode which tank this
+     *  batch pours from. Omitted = auto-resolve (see resolveTankFor). */
+    resinTankId?: string
   ) {
     const printerResult = await this.db.query<{ print_technology: string | null }>(
       `
@@ -187,9 +192,10 @@ export class SimpleJobsService {
     const printerTech = (printer.print_technology ?? "").trim().toUpperCase();
     const resinTanks = isResinPrinter
       ? (
-          await this.db.query<{ asset_id: string; free_ml: string | null }>(
+          await this.db.query<{ asset_id: string; free_ml: string | null; resin_color: string | null }>(
             `
               SELECT ai.asset_id,
+                     ai.resin_color,
                      COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0) AS free_ml
                 FROM asset_instances ai
                 JOIN asset_stock ast ON ast.asset_id = ai.asset_id
@@ -206,12 +212,35 @@ export class SimpleJobsService {
           )
         ).rows
       : [];
-    /** The emptiest tank that still covers `needMl` (any tank when the volume
-     *  isn't known yet — the operator fills it in at the slicer step). */
-    const resolveTankFor = (needMl: number | null): string | null => {
-      if (resinTanks.length === 0) return null;
-      if (needMl == null || !(needMl > 0)) return resinTanks[resinTanks.length - 1]?.asset_id ?? null;
-      const fits = resinTanks.find((t) => Number(t.free_ml ?? 0) >= needMl);
+    // An explicit tank must be a real, usable tank for THIS printer — validated
+    // against the same roster the auto-resolver draws from, so an override can
+    // never smuggle in an expired or wrong-light-source bottle that the
+    // automatic path would have refused.
+    if (resinTankId) {
+      if (!isResinPrinter) {
+        throw new BadRequestException("Resin tanks only apply to MSLA/SLA printers.");
+      }
+      if (!resinTanks.some((t) => t.asset_id === resinTankId)) {
+        throw new BadRequestException(
+          "That resin tank is unavailable for this printer — it may be empty, expired, split, or formulated for the other resin technology."
+        );
+      }
+    }
+    /** The emptiest tank of the RIGHT COLOUR that still covers `needMl` (any
+     *  volume when it isn't known yet — the operator fills it in at the slicer
+     *  step). An explicit pick always wins: the operator can see the vat.
+     *
+     *  Colour is a hard filter here because a resin part comes out the colour of
+     *  the liquid it was cured from — there is no way to correct it afterwards,
+     *  so pouring a blue print from the yellow vat scraps the part. An
+     *  unrecorded colour on either side stays a wildcard (see colorCompatible),
+     *  so shops that don't track colour are unaffected. */
+    const resolveTankFor = (needMl: number | null, wantColor: string | null): string | null => {
+      if (resinTankId) return resinTankId;
+      const usable = resinTanks.filter((t) => colorCompatible(wantColor, t.resin_color));
+      if (usable.length === 0) return null;
+      if (needMl == null || !(needMl > 0)) return usable[usable.length - 1]?.asset_id ?? null;
+      const fits = usable.find((t) => Number(t.free_ml ?? 0) >= needMl);
       // Nothing covers it: leave it unlinked rather than pick a tank that will
       // fail the volume check at schedule time with a confusing error.
       return fits?.asset_id ?? null;
@@ -256,13 +285,17 @@ export class SimpleJobsService {
       required_print_technology: string | null;
       required_nozzle_diameter_mm: number | null;
       required_nozzle_material: string | null;
+      required_color: string | null;
       status: string;
       requires_multicolor: boolean | null;
       cost_inputs: { grams?: string[]; time?: string; failure?: string } | null;
     }>(
       `
         SELECT piece_id, piece_name, required_print_technology,
-               required_nozzle_diameter_mm, required_nozzle_material, status,
+               required_nozzle_diameter_mm, required_nozzle_material,
+               -- Resin's material constraint. A resin part cures the colour of
+               -- the vat, so this is what decides which tank can print it.
+               required_color, status,
                requires_multicolor, cost_inputs
         FROM order_pieces
         WHERE company_id = $1
@@ -272,6 +305,10 @@ export class SimpleJobsService {
     );
 
     const skipped: { piece_id: string; piece_name: string; reason: string }[] = [];
+    // Pieces that WERE assigned but stopped short of 'ready', with the reason.
+    // Distinct from `skipped` (not assigned at all) — the operator needs to tell
+    // "I did nothing with this" apart from "I did half of it, here's the rest".
+    const notes: { piece_id: string; piece_name: string; note: string }[] = [];
     // Group assignable pieces by (nozzle, assumed time, assumed grams) so each
     // distinct combination is a single UPDATE (nozzle null = none resolved →
     // keep existing).
@@ -325,7 +362,23 @@ export class SimpleJobsService {
       // piece grid's quantity column carries the row's own unit. So it seeds the
       // resin draw, and picks the tank that can cover it.
       const pieceIsResin = isResinTech(piece.required_print_technology);
-      const tank = pieceIsResin ? resolveTankFor(assumed.grams) : null;
+      const tank = pieceIsResin ? resolveTankFor(assumed.grams, piece.required_color) : null;
+      // The piece IS assigned either way — it just can't reach 'ready' without a
+      // tank, and until now it parked at 'assigned' with nothing said. Silence is
+      // the specific thing that made every earlier resin gap so expensive to
+      // diagnose, so name the blocker instead of leaving the operator to infer it.
+      if (pieceIsResin && !tank) {
+        const wanted = (piece.required_color ?? "").trim();
+        notes.push({
+          piece_id: piece.piece_id,
+          piece_name: piece.piece_name,
+          note: resinTanks.length === 0
+            ? "assigned, but no usable resin tank exists — add one to reach ready"
+            : wanted && !resinTanks.some((t) => colorCompatible(wanted, t.resin_color))
+              ? `assigned, but no ${wanted} resin tank is available — it needs one to reach ready`
+              : "assigned, but no resin tank has enough volume left — it needs one to reach ready",
+        });
+      }
       const key = `${nozzle ?? ""}|${tank ?? ""}|${assumed.minutes ?? ""}|${assumed.grams ?? ""}|${pieceIsResin ? "r" : "f"}`;
       let g = groups.get(key);
       if (!g) {
@@ -433,6 +486,7 @@ export class SimpleJobsService {
     return {
       assigned: assignedCount,
       skipped,
+      notes,
       ready_ids: readyRes.rows.map((r) => r.piece_id),
     };
   }
@@ -787,7 +841,7 @@ export class SimpleJobsService {
     }
     if (piece.bed_id) {
       throw new BadRequestException(
-        "This piece is part of a bed — move the whole bed from the Advanced workspace instead."
+        "This piece is packed on a bed — schedule or move the whole bed instead."
       );
     }
     if (requeueTo === "assigned" && !piece.assigned_printer_id) {
@@ -1027,6 +1081,11 @@ export class SimpleJobsService {
     const nozzleReq = new Map<string, { key: string; diameter_mm: number | null; material: string | null; label: string; piece_count: number }>();
     const reqKey = (dia: number | null, mat: string | null) =>
       `${dia != null ? Number(dia) : ""}|${(mat ?? "").trim().toLowerCase()}`;
+    // Resin's counterpart of a nozzle requirement: the colours the selection
+    // demands. Distinct, case-insensitive, blanks dropped (a piece with no
+    // colour constrains nothing). Only resin pieces contribute — an FDM piece
+    // gets its colour from a spool, which is a different mechanism entirely.
+    const resinColorSet = new Map<string, string>();
     if (pieceIds && pieceIds.length > 0) {
       const reqRes = await this.db.query<{
         required_print_technology: string | null;
@@ -1034,10 +1093,11 @@ export class SimpleJobsService {
         requires_multicolor: boolean | null;
         required_nozzle_diameter_mm: number | null;
         required_nozzle_material: string | null;
+        required_color: string | null;
       }>(
         `
           SELECT required_print_technology, required_multicolor_capable, requires_multicolor,
-                 required_nozzle_diameter_mm, required_nozzle_material
+                 required_nozzle_diameter_mm, required_nozzle_material, required_color
           FROM order_pieces
           WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
         `,
@@ -1046,6 +1106,10 @@ export class SimpleJobsService {
       for (const r of reqRes.rows) {
         if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
         if (r.required_multicolor_capable || r.requires_multicolor) requireMulticolor = true;
+        if (isResinTech(r.required_print_technology)) {
+          const c = (r.required_color ?? "").trim();
+          if (c) resinColorSet.set(c.toLowerCase(), c);
+        }
         // A resin printer has no nozzle, so a resin piece must never contribute a
         // nozzle requirement — otherwise the picker asks for a nozzle no resin
         // machine can offer and returns an empty list. Checked on the TECHNOLOGY
@@ -1089,6 +1153,12 @@ export class SimpleJobsService {
       for (const r of bedRes.rows) {
         if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
         if (r.required_multicolor_capable) requireMulticolor = true;
+        // Same rule the piece branch above applies, and it was missing here: a
+        // resin PLATE has no nozzle either. A bed whose technology was switched
+        // to MSLA/SLA still carries its old diameter/material, so testing the
+        // columns instead of the technology let a resin bed demand a nozzle no
+        // resin machine can offer — and the picker then showed an empty list.
+        if (isResinTech(r.required_print_technology)) continue;
         const dia = r.required_nozzle_diameter_mm != null ? Number(r.required_nozzle_diameter_mm) : null;
         const mat = r.required_nozzle_material;
         if (dia == null && !mat) continue;
@@ -1101,7 +1171,28 @@ export class SimpleJobsService {
           piece_count: 1,
         });
       }
+      // print_beds has no required_color of its own — unlike the nozzle spec,
+      // colour was never duplicated onto the plate — so a resin plate's colour
+      // demand is the union of the colours of the parts packed on it. In
+      // practice a plate is one colour (it is one pour), but deriving rather
+      // than assuming keeps a mixed plate honest: it will match no tank and say
+      // so, instead of silently pouring one of the two colours.
+      const bedResin = bedRes.rows.some((r) => isResinTech(r.required_print_technology));
+      if (bedResin) {
+        const bedColors = await this.db.query<{ required_color: string | null }>(
+          `SELECT DISTINCT required_color
+             FROM order_pieces
+            WHERE company_id = $1 AND bed_id = $2
+              AND NULLIF(TRIM(required_color), '') IS NOT NULL`,
+          [companyId, bedId]
+        );
+        for (const r of bedColors.rows) {
+          const c = (r.required_color ?? "").trim();
+          if (c) resinColorSet.set(c.toLowerCase(), c);
+        }
+      }
     }
+    const resinColorsWanted = Array.from(resinColorSet.values());
     const requirements = Array.from(nozzleReq.values()).sort(
       (a, b) => (a.diameter_mm ?? 0) - (b.diameter_mm ?? 0) || a.label.localeCompare(b.label)
     );
@@ -1120,9 +1211,14 @@ export class SimpleJobsService {
     // The selection spans more than one technology family (e.g. an FDM piece and
     // a resin piece) — no single printer can run them all.
     if (techFamilies.size > 1) {
-      return { window_end: windowEnd.toISOString(), printers: [] };
+      return { window_end: windowEnd.toISOString(), is_resin: false, printers: [] };
     }
     const requiredFamily = techFamilies.size === 1 ? [...techFamilies][0] : null;
+    // Announced to the picker so it can drop every nozzle affordance rather than
+    // render them empty. The picker cannot infer this from `requirements` being
+    // empty — a single unconstrained FDM piece also has no requirements, and
+    // that one DOES still need a nozzle chosen.
+    const isResinTarget = requiredFamily === "RESIN";
 
     // $1 = company, $2 = window end. Compatibility filters add params after.
     const params: unknown[] = [companyId, windowEnd.toISOString()];
@@ -1258,16 +1354,82 @@ export class SimpleJobsService {
       satisfies: string[];
     };
     const nozzlesByPrinter = new Map<string, NozzleOut[]>();
-    for (const n of nozzlesResult.rows) {
-      const arr = nozzlesByPrinter.get(n.printer_id) ?? [];
-      arr.push({
-        nozzle_asset_id: n.nozzle_asset_id,
-        nozzle_diameter_mm: n.nozzle_diameter_mm,
-        nozzle_material: n.nozzle_material,
-        nozzle_status: n.nozzle_status,
-        satisfies: requirements.filter((req) => nozzleSatisfies(n, req)).map((req) => req.key),
-      });
-      nozzlesByPrinter.set(n.printer_id, arr);
+    // A resin target gets NO nozzle roster at all — not even a stale one. Some
+    // shops have linked nozzle assets to a resin machine by accident, and the
+    // picker would then offer hardware that physically cannot be fitted.
+    if (!isResinTarget) {
+      for (const n of nozzlesResult.rows) {
+        const arr = nozzlesByPrinter.get(n.printer_id) ?? [];
+        arr.push({
+          nozzle_asset_id: n.nozzle_asset_id,
+          nozzle_diameter_mm: n.nozzle_diameter_mm,
+          nozzle_material: n.nozzle_material,
+          nozzle_status: n.nozzle_status,
+          satisfies: requirements.filter((req) => nozzleSatisfies(n, req)).map((req) => req.key),
+        });
+        nozzlesByPrinter.set(n.printer_id, arr);
+      }
+    }
+
+    // ── Resin's counterpart of the nozzle roster: the tanks this job could be
+    //    poured from. Unlike nozzles a tank is not bound to a printer, so this
+    //    is one fleet-wide list rather than a per-printer one. Read-only info
+    //    for the picker (which tank the one-click assign will use, and how much
+    //    is left in it) plus the material for an explicit override.
+    type TankOut = {
+      tank_asset_id: string;
+      label: string | null;
+      free_ml: number | null;
+      tech_compat: string;
+      expiry_date: string | null;
+      /** Colour name + optional swatch, so the picker can show what will
+       *  actually come off the plate rather than just a bottle name. */
+      color: string | null;
+      hex: string | null;
+    };
+    let resinTanks: TankOut[] = [];
+    if (isResinTarget) {
+      const tanksRes = await this.db.query<{
+        asset_id: string; label: string | null; free_ml: string | null;
+        tech_compat: string; expiry_date: string | null;
+        color: string | null; hex: string | null;
+      }>(
+        `SELECT ai.asset_id,
+                NULLIF(TRIM(CONCAT_WS(' ', ai.resin_brand, ai.resin_type, ai.resin_color)), '') AS label,
+                (COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0))::text AS free_ml,
+                COALESCE(ai.resin_tech_compat, 'both') AS tech_compat,
+                ai.resin_expiry_date::text AS expiry_date,
+                NULLIF(TRIM(ai.resin_color), '') AS color,
+                NULLIF(TRIM(ai.resin_hex), '') AS hex
+           FROM asset_instances ai
+           LEFT JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'resin_tank'
+            AND ai.split_at IS NULL
+            AND (ai.resin_expiry_date IS NULL OR ai.resin_expiry_date >= CURRENT_DATE)
+          ORDER BY (COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0)) DESC`,
+        [companyId]
+      );
+      // Only tanks that can actually produce the requested colour. Showing a
+      // yellow tank to a blue print is offering the operator a way to scrap the
+      // part — the cure is permanent. When the selection spans several colours,
+      // a tank qualifies if it can serve ANY of them (the operator assigns them
+      // one at a time from here); an unrecorded colour on either side is a
+      // wildcard, so shops that don't track colour see no change at all.
+      resinTanks = tanksRes.rows
+        .filter((t) =>
+          resinColorsWanted.length === 0 ||
+          resinColorsWanted.some((want) => colorCompatible(want, t.color))
+        )
+        .map((t) => ({
+          tank_asset_id: t.asset_id,
+          label: t.label,
+          free_ml: t.free_ml == null ? null : Number(t.free_ml),
+          tech_compat: t.tech_compat,
+          expiry_date: t.expiry_date,
+          color: t.color,
+          hex: t.hex,
+        }));
     }
 
     const windowMinutes = (windowEnd.getTime() - now.getTime()) / 60000;
@@ -1314,7 +1476,15 @@ export class SimpleJobsService {
     printers.sort((a, b) => tier(a) - tier(b));
     return {
       window_end: windowEnd.toISOString(),
+      // The picker keys its whole nozzle-vs-tank presentation off this. See the
+      // note at isResinTarget for why an empty `requirements` list isn't enough.
+      is_resin: isResinTarget,
       requirements,
+      // The colours this selection demands. The picker shows them so an empty
+      // tank list reads as "no BLACK tank" rather than "no tanks", which is the
+      // difference between a 5-second fix and a support ticket.
+      resin_colors_wanted: resinColorsWanted,
+      resin_tanks: resinTanks,
       printers,
     };
   }
@@ -1613,11 +1783,19 @@ export class SimpleJobsService {
     } catch { /* print_beds not migrated yet */ }
     // Spool reservations occupy the window of their standalone piece — or of
     // their parent BED (bed reservations anchor on a windowless child piece).
+    // The resin arm is the tank column on the piece itself (resin has no join
+    // table — a print draws from exactly one tank). Both arms feed the SAME
+    // materialBusy map, so "a tank can't be in two vats at once" is enforced by
+    // the identical code path that stops one spool feeding two printers.
     const spoolRes = await this.db.query<{ spool_asset_id: string; piece_id: string; bed_id: string | null }>(
       `SELECT ops.spool_asset_id, ops.piece_id, op.bed_id
          FROM order_piece_spools ops
          JOIN order_pieces op ON op.piece_id = ops.piece_id
-        WHERE ops.company_id = $1`,
+        WHERE ops.company_id = $1
+       UNION
+       SELECT op.resin_tank_id AS spool_asset_id, op.piece_id, op.bed_id
+         FROM order_pieces op
+        WHERE op.company_id = $1 AND op.resin_tank_id IS NOT NULL`,
       [companyId]
     );
     for (const r of spoolRes.rows) {
@@ -1635,6 +1813,12 @@ export class SimpleJobsService {
       // The nozzle SPEC the piece needs, which is what makes substitution
       // possible: any nozzle meeting this spec will print it identically.
       req_dia: number | null; req_mat: string | null;
+      // A resin job has no nozzle and no spool — it has a tank. Carried per
+      // candidate because every nozzle/spool step below has to be skipped for
+      // it rather than failed: without this the "missing printer/nozzle/print
+      // time" gate dropped EVERY resin job, so auto-schedule silently packed
+      // the FDM backlog and left the resin backlog untouched.
+      is_resin: boolean;
       /** printer + nozzle spec; filled in just before ordering. */
       setupKey?: string;
     };
@@ -1645,10 +1829,12 @@ export class SimpleJobsService {
         assigned_printer_id: string | null; assigned_nozzle_asset_id: string | null;
         slicer_print_time_minutes: number | null; deadline: string | null;
         required_nozzle_diameter_mm: number | null; required_nozzle_material: string | null;
+        required_print_technology: string | null;
       }>(
         `SELECT op.piece_id, op.piece_name, op.status, op.assigned_printer_id,
                 op.assigned_nozzle_asset_id, op.slicer_print_time_minutes,
                 op.required_nozzle_diameter_mm, op.required_nozzle_material,
+                op.required_print_technology,
                 o.deadline::text AS deadline
            FROM order_pieces op
            JOIN orders o ON o.order_id = op.order_id
@@ -1663,6 +1849,7 @@ export class SimpleJobsService {
           deadline: p.deadline,
           req_dia: p.required_nozzle_diameter_mm != null ? Number(p.required_nozzle_diameter_mm) : null,
           req_mat: p.required_nozzle_material,
+          is_resin: isResinTech(p.required_print_technology),
         });
       }
     }
@@ -1672,10 +1859,12 @@ export class SimpleJobsService {
         assigned_printer_id: string | null; assigned_nozzle_asset_id: string | null;
         slicer_print_time_minutes: number | null; deadline: string | null;
         required_nozzle_diameter_mm: number | null; required_nozzle_material: string | null;
+        required_print_technology: string | null;
       }>(
         `SELECT bed_id, bed_name, status, assigned_printer_id, assigned_nozzle_asset_id,
                 slicer_print_time_minutes, required_nozzle_diameter_mm,
-                required_nozzle_material, effective_deadline::text AS deadline
+                required_nozzle_material, required_print_technology,
+                effective_deadline::text AS deadline
            FROM print_beds
           WHERE company_id = $1 AND bed_id = ANY($2::uuid[])`,
         [companyId, bedIds]
@@ -1688,6 +1877,7 @@ export class SimpleJobsService {
           deadline: b.deadline,
           req_dia: b.required_nozzle_diameter_mm != null ? Number(b.required_nozzle_diameter_mm) : null,
           req_mat: b.required_nozzle_material,
+          is_resin: isResinTech(b.required_print_technology),
         });
       }
     }
@@ -1785,11 +1975,21 @@ export class SimpleJobsService {
     }
     const reservedByBed = new Map<string, string[]>();
     if (bedIds.length > 0) {
+      // Same UNION as the per-piece query above, for the same reason: a resin
+      // plate's material commitment is the TANK on its constituent pieces, not
+      // a row in order_piece_spools. Without the second arm a resin bed booked
+      // zero material time, so the packer would happily start a second resin
+      // job on the very tank this plate is pouring from.
       const r = await this.db.query<{ bed_id: string; spool_asset_id: string }>(
         `SELECT DISTINCT op.bed_id, ops.spool_asset_id
            FROM order_piece_spools ops
            JOIN order_pieces op ON op.piece_id = ops.piece_id
-          WHERE ops.company_id = $1 AND op.bed_id = ANY($2::uuid[])`,
+          WHERE ops.company_id = $1 AND op.bed_id = ANY($2::uuid[])
+         UNION
+         SELECT DISTINCT op.bed_id, op.resin_tank_id AS spool_asset_id
+           FROM order_pieces op
+          WHERE op.company_id = $1 AND op.bed_id = ANY($2::uuid[])
+            AND op.resin_tank_id IS NOT NULL`,
         [companyId, bedIds]
       );
       for (const row of r.rows) {
@@ -1825,7 +2025,10 @@ export class SimpleJobsService {
           id: c.id, is_bed: c.is_bed, name: c.name,
           reason: c.status === "scheduled" || c.status === "printing"
             ? "already on the board"
-            : `not ready yet ('${c.status}' — needs printer, nozzle and print data)`,
+            // Name the hardware this job actually needs. Telling a resin
+            // operator their piece "needs a nozzle" sends them looking for a
+            // part their printer does not have.
+            : `not ready yet ('${c.status}' — needs printer, ${c.is_resin ? "resin tank" : "nozzle"} and print data)`,
         });
         continue;
       }
@@ -1834,8 +2037,17 @@ export class SimpleJobsService {
       // same gate. It used to be waved through without a nozzle, which meant a
       // bed booked no nozzle time and could be double-booked against a piece
       // using the very same nozzle.
-      if (!c.printer_id || c.minutes == null || c.minutes <= 0 || !c.nozzle_id) {
-        skipped.push({ id: c.id, is_bed: c.is_bed, name: c.name, reason: "missing printer/nozzle/print time" });
+      // A resin machine has no nozzle at all, so the nozzle half of this gate
+      // must be asked only of the technologies that HAVE one. Asked
+      // unconditionally it rejected every resin job here — before any placement
+      // ran — which is why auto-schedule appeared to work while quietly leaving
+      // the entire resin backlog unplaced. Resin's own required resource (the
+      // tank) is enforced by schedule() and by the material timeline below.
+      if (!c.printer_id || c.minutes == null || c.minutes <= 0 || (!c.is_resin && !c.nozzle_id)) {
+        skipped.push({
+          id: c.id, is_bed: c.is_bed, name: c.name,
+          reason: c.is_resin ? "missing printer/print time" : "missing printer/nozzle/print time",
+        });
         continue;
       }
 
@@ -1854,18 +2066,39 @@ export class SimpleJobsService {
             `SELECT DISTINCT ops.spool_asset_id
                FROM order_piece_spools ops
                JOIN order_pieces op ON op.piece_id = ops.piece_id
-              WHERE ops.company_id = $1 AND op.bed_id = $2`,
+              WHERE ops.company_id = $1 AND op.bed_id = $2
+             UNION
+             SELECT DISTINCT op.resin_tank_id
+               FROM order_pieces op
+              WHERE op.company_id = $1 AND op.bed_id = $2
+                AND op.resin_tank_id IS NOT NULL`,
             [companyId, c.id]
           );
           return r.rows.map((x) => x.spool_asset_id);
         }
         const r = await this.db.query<{ spool_asset_id: string }>(
-          `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+          `SELECT spool_asset_id FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2
+           UNION
+           SELECT resin_tank_id FROM order_pieces
+            WHERE company_id = $1 AND piece_id = $2 AND resin_tank_id IS NOT NULL`,
           [companyId, c.id]
         );
         return r.rows.map((x) => x.spool_asset_id);
       };
       mySpools = (c.is_bed ? reservedByBed.get(c.id) : reservedByPiece.get(c.id)) ?? [];
+      if (mySpools.length === 0 && c.is_resin) {
+        // Resin has no auto-planner to fall back on, and that is deliberate: a
+        // spool is chosen from stock by material family, but a tank is POURED
+        // INTO THE MACHINE by hand. The operator picks it; we never guess.
+        // Sending resin down the filament planner below produced the nonsense
+        // "no spool in stock covers this piece's filament" on a job that has no
+        // filament — say the true thing instead.
+        skipped.push({
+          id: c.id, is_bed: c.is_bed, name: c.name,
+          reason: `link a resin tank to this ${c.is_bed ? "bed" : "piece"} before scheduling`,
+        });
+        continue;
+      }
       if (mySpools.length === 0) {
         const what = c.is_bed ? "bed" : "piece";
         if (dryRun) {
@@ -1874,12 +2107,19 @@ export class SimpleJobsService {
           // instead of ignoring a constraint the real run enforces.
           willReserveSpool = true;
           try {
+            // A resin plate's planner returns null (it pours from a tank, which
+            // is never auto-planned). Unreachable here — the resin arm above
+            // already `continue`d — but narrowed rather than asserted, so the
+            // day someone reorders these branches it fails loudly instead of
+            // dereferencing null in the packer.
             const plan = c.is_bed
               ? await this.bedsService.filamentPlan(companyId, c.id)
               : await this.jobsService.filamentPlan(companyId, c.id);
-            mySpools = plan.multicolor
-              ? plan.slots.flatMap((s) => s.allocation.map((a) => a.spool_asset_id))
-              : plan.allocation.map((a) => a.spool_asset_id);
+            mySpools = !plan
+              ? []
+              : plan.multicolor
+                ? plan.slots.flatMap((s) => s.allocation.map((a) => a.spool_asset_id))
+                : plan.allocation.map((a) => a.spool_asset_id);
             if (mySpools.length === 0) {
               skipped.push({
                 id: c.id, is_bed: c.is_bed, name: c.name,

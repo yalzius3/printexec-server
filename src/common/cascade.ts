@@ -459,13 +459,19 @@ export function quoteAssumedMeta(
 }
 
 /**
- * Copy slicer metadata (print time + filament grams — NOT the file) from one
- * piece to its literal duplicates: same order, same name, same spec, still
+ * Copy slicer metadata (print time + the quantity consumed — NOT the file) from
+ * one piece to its literal duplicates: same order, same name, same spec, still
  * below 'ready', metadata missing. Slicing is deterministic, so two identical
- * pieces consume identical time/filament — entering it once should cover both.
+ * pieces consume identical time/material — entering it once should cover both.
+ *
+ * The quantity is copied in the piece's OWN unit: grams for filament,
+ * millilitres for resin. Written against grams alone, this both failed to carry
+ * a resin clone's volume AND could never flip it to 'ready' (a resin piece has
+ * no nozzle and no gram figure, so every arm of the old test was false) — so
+ * resin duplicates silently stayed behind while their FDM twins went ready.
  *
  * Fills only what's missing (COALESCE keeps operator-entered values) and flips
- * an 'assigned' duplicate that now has printer + nozzle + both numbers to
+ * an 'assigned' duplicate that now has everything its technology needs to
  * 'ready'. Multicolor pieces are excluded: their per-slot grams must stay in
  * sync with the piece total, which a flat copy can't guarantee.
  *
@@ -483,25 +489,41 @@ export async function propagateSlicerMetaToDuplicatesTx(
         UPDATE order_pieces dup
            SET slicer_print_time_minutes  = COALESCE(dup.slicer_print_time_minutes,  src.slicer_print_time_minutes),
                slicer_filament_used_grams = COALESCE(dup.slicer_filament_used_grams, src.slicer_filament_used_grams),
+               slicer_resin_used_ml       = COALESCE(dup.slicer_resin_used_ml,       src.slicer_resin_used_ml),
+               -- The tank travels with the volume: two identical resin parts in
+               -- one order pour from the same bottle unless someone says
+               -- otherwise, and a volume with no tank can't reach 'ready'.
+               resin_tank_id              = COALESCE(dup.resin_tank_id,              src.resin_tank_id),
                status = CASE
                  WHEN dup.status = 'assigned'
                   AND dup.assigned_printer_id IS NOT NULL
-                  AND dup.assigned_nozzle_asset_id IS NOT NULL
-                  AND COALESCE(dup.slicer_print_time_minutes,  src.slicer_print_time_minutes)  IS NOT NULL
-                  AND COALESCE(dup.slicer_filament_used_grams, src.slicer_filament_used_grams) IS NOT NULL
+                  AND COALESCE(dup.slicer_print_time_minutes, src.slicer_print_time_minutes) IS NOT NULL
+                  AND CASE WHEN dup.required_print_technology IN ('MSLA', 'SLA') THEN
+                        COALESCE(dup.slicer_resin_used_ml, src.slicer_resin_used_ml) IS NOT NULL
+                        AND COALESCE(dup.resin_tank_id, src.resin_tank_id) IS NOT NULL
+                      ELSE
+                        dup.assigned_nozzle_asset_id IS NOT NULL
+                        AND COALESCE(dup.slicer_filament_used_grams, src.slicer_filament_used_grams) IS NOT NULL
+                      END
                  THEN 'ready'
                  ELSE dup.status
                END
           FROM order_pieces src
          WHERE src.company_id = $1 AND src.piece_id = $2
-           AND (src.slicer_print_time_minutes IS NOT NULL OR src.slicer_filament_used_grams IS NOT NULL)
+           AND (src.slicer_print_time_minutes IS NOT NULL
+                OR src.slicer_filament_used_grams IS NOT NULL
+                OR src.slicer_resin_used_ml IS NOT NULL)
            AND dup.company_id = src.company_id
            AND dup.order_id   = src.order_id
            AND dup.piece_id  <> src.piece_id
            AND dup.bed_id IS NULL
            AND LOWER(TRIM(dup.piece_name)) = LOWER(TRIM(src.piece_name))
            AND dup.status IN ('pending', 'assigned')
-           AND (dup.slicer_print_time_minutes IS NULL OR dup.slicer_filament_used_grams IS NULL)
+           AND (dup.slicer_print_time_minutes IS NULL
+                OR CASE WHEN dup.required_print_technology IN ('MSLA', 'SLA')
+                        THEN dup.slicer_resin_used_ml IS NULL
+                        ELSE dup.slicer_filament_used_grams IS NULL
+                   END)
            AND dup.required_print_technology    IS NOT DISTINCT FROM src.required_print_technology
            AND dup.required_filament_ref_id     IS NOT DISTINCT FROM src.required_filament_ref_id
            AND dup.required_filament_material   IS NOT DISTINCT FROM src.required_filament_material

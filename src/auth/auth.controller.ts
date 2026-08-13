@@ -504,35 +504,15 @@ export class AuthController {
     return this.composeProfile(userId);
   }
 
-  // Owner-only: switch the company between 'advanced' and 'simple'. Soft — it
-  // never blocks; the client warns when the other mode still has active work.
-  // Returns the refreshed profile so the client can update in place.
-  @Post("operation-mode")
-  async setOperationMode(
-    @UserId() userId: string,
-    @CompanyId() companyId: string,
-    @UserRole() role: "owner" | "staff",
-    @Body() body: unknown
-  ) {
-    const parsed = z.object({ mode: z.enum(["advanced", "simple"]) }).safeParse(body);
-    if (!parsed.success) {
-      throw new BadRequestException("mode must be 'advanced' or 'simple'.");
-    }
-
-    // Owner-only mutation. The guard already loaded the profile, so we gate on
-    // the request context instead of re-querying users.
-    if (role !== "owner") {
-      throw new UnauthorizedException("Only the company owner can change the operation mode.");
-    }
-
-    await this.db.query(
-      "UPDATE companies SET operation_mode = $1 WHERE company_id = $2",
-      [parsed.data.mode, companyId]
-    );
-
-    // Full profile, never a partial one — see composeProfile.
-    return this.composeProfile(userId);
-  }
+  // POST operation-mode is GONE. It switched the company between 'advanced' and
+  // 'simple' back when both workspaces existed. Advanced is retired end to end —
+  // the client has no toggle and no Advanced UI to switch into — so the only
+  // thing this endpoint could still do was strand a company in a mode with no
+  // interface. It is deliberately not replaced by a 410 stub: no client has
+  // called it since Advanced was retired, and a route that exists invites a
+  // caller. companies.operation_mode itself is left alone (dropping a NOT NULL
+  // column is a separate, riskier migration) — it is now inert everywhere that
+  // reads it.
 
   // Owner-only: set (or clear, with null) the company's logo URL. The file
   // itself is uploaded first via the generic POST /uploads, then its returned

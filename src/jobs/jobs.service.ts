@@ -40,40 +40,30 @@ import { JOB_STATUSES } from "./jobs.schemas";
 // don't change which printers can run the material. (Nozzle hardness for
 // CF/GF is a separate nozzle-compatibility concern, handled in Stage 3/4.)
 // ────────────────────────────────────────────────────────────
-export function materialFamily(raw: string): string {
-  const u = raw.toUpperCase().replace(/[^A-Z0-9]/g, " ").trim();
-  if (u.includes("PETG") || u.includes("PCTG")) return "PETG";
-  if (u.includes("PLA")) return "PLA";          // PLA, PLA+, PLA MATTE, SILK PLA, HTPLA, LW-PLA…
-  if (u.includes("ABS")) return "ABS";          // ABS, ABS+
-  if (u.includes("ASA")) return "ASA";          // ASA, ASA-CF, ASA-GF
-  if (u.includes("TPU") || u.includes("FLEX") || u.includes("TPE")) return "TPU";
-  if (u.includes("NYLON") || /\bPA\d*/.test(u) || u.startsWith("PA")) return "NYLON";
-  if (u.includes("HIPS")) return "HIPS";
-  if (u.includes("PVA")) return "PVA";
-  if (u.includes("PC")) return "PC";            // PC, PCPBT (PC blend)
-  // Fall back to the cleaned token so exotic materials still match by name.
-  return u.replace(/\s+/g, "");
-}
-function materialsCompatible(filamentMaterial: string, printerMaterial: string): boolean {
-  return materialFamily(filamentMaterial) === materialFamily(printerMaterial);
-}
+// The pure compatibility rules now live in matching.ts (sibling of packing.ts)
+// so they can be unit-tested — this file's Nest constructor parameter properties
+// make it unloadable by the test runner's strip-only TypeScript loader.
+// Imported for use below AND re-exported, so every existing
+// `from "../jobs/jobs.service"` import site keeps working unchanged.
+import {
+  materialFamily,
+  materialsCompatible,
+  isResinTech,
+  techFamily,
+  techCompatible,
+  sameColor,
+  colorCompatible,
+} from "./matching";
 
-// Color matching for color slots vs. spools. Simple color names should match
-// regardless of case ("Black" == "BLACK" == "black"), but distinct names stay
-// distinct ("green" != "blue"). Trim + lowercase is enough for the free-text
-// color field; operators who need finer distinction just type different names.
-/** The two resin technologies. A resin job is stocked, scheduled and finished
- *  differently from an FDM one — it draws millilitres from a tank instead of
- *  grams from a spool, and it isn't done when the printer stops. */
-export function isResinTech(tech: string | null | undefined): boolean {
-  if (!tech) return false;
-  const t = tech.trim().toUpperCase();
-  return t === "MSLA" || t === "SLA";
-}
-
-export function sameColor(a: string | null | undefined, b: string | null | undefined): boolean {
-  return (a ?? "").trim().toLowerCase() === (b ?? "").trim().toLowerCase();
-}
+export {
+  materialFamily,
+  materialsCompatible,
+  isResinTech,
+  techFamily,
+  techCompatible,
+  sameColor,
+  colorCompatible,
+};
 
 // ────────────────────────────────────────────────────────────
 // Row types — narrow shapes for the queries used below.
@@ -1963,6 +1953,29 @@ export class JobsService {
       : piece.slicer_filament_used_grams != null;
   }
 
+  /** Does this piece have everything its TECHNOLOGY needs to be schedulable?
+   *  Filament: printer + nozzle + time + grams. Resin: printer + tank + time +
+   *  millilitres. Mirrors BedsService.isBedSchedulable — the bed half of this
+   *  pair already existed, the piece half did not, so reprint() and restore()
+   *  each wrote the FILAMENT test by hand (`assigned_nozzle_asset_id && …`).
+   *  A resin piece has no nozzle and never will, so both silently demoted every
+   *  resin piece to 'assigned' and sent the operator back through a print-data
+   *  step for a piece that already had its numbers. */
+  private isPieceSchedulable(piece: {
+    assigned_printer_id: string | null;
+    assigned_nozzle_asset_id: string | null;
+    resin_tank_id?: string | null;
+    required_print_technology?: string | null;
+    slicer_print_time_minutes: number | null;
+    slicer_filament_used_grams: number | null;
+    slicer_resin_used_ml?: number | string | null;
+  }): boolean {
+    if (!piece.assigned_printer_id || !this.hasSlicerCoreData(piece)) return false;
+    return isResinTech(piece.required_print_technology)
+      ? !!piece.resin_tank_id
+      : !!piece.assigned_nozzle_asset_id;
+  }
+
   async unschedule(companyId: string, pieceId: string): Promise<JobRow> {
     const piece = await this.loadJob(companyId, pieceId);
     if (piece.status !== "scheduled") {
@@ -2133,12 +2146,11 @@ export class JobsService {
         `Only failed pieces can be re-queued for reprint (current: '${piece.status}').`
       );
     }
-    const target =
-      piece.assigned_printer_id && piece.assigned_nozzle_asset_id && this.hasSlicerCoreData(piece)
-        ? "ready"
-        : piece.assigned_printer_id
-          ? "assigned"
-          : "pending";
+    const target = this.isPieceSchedulable(piece)
+      ? "ready"
+      : piece.assigned_printer_id
+        ? "assigned"
+        : "pending";
     await this.databaseService.query(
       `UPDATE order_pieces
           SET status                     = $3,
@@ -2194,13 +2206,10 @@ export class JobsService {
           "Cannot restore as 'assigned': the piece has no printer recorded. Use restore-as-pending instead."
         );
       }
-      // If the piece carries all `ready` prereqs (printer + nozzle + slicer
-      // metadata), promote it straight to 'ready' so the operator can schedule
-      // immediately without having to re-confirm the slicer step.
-      const targetStatus =
-        piece.assigned_nozzle_asset_id && this.hasSlicerCoreData(piece)
-          ? "ready"
-          : "assigned";
+      // If the piece carries all `ready` prereqs for its technology (printer +
+      // nozzle-or-tank + slicer metadata), promote it straight to 'ready' so the
+      // operator can schedule immediately without re-confirming the slicer step.
+      const targetStatus = this.isPieceSchedulable(piece) ? "ready" : "assigned";
       await this.databaseService.query(
         `UPDATE order_pieces
             SET status             = $3,
@@ -2660,6 +2669,13 @@ export class JobsService {
                 pb.required_multicolor_capable,
                 pb.slicer_print_time_minutes,
                 pb.slicer_filament_used_grams,
+                -- A resin PLATE binds a tank exactly as a resin piece does; the
+                -- timeline pivots by literal tank, so a bed block that omitted
+                -- these would silently fall into the "no tank" lane.
+                pb.resin_tank_id,
+                pb.slicer_resin_used_ml,
+                NULLIF(TRIM(CONCAT_WS(' ', rt.resin_brand, rt.resin_type, rt.resin_color)), '')
+                  AS resin_tank_label,
                 pb.slicer_file_url,
                 pb.stl_file_url,
                 pb.scheduled_start_at,
@@ -2670,6 +2686,7 @@ export class JobsService {
                 TRUE AS is_bed
            FROM print_beds pb
            LEFT JOIN printer_instances pi ON pi.printer_id = pb.assigned_printer_id
+           LEFT JOIN asset_instances rt ON rt.asset_id = pb.resin_tank_id
           WHERE pb.company_id = $1
             AND pb.status IN ('scheduled','printing','done','failed')
             AND pb.scheduled_start_at < $4
@@ -2712,10 +2729,14 @@ export class JobsService {
     };
   }
 
-  // The resin counterpart of spoolTimeline, and markedly simpler: a job's tank
-  // is a column on the piece rather than a join-table reservation, and a bed
-  // never carries a tank of its own — so there is no bed-anchoring fallback and
-  // no per-slot sequence. Same response shape, so one client panel renders both.
+  // The resin counterpart of spoolTimeline: a job's tank is a column on the row
+  // rather than a join-table reservation, so there is no per-slot sequence and
+  // no anchoring indirection — a PLATE carries its own tank the same way a piece
+  // does. Same response shape, so one client panel renders both.
+  //
+  // Bed-owned pieces are excluded from both halves on purpose: their scheduling
+  // window and their volume live on the PLATE, and counting the parts as well as
+  // the plate would draw the same resin down twice on the depletion curve.
   async tankTimeline(companyId: string, tankAssetId: string, query: TimelineQuery) {
     const hasStl = await this.hasStlColumn();
     const [tankRes, scheduledRes, ledgerRes] = await Promise.all([
@@ -2744,6 +2765,7 @@ export class JobsService {
           hasStl,
           `WHERE op.company_id = $1
              AND op.resin_tank_id = $2
+             AND op.bed_id IS NULL
              AND op.status IN ('scheduled','printing','done','failed')
              AND op.scheduled_start_at < $4
              AND op.scheduled_end_at   > $3`,
@@ -2753,7 +2775,8 @@ export class JobsService {
         [companyId, tankAssetId, query.from, query.to]
       ),
       // Full draw ledger (every job that ever pointed at this tank), ordered by
-      // run time — the tank's depletion history.
+      // run time — the tank's depletion history. Plates and standalone pieces
+      // are one list: both draw from the same bottle.
       this.databaseService.query<{
         piece_id: string;
         piece_name: string;
@@ -2766,23 +2789,81 @@ export class JobsService {
                 op.status,
                 COALESCE(op.scheduled_start_at, op.print_started_at) AS scheduled_start_at
            FROM order_pieces op
-          WHERE op.company_id = $1 AND op.resin_tank_id = $2
-          ORDER BY COALESCE(op.scheduled_start_at, op.print_started_at) ASC NULLS LAST`,
+          WHERE op.company_id = $1 AND op.resin_tank_id = $2 AND op.bed_id IS NULL
+         UNION ALL
+         SELECT pb.bed_id AS piece_id, pb.bed_name AS piece_name,
+                pb.slicer_resin_used_ml AS planned_ml,
+                pb.status,
+                COALESCE(pb.scheduled_start_at, pb.print_started_at) AS scheduled_start_at
+           FROM print_beds pb
+          WHERE pb.company_id = $1 AND pb.resin_tank_id = $2
+          ORDER BY scheduled_start_at ASC NULLS LAST`,
         [companyId, tankAssetId]
       ),
     ]);
     if (tankRes.rowCount === 0) throw new NotFoundException("Resin tank not found.");
 
-    const mlByPiece = new Map<string, number>();
+    // Scheduled resin PLATES occupy the tank exactly as pieces do. Shaped like a
+    // JobRow with `is_bed`, matching what spoolTimeline already does for spools,
+    // so the timeline panel routes a click to the bed detail.
+    let bedBlocks: Array<JobRow & { is_bed?: boolean }> = [];
+    if (await this.hasBedsTable()) {
+      const bedsRes = await this.databaseService.query<JobRow & { is_bed?: boolean }>(
+        `SELECT pb.bed_id AS piece_id,
+                NULL::uuid AS order_id,
+                pb.bed_name AS order_reference,
+                pb.effective_deadline::text AS order_deadline,
+                pb.bed_name AS piece_name,
+                pb.description,
+                pb.status,
+                pb.assigned_printer_id,
+                CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS assigned_printer_label,
+                pb.assigned_nozzle_asset_id,
+                pb.required_print_technology,
+                pb.required_nozzle_diameter_mm,
+                pb.required_nozzle_material,
+                pb.required_filament_ref_id,
+                pb.required_filament_material,
+                NULL::text AS required_filament_label,
+                NULL::text AS required_color,
+                pb.required_multicolor_capable,
+                pb.slicer_print_time_minutes,
+                pb.slicer_filament_used_grams,
+                pb.resin_tank_id,
+                pb.slicer_resin_used_ml,
+                NULLIF(TRIM(CONCAT_WS(' ', rt.resin_brand, rt.resin_type, rt.resin_color)), '')
+                  AS resin_tank_label,
+                pb.slicer_file_url,
+                pb.stl_file_url,
+                pb.scheduled_start_at,
+                pb.scheduled_end_at,
+                pb.print_started_at,
+                pb.print_completed_at,
+                NULL::text AS customer_name,
+                TRUE AS is_bed
+           FROM print_beds pb
+           LEFT JOIN printer_instances pi ON pi.printer_id = pb.assigned_printer_id
+           LEFT JOIN asset_instances rt ON rt.asset_id = pb.resin_tank_id
+          WHERE pb.company_id = $1
+            AND pb.resin_tank_id = $2
+            AND pb.status IN ('scheduled','printing','done','failed')
+            AND pb.scheduled_start_at < $4
+            AND pb.scheduled_end_at   > $3`,
+        [companyId, tankAssetId, query.from, query.to]
+      );
+      bedBlocks = bedsRes.rows;
+    }
+
+    const mlById = new Map<string, number>();
     for (const r of ledgerRes.rows) {
-      if (r.planned_ml != null) mlByPiece.set(r.piece_id, Number(r.planned_ml));
+      if (r.planned_ml != null) mlById.set(r.piece_id, Number(r.planned_ml));
     }
 
     return {
       tank: tankRes.rows[0]!,
-      scheduled: scheduledRes.rows.map((r) => ({
+      scheduled: [...scheduledRes.rows, ...bedBlocks].map((r) => ({
         ...r,
-        planned_ml: mlByPiece.get(r.piece_id) ?? null,
+        planned_ml: mlById.get(r.piece_id) ?? null,
       })),
       ledger: ledgerRes.rows.map((r) => ({
         piece_id: r.piece_id,
@@ -3310,6 +3391,13 @@ export class JobsService {
                 pb.required_multicolor_capable,
                 pb.slicer_print_time_minutes,
                 pb.slicer_filament_used_grams,
+                -- A resin PLATE binds a tank exactly as a resin piece does; the
+                -- timeline pivots by literal tank, so a bed block that omitted
+                -- these would silently fall into the "no tank" lane.
+                pb.resin_tank_id,
+                pb.slicer_resin_used_ml,
+                NULLIF(TRIM(CONCAT_WS(' ', rt.resin_brand, rt.resin_type, rt.resin_color)), '')
+                  AS resin_tank_label,
                 pb.slicer_file_url,
                 pb.stl_file_url,
                 pb.scheduled_start_at,
@@ -3320,6 +3408,7 @@ export class JobsService {
                 TRUE AS is_bed
            FROM print_beds pb
            LEFT JOIN printer_instances pi ON pi.printer_id = pb.assigned_printer_id
+           LEFT JOIN asset_instances rt ON rt.asset_id = pb.resin_tank_id
           WHERE pb.company_id = $1
             AND pb.status IN ('scheduled','printing','done','failed')
             AND pb.scheduled_start_at < $3

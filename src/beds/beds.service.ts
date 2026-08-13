@@ -12,7 +12,7 @@ import {
   recomputeOrderStatusTx,
   releasePrinterTx
 } from "../common/cascade";
-import { JobsService, materialFamily } from "../jobs/jobs.service";
+import { JobsService, isResinTech, materialFamily } from "../jobs/jobs.service";
 import { PIECE_POST_PROCESS_TRANSITIONS } from "../order-pieces/order-pieces.service";
 import type { FindCandidatesInput, ReserveSpoolsInput } from "../jobs/jobs.schemas";
 import type {
@@ -41,6 +41,13 @@ export interface BedRow {
   slicer_file_url: string | null;
   slicer_print_time_minutes: number | null;
   slicer_filament_used_grams: number | null;
+  // ── Resin (MSLA/SLA) ──────────────────────────────────────────────────────
+  // A resin plate's counterparts of the two fields above it: it pours from one
+  // tank and draws millilitres, and it has no nozzle and no spool at all. Null
+  // on every FDM bed, and vice-versa — a bed is one technology by construction.
+  resin_tank_id: string | null;
+  resin_tank_label: string | null;
+  slicer_resin_used_ml: number | null;
   assigned_printer_id: string | null;
   assigned_printer_label: string | null;
   assigned_nozzle_asset_id: string | null;
@@ -137,6 +144,12 @@ export class BedsService {
   // a bed, exactly like a piece.
   async filamentPlan(companyId: string, bedId: string) {
     const bed = await this.loadBed(companyId, bedId);
+    // A resin plate has no filament plan to make — it pours from one tank, which
+    // the operator links directly. Returning the FDM planner's "none" verdict
+    // here made the scheduling board demand a filament material for a plate that
+    // can never have one, and left its Done button disabled forever. `null` is
+    // the honest answer, and the board reads it as "this job has no spools".
+    if (isResinTech(bed.required_print_technology)) return null;
     // Beds print as one plate from a single material — always single-color, so
     // we tag the plan with multicolor:false to match the piece plan's shape.
     const plan = await this.jobsService.filamentPlanCore(
@@ -168,6 +181,11 @@ export class BedsService {
     input: ReserveSpoolsInput
   ): Promise<BedRow> {
     const bed = await this.loadBed(companyId, bedId);
+    if (isResinTech(bed.required_print_technology)) {
+      throw new BadRequestException(
+        "A resin bed draws from a tank, not a spool — link a resin tank instead."
+      );
+    }
     if (!bed.required_filament_material) {
       throw new BadRequestException("Pick a filament material for the bed before reserving a spool.");
     }
@@ -356,6 +374,12 @@ export class BedsService {
         pb.effective_deadline::text AS effective_deadline,
         pb.stl_file_url, pb.slicer_file_url,
         pb.slicer_print_time_minutes, pb.slicer_filament_used_grams,
+        pb.resin_tank_id,
+        pb.slicer_resin_used_ml,
+        -- Same label expression the piece query uses, so a tank reads
+        -- identically wherever it appears.
+        NULLIF(TRIM(CONCAT_WS(' ', rt.resin_brand, rt.resin_type, rt.resin_color)), '')
+          AS resin_tank_label,
         pb.assigned_printer_id,
         CASE WHEN pi.printer_id IS NOT NULL
              THEN pi.brand || ' ' || pi.model
@@ -375,6 +399,7 @@ export class BedsService {
       FROM print_beds pb
       LEFT JOIN printer_instances pi ON pi.printer_id = pb.assigned_printer_id
       LEFT JOIN filament_reference fr ON fr.filament_ref_id = pb.required_filament_ref_id
+      LEFT JOIN asset_instances rt ON rt.asset_id = pb.resin_tank_id
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::int AS piece_count FROM order_pieces WHERE bed_id = pb.bed_id
       ) c ON TRUE
@@ -689,12 +714,15 @@ export class BedsService {
     // The slicer metadata (print time + grams) is the schedule basis and can't
     // be cleared out from under a committed schedule. The slicer FILE, by
     // contrast, is an optional attachment and may be changed/removed anytime.
+    const bedIsResin = isResinTech(bed.required_print_technology);
     if (
       (bed.status === "scheduled" || bed.status === "printing") &&
-      (input.slicer_print_time_minutes === null || input.slicer_filament_used_grams === null)
+      (input.slicer_print_time_minutes === null ||
+        input.slicer_filament_used_grams === null ||
+        input.slicer_resin_used_ml === null)
     ) {
       throw new ConflictException(
-        `Cannot clear the slicer time/filament while the bed is '${bed.status}'. Unschedule first.`
+        `Cannot clear the slicer time/${bedIsResin ? "resin volume" : "filament"} while the bed is '${bed.status}'. Unschedule first.`
       );
     }
 
@@ -721,26 +749,36 @@ export class BedsService {
       values.push(input.slicer_filament_used_grams);
       sets.push(`slicer_filament_used_grams = $${values.length}`);
     }
+    if (input.slicer_resin_used_ml !== undefined) {
+      values.push(input.slicer_resin_used_ml);
+      sets.push(`slicer_resin_used_ml = $${values.length}`);
+    }
+    if (input.resin_tank_id !== undefined) {
+      values.push(input.resin_tank_id);
+      sets.push(`resin_tank_id = $${values.length}::uuid`);
+    }
 
     // Recompute readiness from the slicer METADATA whenever it changes. A bed in
-    // a mutable planning state (assigned/ready) flips to 'ready' once it has an
-    // assigned printer + nozzle AND both slicer time + filament grams, and falls
-    // back to 'assigned' otherwise. The slicer/STL files never affect status.
+    // a mutable planning state (assigned/ready) flips to 'ready' once it has
+    // everything its TECHNOLOGY needs — printer + nozzle + time + grams for
+    // filament, printer + time + millilitres + tank for resin — and falls back
+    // to 'assigned' otherwise. The slicer/STL files never affect status.
     const metaChanged =
       input.slicer_print_time_minutes !== undefined ||
-      input.slicer_filament_used_grams !== undefined;
+      input.slicer_filament_used_grams !== undefined ||
+      input.slicer_resin_used_ml !== undefined ||
+      input.resin_tank_id !== undefined;
     if (metaChanged && (bed.status === "assigned" || bed.status === "ready")) {
-      const newTime =
-        input.slicer_print_time_minutes !== undefined
-          ? input.slicer_print_time_minutes
-          : bed.slicer_print_time_minutes;
-      const newGrams =
-        input.slicer_filament_used_grams !== undefined
-          ? input.slicer_filament_used_grams
-          : bed.slicer_filament_used_grams;
-      const ready =
-        Boolean(bed.assigned_printer_id) && Boolean(bed.assigned_nozzle_asset_id) &&
-        newTime != null && newGrams != null;
+      const pick = <T,>(given: T | undefined, current: T): T => (given !== undefined ? given : current);
+      const newTime = pick(input.slicer_print_time_minutes, bed.slicer_print_time_minutes);
+      const ready = bedIsResin
+        ? Boolean(bed.assigned_printer_id) &&
+          newTime != null &&
+          pick(input.slicer_resin_used_ml, bed.slicer_resin_used_ml) != null &&
+          Boolean(pick(input.resin_tank_id, bed.resin_tank_id))
+        : Boolean(bed.assigned_printer_id) && Boolean(bed.assigned_nozzle_asset_id) &&
+          newTime != null &&
+          pick(input.slicer_filament_used_grams, bed.slicer_filament_used_grams) != null;
       sets.push(`status = '${ready ? "ready" : "assigned"}'`);
     }
 
@@ -791,14 +829,39 @@ export class BedsService {
     });
   }
 
-  /** Readiness/scheduling is gated on slicer METADATA (print time + filament
-   *  grams) plus an assigned printer + nozzle — never on the slicer file, which
-   *  is an optional attachment the system never feeds to a printer. */
+  /** Readiness/scheduling is gated on slicer METADATA (print time + the
+   *  quantity consumed) plus an assigned printer and, for FDM, a nozzle — never
+   *  on the slicer file, which is an optional attachment the system never feeds
+   *  to a printer.
+   *
+   *  The quantity is read in the PLATE'S OWN UNIT: grams of filament, or
+   *  millilitres of resin. Written against grams alone — as it was — this
+   *  answered "no data" for every resin plate forever, so a resin bed could
+   *  never leave 'assigned'. Mirrors JobsService.hasSlicerCoreData and the
+   *  client's hasPrintData; keep the three in step. */
   private hasSlicerCoreData(bed: {
+    required_print_technology?: string | null;
     slicer_print_time_minutes: number | null;
     slicer_filament_used_grams: number | null;
+    slicer_resin_used_ml?: number | null;
   }): boolean {
-    return bed.slicer_print_time_minutes != null && bed.slicer_filament_used_grams != null;
+    if (bed.slicer_print_time_minutes == null) return false;
+    return isResinTech(bed.required_print_technology)
+      ? bed.slicer_resin_used_ml != null
+      : bed.slicer_filament_used_grams != null;
+  }
+
+  /** Does this bed have everything its TECHNOLOGY needs to be schedulable?
+   *  Filament: printer + nozzle + time + grams. Resin: printer + tank + time +
+   *  millilitres. One predicate because restore() and reprint() each wrote the
+   *  filament half by hand, so a resin plate coming back from cancelled or
+   *  failed always landed on 'assigned' — sending the operator back through a
+   *  print-data step for a plate that already had its numbers. */
+  private isBedSchedulable(bed: BedRow): boolean {
+    if (!bed.assigned_printer_id || !this.hasSlicerCoreData(bed)) return false;
+    return isResinTech(bed.required_print_technology)
+      ? !!bed.resin_tank_id
+      : !!bed.assigned_nozzle_asset_id;
   }
 
   // ──────────────────────────────────────────────────────────
@@ -812,11 +875,15 @@ export class BedsService {
     bedId: string,
     input: {
       printer_id: string;
-      nozzle_asset_id: string;
+      /** Absent for resin — an MSLA/SLA machine has no nozzle to mount. */
+      nozzle_asset_id?: string | null | undefined;
       slicer_print_time_minutes?: number | null | undefined;
       slicer_file_url?: string | null | undefined;
       stl_file_url?: string | null | undefined;
       slicer_filament_used_grams?: number | null | undefined;
+      /** Resin's counterparts of nozzle + grams. */
+      slicer_resin_used_ml?: number | null | undefined;
+      resin_tank_id?: string | null | undefined;
     }
   ): Promise<BedRow> {
     const bed = await this.loadBed(companyId, bedId);
@@ -825,23 +892,63 @@ export class BedsService {
         `Cannot assign a bed in status '${bed.status}'. Unschedule or restore it first.`
       );
     }
-    // Filament material required before assignment (compatibility check needs it).
-    if (!bed.required_filament_material) {
+    const bedIsResin = isResinTech(bed.required_print_technology);
+    // Printer compatibility is checked against the FILAMENT material, so FDM
+    // needs one first. A resin plate has none — its material identity is the
+    // tank — and demanding it here is what left every resin bed permanently
+    // unassignable with an error naming a field it can never have.
+    if (!bedIsResin && !bed.required_filament_material) {
       throw new BadRequestException(
         "Choose a filament material for this bed before assigning a printer — compatibility is checked against it."
       );
     }
-    const nozzleRes = await this.databaseService.query<{ exists: boolean }>(
-      `SELECT EXISTS(
-         SELECT 1 FROM printer_nozzle_compatibility
-          WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
-       ) AS exists`,
-      [companyId, input.printer_id, input.nozzle_asset_id]
-    );
-    if (!nozzleRes.rows[0]?.exists) {
-      throw new BadRequestException(
-        "Selected nozzle is not compatible with the selected printer."
+    if (bedIsResin) {
+      if (input.nozzle_asset_id) {
+        throw new BadRequestException("A resin printer has no nozzle — omit nozzle_asset_id.");
+      }
+    } else {
+      if (!input.nozzle_asset_id) {
+        throw new BadRequestException("Choose a nozzle for this bed.");
+      }
+      const nozzleRes = await this.databaseService.query<{ exists: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1 FROM printer_nozzle_compatibility
+            WHERE company_id = $1 AND printer_id = $2 AND nozzle_asset_id = $3
+         ) AS exists`,
+        [companyId, input.printer_id, input.nozzle_asset_id]
       );
+      if (!nozzleRes.rows[0]?.exists) {
+        throw new BadRequestException(
+          "Selected nozzle is not compatible with the selected printer."
+        );
+      }
+    }
+    // A linked tank must be a real, usable resin tank in this company whose
+    // formulation suits the plate's light source. Same validation the piece
+    // path runs (JobsService.assign), so the two can't drift apart.
+    if (input.resin_tank_id) {
+      if (!bedIsResin) {
+        throw new BadRequestException("Resin tanks only apply to MSLA/SLA beds.");
+      }
+      const tankRes = await this.databaseService.query<{ tech_compat: string }>(
+        `SELECT COALESCE(resin_tech_compat, 'both') AS tech_compat
+           FROM asset_instances
+          WHERE company_id = $1 AND asset_id = $2 AND asset_type = 'resin_tank'
+            AND split_at IS NULL`,
+        [companyId, input.resin_tank_id]
+      );
+      const compat = tankRes.rows[0]?.tech_compat;
+      if (!compat) {
+        throw new BadRequestException(
+          "Selected resin tank does not exist, or has been split into child tanks."
+        );
+      }
+      const tech = (bed.required_print_technology ?? "").trim().toUpperCase();
+      if (compat !== "both" && compat !== tech) {
+        throw new BadRequestException(
+          `That resin is formulated for ${compat} printers, but this bed is ${tech}.`
+        );
+      }
     }
     // Assumed metadata: when the payload doesn't state time/grams and the bed
     // doesn't have them yet, seed from the constituent pieces' quote numbers
@@ -849,10 +956,15 @@ export class BedsService {
     // than the pieces sequentially, so the sum is a safe over-estimate the
     // operator can trim — but it makes the bed schedulable in one step.
     let seedMinutes: number | null = null;
-    let seedGrams: number | null = null;
+    let seedQuantity: number | null = null;
+    // The quantity the plate consumes, in its own unit. For resin the quote's
+    // quantity box IS millilitres (see BulkPieceEntry) — the same sum, landing
+    // in the resin column instead of the gram one.
+    const currentQuantity = bedIsResin ? bed.slicer_resin_used_ml : bed.slicer_filament_used_grams;
+    const inputQuantity = bedIsResin ? input.slicer_resin_used_ml : input.slicer_filament_used_grams;
     const needsSeed =
       (input.slicer_print_time_minutes == null && bed.slicer_print_time_minutes == null) ||
-      (input.slicer_filament_used_grams == null && bed.slicer_filament_used_grams == null);
+      (inputQuantity == null && currentQuantity == null);
     if (needsSeed) {
       const quoteRes = await this.databaseService.query<{
         cost_inputs: { grams?: string[]; time?: string } | null;
@@ -861,14 +973,28 @@ export class BedsService {
         [companyId, bedId]
       );
       let minutesSum = 0;
-      let gramsSum = 0;
+      let quantitySum = 0;
       for (const r of quoteRes.rows) {
         const q = quoteAssumedMeta(r.cost_inputs);
         if (q.minutes != null) minutesSum += q.minutes;
-        if (q.grams != null) gramsSum += q.grams;
+        if (q.grams != null) quantitySum += q.grams;
       }
       seedMinutes = minutesSum > 0 ? Math.round(minutesSum) : null;
-      seedGrams = gramsSum > 0 ? Math.round(gramsSum * 100) / 100 : null;
+      seedQuantity = quantitySum > 0 ? Math.round(quantitySum * 100) / 100 : null;
+    }
+    // Seed the tank from the pieces already on the plate when the caller didn't
+    // name one: those pieces were costed against a tank, and a plate pours from
+    // one vat, so the first is the honest default. Without this the operator
+    // would have to re-link a tank the plate already implies.
+    let seedTankId: string | null = null;
+    if (bedIsResin && !input.resin_tank_id && !bed.resin_tank_id) {
+      const tankRes = await this.databaseService.query<{ resin_tank_id: string }>(
+        `SELECT resin_tank_id FROM order_pieces
+          WHERE company_id = $1 AND bed_id = $2 AND resin_tank_id IS NOT NULL
+          LIMIT 1`,
+        [companyId, bedId]
+      );
+      seedTankId = tankRes.rows[0]?.resin_tank_id ?? null;
     }
     await this.databaseService.query(
       `UPDATE print_beds
@@ -880,7 +1006,17 @@ export class BedsService {
               slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams),
               stl_file_url               = COALESCE($8, stl_file_url),
               stl_file_uploaded_at       = CASE WHEN $8 IS NOT NULL THEN now() ELSE stl_file_uploaded_at END,
+              slicer_resin_used_ml       = COALESCE($9, slicer_resin_used_ml),
+              resin_tank_id              = COALESCE($10::uuid, resin_tank_id),
+              -- Readiness in the plate's own unit, mirroring the piece path. The
+              -- resin arm ALSO requires a tank: a volume with nothing to pour
+              -- from is not a schedulable plate.
               status = CASE
+                WHEN $11::boolean THEN
+                  CASE WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
+                        AND COALESCE($9, slicer_resin_used_ml) IS NOT NULL
+                        AND COALESCE($10::uuid, resin_tank_id) IS NOT NULL
+                       THEN 'ready' ELSE 'assigned' END
                 WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
                  AND COALESCE($7, slicer_filament_used_grams) IS NOT NULL THEN 'ready'
                 ELSE 'assigned'
@@ -888,11 +1024,14 @@ export class BedsService {
         WHERE company_id = $1 AND bed_id = $2`,
       [
         companyId, bedId,
-        input.printer_id, input.nozzle_asset_id,
+        input.printer_id, input.nozzle_asset_id ?? null,
         input.slicer_print_time_minutes ?? seedMinutes,
         input.slicer_file_url ?? null,
-        input.slicer_filament_used_grams ?? seedGrams,
+        bedIsResin ? null : (input.slicer_filament_used_grams ?? seedQuantity),
         input.stl_file_url ?? null,
+        bedIsResin ? (input.slicer_resin_used_ml ?? seedQuantity) : null,
+        bedIsResin ? (input.resin_tank_id ?? seedTankId) : null,
+        bedIsResin,
       ]
     );
     return this.loadBed(companyId, bedId);
@@ -902,6 +1041,9 @@ export class BedsService {
   // must come from the assigned printer's compatibility table.
   async setNozzle(companyId: string, bedId: string, nozzleAssetId: string): Promise<BedRow> {
     const bed = await this.loadBed(companyId, bedId);
+    if (isResinTech(bed.required_print_technology)) {
+      throw new BadRequestException("A resin printer has no nozzle to change.");
+    }
     if (!bed.assigned_printer_id) {
       throw new ConflictException("Assign a printer before choosing a nozzle.");
     }
@@ -969,20 +1111,41 @@ export class BedsService {
     input: { start_at: string }
   ): Promise<BedRow> {
     const bed = await this.loadBed(companyId, bedId);
+    const bedIsResin = isResinTech(bed.required_print_technology);
     if (bed.status !== "ready" && bed.status !== "scheduled") {
       throw new ConflictException(
-        `Cannot schedule a '${bed.status}' bed. Add slicer time + filament first.`
+        `Cannot schedule a '${bed.status}' bed. Add slicer time + ${bedIsResin ? "resin volume" : "filament"} first.`
       );
     }
-    if (bed.slicer_print_time_minutes == null || bed.slicer_filament_used_grams == null) {
-      throw new BadRequestException("Bed needs a slicer time and filament grams to schedule.");
+    if (bed.slicer_print_time_minutes == null) {
+      throw new BadRequestException("Bed needs a slicer print time to schedule.");
     }
     if (!bed.assigned_printer_id) {
       throw new BadRequestException("Bed has no assigned printer.");
     }
-    // Filament optional until scheduling, then mandatory.
-    if (!bed.required_filament_material) {
-      throw new BadRequestException("Pick a filament material for the bed before scheduling.");
+    // Each technology's own material prerequisites. Asking a resin plate for
+    // filament grams and a filament material — as this did unconditionally —
+    // made every resin bed unschedulable behind an error about a material it
+    // does not have.
+    if (bedIsResin) {
+      if (bed.slicer_resin_used_ml == null) {
+        throw new BadRequestException(
+          "Bed needs the resin volume this plate consumes (ml) to schedule."
+        );
+      }
+      if (!bed.resin_tank_id) {
+        throw new BadRequestException(
+          "Link a resin tank to this bed before scheduling (a plate pours from one physical tank)."
+        );
+      }
+    } else {
+      if (bed.slicer_filament_used_grams == null) {
+        throw new BadRequestException("Bed needs a slicer time and filament grams to schedule.");
+      }
+      // Filament optional until scheduling, then mandatory.
+      if (!bed.required_filament_material) {
+        throw new BadRequestException("Pick a filament material for the bed before scheduling.");
+      }
     }
     const start = new Date(input.start_at);
     const end = new Date(start.getTime() + bed.slicer_print_time_minutes * 60_000);
@@ -1068,6 +1231,61 @@ export class BedsService {
       }
     }
 
+    // ── The tank is resin's spool: physically exclusive, and finite. Both
+    //    checks mirror JobsService.schedule exactly, because the failure they
+    //    prevent is the same one — committing two prints to a vat that can only
+    //    hold one pour, or to a bottle that no longer has enough in it.
+    if (bed.resin_tank_id) {
+      const tankPiece = await this.databaseService.query<{ piece_name: string }>(
+        `SELECT piece_name FROM order_pieces
+          WHERE company_id = $1 AND resin_tank_id = $2
+            AND bed_id IS DISTINCT FROM $3
+            AND status IN ('scheduled','printing')
+            AND scheduled_start_at < $5 AND scheduled_end_at > $4
+          LIMIT 1`,
+        [companyId, bed.resin_tank_id, bedId, start.toISOString(), end.toISOString()]
+      );
+      if (tankPiece.rows[0]) {
+        throw new ConflictException(
+          `That resin tank is already feeding "${tankPiece.rows[0].piece_name}" in this time slot — a tank can't be in two vats at once.`
+        );
+      }
+      const tankBed = await this.databaseService.query<{ bed_name: string }>(
+        `SELECT bed_name FROM print_beds
+          WHERE company_id = $1 AND resin_tank_id = $2
+            AND bed_id <> $3
+            AND status IN ('scheduled','printing')
+            AND scheduled_start_at < $5 AND scheduled_end_at > $4
+          LIMIT 1`,
+        [companyId, bed.resin_tank_id, bedId, start.toISOString(), end.toISOString()]
+      );
+      if (tankBed.rows[0]) {
+        throw new ConflictException(
+          `That resin tank is already feeding bed "${tankBed.rows[0].bed_name}" in this time slot — a tank can't be in two vats at once.`
+        );
+      }
+      // Enough resin left, counting what is already promised to other prints.
+      // The bed's OWN reservation is excluded so re-scheduling an already
+      // committed plate doesn't read its own volume as someone else's claim.
+      const tankStock = await this.databaseService.query<{ free_ml: string | null; label: string | null }>(
+        `SELECT (COALESCE(ast.remaining_volume_ml, 0)
+                 - COALESCE(ast.reserved_volume_ml, 0)
+                 + CASE WHEN $3::text = 'scheduled' THEN COALESCE($4::numeric, 0) ELSE 0 END)::text AS free_ml,
+                NULLIF(TRIM(CONCAT_WS(' ', ai.resin_brand, ai.resin_type, ai.resin_color)), '') AS label
+           FROM asset_instances ai
+           LEFT JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1 AND ai.asset_id = $2`,
+        [companyId, bed.resin_tank_id, bed.status, bed.slicer_resin_used_ml]
+      );
+      const free = Number(tankStock.rows[0]?.free_ml ?? 0);
+      const needed = Number(bed.slicer_resin_used_ml ?? 0);
+      if (needed > free) {
+        throw new BadRequestException(
+          `${tankStock.rows[0]?.label ?? "That resin tank"} has ${Math.round(free)} ml free but this plate needs ${Math.round(needed)} ml.`
+        );
+      }
+    }
+
     // The nozzle is its own resource — reject if mounted elsewhere in-window.
     if (bed.assigned_nozzle_asset_id) {
       const nzPiece = await this.databaseService.query<{ piece_id: string }>(
@@ -1147,10 +1365,31 @@ export class BedsService {
         WHERE company_id = $1 AND bed_id = $2`,
       [companyId, bedId, input.outcome, input.actual_print_time_minutes ?? null]
     );
-    // Settle the reserved filament: a finished plate consumes it (reserved →
-    // deducted from stock); a failed plate releases it so the reprint can
-    // reserve afresh.
-    if (input.outcome === "done") {
+    const bedIsResin = isResinTech(bed.required_print_technology);
+    // Settle the reserved material in ITS OWN unit: a finished plate consumes it
+    // (reserved → deducted from stock); a failed plate releases it so the
+    // reprint can reserve afresh. A resin plate draws millilitres from its tank;
+    // releasing is implicit for resin because the reservation is derived from
+    // the bed's own status (see fn_recalc_reserved_volume_for_tank), which the
+    // UPDATE above has already moved off 'scheduled'/'printing'.
+    if (bedIsResin) {
+      if (input.outcome === "done") {
+        await this.databaseService.query(
+          `UPDATE asset_stock ast
+              SET remaining_volume_ml = GREATEST(0, COALESCE(ast.remaining_volume_ml, 0) - pb.slicer_resin_used_ml),
+                  status = CASE
+                             WHEN GREATEST(0, COALESCE(ast.remaining_volume_ml, 0) - pb.slicer_resin_used_ml) <= 0
+                               THEN 'empty' ELSE ast.status
+                           END
+             FROM print_beds pb
+            WHERE pb.company_id = $1
+              AND pb.bed_id = $2
+              AND pb.resin_tank_id = ast.asset_id
+              AND pb.slicer_resin_used_ml IS NOT NULL`,
+          [companyId, bedId]
+        );
+      }
+    } else if (input.outcome === "done") {
       await this.databaseService.transaction(async (client) => {
         await this.consumeSpoolsTx(client, companyId, bedId);
       });
@@ -1161,6 +1400,28 @@ export class BedsService {
     // separately via the order-pieces endpoints if some succeeded and
     // some failed in the same bed.
     await this.propagatePieceStatus(companyId, bedId, input.outcome);
+    // A finished resin print is not a finished PART: it comes off the plate
+    // coated in uncured resin and still has to be washed, then cured. The piece
+    // path stamps this in JobsService.complete; without the same stamp here, a
+    // resin PLATE's parts skipped the wash/cure queue entirely and went straight
+    // to shippable — which is the one thing post_process_state exists to stop.
+    // Only 'done' enters the queue; a failed run never does.
+    if (bedIsResin && input.outcome === "done") {
+      try {
+        await this.databaseService.query(
+          `UPDATE order_pieces
+              SET post_process_state = 'print_done',
+                  post_process_state_entered_at = now()
+            WHERE company_id = $1 AND bed_id = $2
+              AND status = 'done'
+              AND post_process_state IS NULL`,
+          [companyId, bedId]
+        );
+      } catch (e) {
+        // Pre-migration column: the plate is still correctly 'done'.
+        if ((e as { code?: string } | null)?.code !== "42703") throw e;
+      }
+    }
     return this.loadBed(companyId, bedId);
   }
 
@@ -1398,12 +1659,11 @@ export class BedsService {
         `Only cancelled beds can be restored (current: '${bed.status}').`
       );
     }
-    const target =
-      bed.assigned_printer_id && bed.assigned_nozzle_asset_id && this.hasSlicerCoreData(bed)
-        ? "ready"
-        : bed.assigned_printer_id
-        ? "assigned"
-        : "pending";
+    const target = this.isBedSchedulable(bed)
+      ? "ready"
+      : bed.assigned_printer_id
+      ? "assigned"
+      : "pending";
     await this.databaseService.query(
       `UPDATE print_beds
           SET status             = $3,
@@ -1432,12 +1692,11 @@ export class BedsService {
         `Only failed beds can be re-queued for reprint (current: '${bed.status}').`
       );
     }
-    const target =
-      bed.assigned_printer_id && bed.assigned_nozzle_asset_id && this.hasSlicerCoreData(bed)
-        ? "ready"
-        : bed.assigned_printer_id
-        ? "assigned"
-        : "pending";
+    const target = this.isBedSchedulable(bed)
+      ? "ready"
+      : bed.assigned_printer_id
+      ? "assigned"
+      : "pending";
     await this.databaseService.query(
       `UPDATE print_beds
           SET status                    = $3,

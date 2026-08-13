@@ -16,6 +16,10 @@ const assignSchema = z.object({
   // requirement across the batch. The service matches each piece to whichever
   // of these fits its own nozzle need (falling back to auto-resolution).
   nozzle_asset_ids: z.array(z.string().uuid()).max(50).optional(),
+  // Resin's counterpart of nozzle_asset_id: pour this batch from a specific
+  // tank. Omitted = the service resolves the emptiest tank that still covers
+  // the job, which is the one-click default.
+  resin_tank_id: z.string().uuid().optional(),
 });
 
 const availabilitySchema = z.object({
@@ -158,9 +162,15 @@ const autoScheduleAllSchema = z.object({
   printer_ids: z.array(z.string().uuid()).max(200).optional(),
 });
 
-// Simple-mode Jobs surface. Additive — the Advanced /jobs endpoints are
-// untouched. Only reachable when the company is in Simple mode (the queue is
-// scoped to the active operation_mode).
+// The Jobs action surface — assign, auto-schedule, bulk g-code drop.
+//
+// The name is historical: this was the Simple-mode half of a two-mode product.
+// Advanced is retired, so there is no longer another mode for these routes to be
+// "the simple one" of, and the queue below is no longer scoped by operation_mode
+// (a filter that, with only one mode left, could only ever hide work).
+//
+// GET queue is legacy: the client lists from /jobs/queue. The POST routes here
+// are the live ones.
 @Controller("simple-jobs")
 export class SimpleJobsController {
   constructor(private readonly simpleJobsService: SimpleJobsService) {}
@@ -174,8 +184,11 @@ export class SimpleJobsController {
   @Post("assign")
   @RequirePermission("action_orders")
   assign(@CompanyId() companyId: string, @Body() body: unknown) {
-    const { piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids } = parseWithSchema(assignSchema, body);
-    return this.simpleJobsService.assign(companyId, piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids);
+    const { piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids, resin_tank_id } =
+      parseWithSchema(assignSchema, body);
+    return this.simpleJobsService.assign(
+      companyId, piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids, resin_tank_id
+    );
   }
 
   @Get("printer-availability")

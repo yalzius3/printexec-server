@@ -387,18 +387,28 @@ export class OrdersService {
       }
 
       if (restoreCancelledPieces) {
+        // "Everything this piece's TECHNOLOGY needs to print", as one SQL
+        // fragment shared by both branches below. Spelled out per technology
+        // because the FDM shape — nozzle + filament grams — is permanently
+        // false for a resin piece, which has neither: written that way, every
+        // restored resin piece dropped to 'assigned' and had to be walked back
+        // through a data step it had already completed.
+        const pieceComplete = `
+          assigned_printer_id IS NOT NULL
+          AND slicer_file_url IS NOT NULL
+          AND slicer_print_time_minutes IS NOT NULL
+          AND CASE WHEN required_print_technology IN ('MSLA', 'SLA') THEN
+                slicer_resin_used_ml IS NOT NULL AND resin_tank_id IS NOT NULL
+              ELSE
+                assigned_nozzle_asset_id IS NOT NULL AND slicer_filament_used_grams IS NOT NULL
+              END`;
         if (nextStatus === "draft") {
           await this.databaseService.query(
             `
               UPDATE order_pieces
               SET
                 status = CASE
-                  WHEN assigned_printer_id IS NOT NULL
-                    AND assigned_nozzle_asset_id IS NOT NULL
-                    AND slicer_file_url IS NOT NULL
-                    AND slicer_print_time_minutes IS NOT NULL
-                    AND slicer_filament_used_grams IS NOT NULL
-                    THEN 'ready'
+                  WHEN ${pieceComplete} THEN 'ready'
                   WHEN assigned_printer_id IS NOT NULL
                     THEN 'assigned'
                   ELSE 'pending'
@@ -420,17 +430,9 @@ export class OrdersService {
               SET status = CASE
                 WHEN scheduled_start_at IS NOT NULL
                   AND scheduled_end_at IS NOT NULL
-                  AND assigned_printer_id IS NOT NULL
-                  AND assigned_nozzle_asset_id IS NOT NULL
-                  AND slicer_file_url IS NOT NULL
-                  AND slicer_print_time_minutes IS NOT NULL
-                  AND slicer_filament_used_grams IS NOT NULL
+                  AND ${pieceComplete}
                   THEN 'scheduled'
-                WHEN assigned_printer_id IS NOT NULL
-                  AND assigned_nozzle_asset_id IS NOT NULL
-                  AND slicer_file_url IS NOT NULL
-                  AND slicer_print_time_minutes IS NOT NULL
-                  AND slicer_filament_used_grams IS NOT NULL
+                WHEN ${pieceComplete}
                   THEN 'ready'
                 WHEN assigned_printer_id IS NOT NULL
                   THEN 'assigned'

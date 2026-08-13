@@ -8,7 +8,7 @@ import {
   releasePrinterForPieceTx
 } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
-import { materialFamily, sameColor } from "../jobs/jobs.service";
+import { isResinTech, materialFamily, sameColor, techCompatible } from "../jobs/jobs.service";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import {
   createOrderPieceSchema,
@@ -1380,11 +1380,13 @@ export class OrderPiecesService {
     if (nextAssignedPrinterId) {
       printerProfile = await this.getPrinterAssignmentProfile(companyId, nextAssignedPrinterId, executor);
 
-      if (
-        nextPrintTechnology &&
-        printerProfile.print_technology !== nextPrintTechnology
-      ) {
-        throw new BadRequestException("assigned_printer_id does not match required_print_technology.");
+      // Family rule, not string equality — MSLA and SLA are interchangeable, and
+      // the assign flow has always accepted that. Comparing the raw strings here
+      // meant a resin piece could be assigned and then never edited again.
+      if (!techCompatible(nextPrintTechnology, printerProfile.print_technology)) {
+        throw new BadRequestException(
+          `assigned_printer_id is a ${printerProfile.print_technology} printer, which cannot print a ${nextPrintTechnology} piece.`
+        );
       }
 
       if (nextRequiredMulticolorCapable && !printerProfile.is_multicolor) {
@@ -1392,7 +1394,15 @@ export class OrderPiecesService {
       }
     }
 
-    if (nextAssignedNozzleAssetId) {
+    // A resin printer has no hotend, so every nozzle test below is meaningless
+    // for it. Crucially the nozzle FIELDS can still be populated — a piece
+    // switched from FDM to MSLA/SLA keeps whatever diameter/material it carried
+    // — and validating those leftovers is how a resin piece ended up rejected
+    // for hardware it does not have. Ignore them outright rather than trying to
+    // keep them consistent.
+    const pieceIsResin = isResinTech(nextPrintTechnology);
+
+    if (nextAssignedNozzleAssetId && !pieceIsResin) {
       nozzleProfile = await this.getNozzleAssignmentProfile(companyId, nextAssignedNozzleAssetId, executor);
 
       if (
@@ -1411,7 +1421,7 @@ export class OrderPiecesService {
       }
     }
 
-    if (nextAssignedPrinterId && nextAssignedNozzleAssetId) {
+    if (nextAssignedPrinterId && nextAssignedNozzleAssetId && !pieceIsResin) {
       const compatibility = await this.databaseService.query(
         `
           SELECT 1
