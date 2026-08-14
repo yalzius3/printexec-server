@@ -320,6 +320,9 @@ export class SimpleJobsService {
       minutes: number | null;
       grams: number | null;
       ml: number | null;
+      // Which technology this group is, carried explicitly so the UPDATE can
+      // CLEAR the other technology's tooling rather than merely not set it.
+      isResin: boolean;
       ids: string[];
     };
     const groups = new Map<string, SeedGroup>();
@@ -389,6 +392,7 @@ export class SimpleJobsService {
           // Resin's quantity rides the resin column; filament's the gram column.
           grams: pieceIsResin ? null : assumed.grams,
           ml: pieceIsResin ? assumed.grams : null,
+          isResin: pieceIsResin,
           ids: [],
         };
         groups.set(key, g);
@@ -415,8 +419,21 @@ export class SimpleJobsService {
         `
           UPDATE order_pieces
           SET assigned_printer_id = $3,
-              assigned_nozzle_asset_id = COALESCE($4::uuid, assigned_nozzle_asset_id),
-              resin_tank_id              = COALESCE($7::uuid, resin_tank_id),
+              -- A piece holds the tooling of ONE technology, and assigning it
+              -- clears the other's outright. COALESCE alone only ever ADDED:
+              -- a piece that was FDM and became resin kept its old nozzle id
+              -- forever, because a resin assign passes NULL and COALESCE reads
+              -- that as "leave it". Nothing downstream could tell that stale id
+              -- from a real one, so the schedule board drew a nozzle lane for a
+              -- machine with no nozzle -- correctly rendering junk data.
+              assigned_nozzle_asset_id = CASE
+                WHEN $9::boolean THEN NULL
+                ELSE COALESCE($4::uuid, assigned_nozzle_asset_id)
+              END,
+              resin_tank_id = CASE
+                WHEN $9::boolean THEN COALESCE($7::uuid, resin_tank_id)
+                ELSE NULL
+              END,
               slicer_file_url            = NULL,
               slicer_file_uploaded_at    = NULL,
               slicer_print_time_minutes  = $5,
@@ -445,8 +462,21 @@ export class SimpleJobsService {
           WHERE company_id = $1
             AND piece_id = ANY($2::uuid[])
         `,
-        [companyId, g.ids, printerId, g.nozzle, g.minutes, g.grams, g.tank, g.ml]
+        [companyId, g.ids, printerId, g.nozzle, g.minutes, g.grams, g.tank, g.ml, g.isResin]
       );
+
+      // Resin draws from a tank, never a spool, so any spool reservation the
+      // piece carried from a previous FDM life is released here. Left in place
+      // it holds grams against stock that will never be consumed AND puts the
+      // piece on the Spool pivot's lanes — the same stale-data problem as the
+      // nozzle above, one table over.
+      if (g.isResin) {
+        await this.db.query(
+          `DELETE FROM order_piece_spools
+            WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          [companyId, g.ids]
+        );
+      }
     }
 
     // Multicolor: mirror the quote's per-slot grams into the color slots (only

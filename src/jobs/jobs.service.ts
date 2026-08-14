@@ -2393,10 +2393,15 @@ export class JobsService {
         brand: string;
         model: string;
         location: string | null;
+        // The board needs this to know which RESOURCE LANES are even meaningful.
+        // Without it the client could only infer the machine's technology from
+        // the pieces on it, which is exactly backwards — a resin printer is a
+        // resin printer with an empty board.
+        print_technology: string | null;
         is_under_maintenance: boolean;
         is_offline: boolean;
       }>(
-        `SELECT pi.printer_id, pi.brand, pi.model, pi.location,
+        `SELECT pi.printer_id, pi.brand, pi.model, pi.location, pi.print_technology,
                 COALESCE(ps.is_under_maintenance, FALSE) AS is_under_maintenance,
                 COALESCE(ps.is_offline, FALSE) AS is_offline
            FROM printer_instances pi
