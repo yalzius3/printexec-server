@@ -3,6 +3,7 @@ import type { z } from "zod";
 import { revertPrinterAssignmentsTx } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
+import { isResinTech } from "../jobs/matching";
 import { LicensingService } from "../licensing/licensing.service";
 import {
   addCompatibleNozzleSchema,
@@ -698,7 +699,21 @@ export class PrintersService {
     printerId: string,
     input: AddCompatibleNozzleInput
   ) {
-    await this.getPrinterById(companyId, printerId);
+    const printer = await this.getPrinterById(companyId, printerId);
+
+    // A resin machine has no hotend and no extruder — it cures liquid from a
+    // vat — so a nozzle cannot be mounted on one at all. Only the CREATE path
+    // enforced this (via printers.schemas), leaving this route free to attach
+    // nozzles to a resin printer after the fact. That is how a Formlabs Form 4
+    // ended up carrying a "0.40mm brass" nozzle and showing a nozzle lane on
+    // the schedule board: the UI was reading real rows, not inventing them.
+    // Refusing the write is the only thing that makes it structurally
+    // impossible rather than merely hidden.
+    if (isResinTech(printer.print_technology as string | null)) {
+      throw new BadRequestException(
+        "This is a resin printer — it cures resin from a tank and has no nozzle to mount."
+      );
+    }
 
     const nozzle = await this.databaseService.query<{ asset_type: string }>(
       `
