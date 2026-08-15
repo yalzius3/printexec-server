@@ -100,6 +100,11 @@ type LineRow = {
   quantity: string;
   unit_price: string;
   amount: string;
+  tax_pct: string;
+  /** Stored per line by writeDocumentLines. `amount + tax_amount` is the line's
+   *  gross, and Σ of those is exactly the invoice total — both sides are summed
+   *  from the same cents, so the document foots without re-deriving anything. */
+  tax_amount: string;
 };
 
 export type InvoiceEmailOutcome = "sent" | "dry_run" | "skipped" | "failed";
@@ -438,9 +443,16 @@ export class InvoiceNotificationsService implements OnModuleInit, OnModuleDestro
     return res.rows[0] ?? null;
   }
 
+  /** The single rate every taxed line shares, or null when they differ / none. */
+  private static uniformTaxPct(lines: LineRow[]): number | null {
+    const pcts = [...new Set(lines.map((l) => Number(l.tax_pct) || 0).filter((p) => p > 0))];
+    return pcts.length === 1 ? pcts[0]! : null;
+  }
+
   private async loadLines(companyId: string, invoiceId: string): Promise<LineRow[]> {
     const res = await this.db.query<LineRow>(
-      `SELECT description, quantity::text, unit_price::text, amount::text
+      `SELECT description, quantity::text, unit_price::text, amount::text,
+              tax_pct::text, tax_amount::text
          FROM invoice_lines
         WHERE company_id = $1 AND invoice_id = $2
         ORDER BY position, description`,
@@ -504,7 +516,9 @@ export class InvoiceNotificationsService implements OnModuleInit, OnModuleDestro
       description: l.description,
       quantity: num(l.quantity),
       unitPrice: num(l.unit_price),
-      amount: num(l.amount)
+      amount: num(l.amount),
+      taxPct: num(l.tax_pct),
+      taxAmount: num(l.tax_amount)
     }));
 
     return {
@@ -535,6 +549,7 @@ export class InvoiceNotificationsService implements OnModuleInit, OnModuleDestro
         lines: invoiceLines,
         subtotal: num(row.subtotal),
         taxTotal: num(row.tax_total),
+        taxPct: InvoiceNotificationsService.uniformTaxPct(lines),
         total: num(row.total),
         amountPaid: num(row.amount_paid),
         balanceDue: num(row.balance_due),

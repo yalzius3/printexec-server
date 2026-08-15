@@ -896,7 +896,12 @@ export type CustomerInvoiceLine = {
   description: string;
   quantity: number;
   unitPrice: number;
+  /** NET: quantity × unitPrice, excluding tax (the DB's generated `amount`). */
   amount: number;
+  /** The rate applied to this line; 0 for an untaxed/exempt line. */
+  taxPct: number;
+  /** The tax that rate produced. `amount + taxAmount` is the line's gross. */
+  taxAmount: number;
 };
 
 export type CustomerInvoiceEmailData = {
@@ -925,6 +930,9 @@ export type CustomerInvoiceEmailData = {
     lines: CustomerInvoiceLine[];
     subtotal: number;
     taxTotal: number;
+    /** The single rate every taxed line shares; null when they differ or none.
+     *  Only used to NAME the tax — the figures are computed server-side. */
+    taxPct: number | null;
     total: number;
     amountPaid: number;
     balanceDue: number;
@@ -934,6 +942,17 @@ export type CustomerInvoiceEmailData = {
     orderTitle: string | null;
   };
 };
+
+// ── Tax vocabulary ───────────────────────────────────────────────────────────
+// These documents are tax-EXCLUSIVE: a line's amount is qty × unit price and the
+// subtotal is the sum of those, so tax appears only in the total. Saying plain
+// "Subtotal" and "Total" left the customer to guess which side of tax each was
+// on — the labels now say it. Mirrors invoicePrint.ts on the client; the two
+// must agree, because they render the same invoice.
+export const SUBTOTAL_LABEL = "Subtotal (excl. tax)";
+export const TOTAL_LABEL = "Total (incl. tax)";
+export const taxTotalLabel = (pct: number | null): string =>
+  pct == null ? "Tax" : `VAT (${pct.toLocaleString("en-US", { maximumFractionDigits: 2 })}%)`;
 
 /** Quantities are NUMERIC(12,3) — hide the decimals when they say nothing. */
 function formatQuantity(value: number): string {
@@ -991,9 +1010,9 @@ function buildCustomerInvoiceText(data: CustomerInvoiceEmailData): string {
       `   =   ${formatMoney(l.amount, invoice.currency)}`
   );
 
-  const totals: string[] = [row("Subtotal", money(invoice.subtotal))];
-  if (invoice.taxTotal > 0) totals.push(row("Tax", money(invoice.taxTotal)));
-  totals.push(row("Total", money(invoice.total)));
+  const totals: string[] = [row(SUBTOTAL_LABEL, money(invoice.subtotal))];
+  if (invoice.taxTotal > 0) totals.push(row(taxTotalLabel(invoice.taxPct), money(invoice.taxTotal)));
+  totals.push(row(TOTAL_LABEL, money(invoice.total)));
   if (invoice.amountPaid > 0) {
     totals.push(row("Paid", `- ${money(invoice.amountPaid)}`));
     totals.push(row("Balance due", money(invoice.balanceDue)));
@@ -1051,9 +1070,9 @@ function buildCustomerInvoiceHtml(data: CustomerInvoiceEmailData): string {
   if (invoice.orderTitle) meta.push(summaryRowHtml("Job", invoice.orderTitle));
   meta.push(summaryRowHtml("Billed to", customer.displayName));
 
-  const totals: string[] = [invoiceTotalRowHtml("Subtotal", money(invoice.subtotal), false)];
-  if (invoice.taxTotal > 0) totals.push(invoiceTotalRowHtml("Tax", money(invoice.taxTotal), false));
-  totals.push(invoiceTotalRowHtml("Total", money(invoice.total), true));
+  const totals: string[] = [invoiceTotalRowHtml(SUBTOTAL_LABEL, money(invoice.subtotal), false)];
+  if (invoice.taxTotal > 0) totals.push(invoiceTotalRowHtml(taxTotalLabel(invoice.taxPct), money(invoice.taxTotal), false));
+  totals.push(invoiceTotalRowHtml(TOTAL_LABEL, money(invoice.total), true));
   if (invoice.amountPaid > 0) {
     totals.push(invoiceTotalRowHtml("Paid", `- ${money(invoice.amountPaid)}`, false));
     totals.push(invoiceTotalRowHtml("Balance due", money(invoice.balanceDue), true));

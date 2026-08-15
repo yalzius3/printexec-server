@@ -1,5 +1,5 @@
 import PDFDocument from "pdfkit";
-import type { CustomerInvoiceEmailData } from "./email-templates";
+import { SUBTOTAL_LABEL, TOTAL_LABEL, taxTotalLabel, type CustomerInvoiceEmailData } from "./email-templates";
 
 // ════════════════════════════════════════════════════════════════
 // CUSTOMER INVOICE PDF
@@ -28,13 +28,30 @@ const HAIRLINE = "#cccccc";
 const PAGE_MARGIN = 50;
 const HEADER_BAR_HEIGHT = 64;
 
-// Line-item table geometry, as fractions of the content width. Description
-// takes the slack; the three numeric columns are fixed so figures stay aligned
-// down the page and across page breaks.
-const COL_QTY = 60;
-const COL_UNIT = 90;
-const COL_AMOUNT = 90;
-const COL_GAP = 12;
+// Line-item table geometry. Description takes the slack; the numeric columns are
+// fixed so figures stay aligned down the page and across page breaks.
+//
+// Five numeric columns, not three: a line shows its NET amount, the TAX on it,
+// and the two added — the three figures Egypt's ETA schema keeps per line
+// (netTotal / taxableItem.Amount / total). Each column foots to its own row in
+// the totals block.
+//
+// Widths are measured, not guessed. pdfkit WRAPS text that exceeds the width it
+// is given, and the row height here is computed from the description alone — so
+// an overflowing numeric cell wraps onto the row rule below it rather than
+// visibly overflowing. Each column therefore holds its widest realistic string
+// at the font it is drawn in (Helvetica 10 / Courier-Bold 8 headers):
+//   QTY    "1234.567"            41.7pt  (quantity is NUMERIC(12,3))
+//   TAX    "14%  999,999.99"     75.6pt  (mixed-rate rows print the rate inline)
+//   TOTAL  "EGP 999,999.99"      ~74pt   (the totals block adds the currency)
+// That leaves ~129pt for the description, which wraps — the row-height code
+// already measures it, so wrapping costs only vertical space.
+const COL_QTY = 44;
+const COL_UNIT = 58;
+const COL_NET = 58;
+const COL_TAX = 78;
+const COL_AMOUNT = 78;
+const COL_GAP = 10;
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -54,6 +71,11 @@ function fmtMoney(amount: number, currency: string | null): string {
     maximumFractionDigits: 2
   });
   return currency ? `${currency} ${fixed}` : fixed;
+}
+
+/** Rates read as written ("14%", "12.5%") — never money-formatted "14.00%". */
+function fmtPct(value: number): string {
+  return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
 }
 
 /** Quantities are NUMERIC(12,3): show decimals only when they carry meaning. */
@@ -89,10 +111,14 @@ export function renderCustomerInvoicePdf(data: CustomerInvoiceEmailData): Promis
       const right = doc.page.width - PAGE_MARGIN;
       const width = right - left;
       const currency = data.invoice.currency;
+      // Null when the lines carry different rates — then each row prints its own.
+      const uniformPct = data.invoice.taxPct;
 
       // Column x-positions, right-aligned numerics anchored off the page edge.
       const xAmount = right - COL_AMOUNT;
-      const xUnit = xAmount - COL_GAP - COL_UNIT;
+      const xTax = xAmount - COL_GAP - COL_TAX;
+      const xNet = xTax - COL_GAP - COL_NET;
+      const xUnit = xNet - COL_GAP - COL_UNIT;
       const xQty = xUnit - COL_GAP - COL_QTY;
       const descWidth = xQty - COL_GAP - left;
 
@@ -196,7 +222,11 @@ export function renderCustomerInvoicePdf(data: CustomerInvoiceEmailData): Promis
         doc.text("DESCRIPTION", left, y, { characterSpacing: 1, width: descWidth });
         doc.text("QTY", xQty, y, { characterSpacing: 1, width: COL_QTY, align: "right" });
         doc.text("UNIT", xUnit, y, { characterSpacing: 1, width: COL_UNIT, align: "right" });
-        doc.text("AMOUNT", xAmount, y, { characterSpacing: 1, width: COL_AMOUNT, align: "right" });
+        doc.text("NET", xNet, y, { characterSpacing: 1, width: COL_NET, align: "right" });
+        // Header carries the rate when the whole invoice shares one, so the
+        // cells below can be pure money.
+        doc.text(uniformPct == null ? "TAX" : `TAX ${fmtPct(uniformPct)}%`, xTax, y, { characterSpacing: 1, width: COL_TAX, align: "right" });
+        doc.text("TOTAL", xAmount, y, { characterSpacing: 1, width: COL_AMOUNT, align: "right" });
         y += 16;
         doc.moveTo(left, y).lineTo(right, y).lineWidth(0.5).strokeColor(HAIRLINE).stroke();
         y += 8;
@@ -222,7 +252,18 @@ export function renderCustomerInvoicePdf(data: CustomerInvoiceEmailData): Promis
         doc.font("Helvetica").fontSize(10).fillColor(INK).text(line.description, left, y, { width: descWidth });
         doc.font("Helvetica").fontSize(10).fillColor(SUBTLE).text(fmtQuantity(line.quantity), xQty, y, { width: COL_QTY, align: "right" });
         doc.text(fmtMoney(line.unitPrice, null), xUnit, y, { width: COL_UNIT, align: "right" });
-        doc.font("Helvetica").fillColor(INK).text(fmtMoney(line.amount, null), xAmount, y, { width: COL_AMOUNT, align: "right" });
+        doc.text(fmtMoney(line.amount, null), xNet, y, { width: COL_NET, align: "right" });
+        // Mixed-rate invoices print the rate per row; a uniform one said it once
+        // in the header. An untaxed line gets an en dash, not a blank.
+        doc.text(
+          line.taxAmount > 0
+            ? (uniformPct == null ? `${fmtPct(line.taxPct)}%  ${fmtMoney(line.taxAmount, null)}` : fmtMoney(line.taxAmount, null))
+            : "–",
+          xTax, y, { width: COL_TAX, align: "right" }
+        );
+        // The tax-inclusive line total is what the customer reconciles against
+        // their payment, so it is the one figure in the row set in ink.
+        doc.font("Helvetica-Bold").fillColor(INK).text(fmtMoney(line.amount + line.taxAmount, null), xAmount, y, { width: COL_AMOUNT, align: "right" });
 
         y += rowHeight;
         doc.moveTo(left, y - 5).lineTo(right, y - 5).lineWidth(0.5).strokeColor(HAIRLINE).stroke();
@@ -230,11 +271,11 @@ export function renderCustomerInvoicePdf(data: CustomerInvoiceEmailData): Promis
 
       // ── Totals ──
       const totals: [string, string, boolean][] = [
-        ["Subtotal", fmtMoney(data.invoice.subtotal, currency), false],
+        [SUBTOTAL_LABEL, fmtMoney(data.invoice.subtotal, currency), false],
         ...(data.invoice.taxTotal > 0
-          ? ([["Tax", fmtMoney(data.invoice.taxTotal, currency), false]] as [string, string, boolean][])
+          ? ([[taxTotalLabel(data.invoice.taxPct), fmtMoney(data.invoice.taxTotal, currency), false]] as [string, string, boolean][])
           : []),
-        ["Total", fmtMoney(data.invoice.total, currency), true],
+        [TOTAL_LABEL, fmtMoney(data.invoice.total, currency), true],
         ...(data.invoice.amountPaid > 0
           ? ([
               ["Paid", `- ${fmtMoney(data.invoice.amountPaid, currency)}`, false],
