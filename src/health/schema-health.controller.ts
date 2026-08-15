@@ -42,22 +42,47 @@ export class SchemaHealthController {
               OR (table_name = 'asset_instances' AND column_name IN ('resin_color', 'resin_hex'))
             )`
       ),
-      // The definition text is the only way to tell the resin-aware rewrite from
-      // the original FDM-only rule — both share the constraint NAME.
-      this.db.query<{ definition: string }>(
-        `SELECT pg_get_constraintdef(oid) AS definition
+      // The definition TEXT is the only way to tell these apart — every version
+      // of this rule has shipped under the same constraint NAME, so presence
+      // proves nothing about which rule is actually live.
+      this.db.query<{ conname: string; definition: string }>(
+        `SELECT conname, pg_get_constraintdef(oid) AS definition
            FROM pg_constraint
-          WHERE conname = 'chk_ready_requires_core_data'
-            AND conrelid = 'public.order_pieces'::regclass`
+          WHERE contype = 'c'
+            AND conrelid IN ('public.order_pieces'::regclass, 'public.print_beds'::regclass)
+            AND (conname LIKE 'chk_ready%' OR conname LIKE 'chk_scheduled%')
+          ORDER BY conname`
       ),
     ]);
 
     const has = (table: string, column: string) =>
       cols.rows.some((r) => r.table_name === table && r.column_name === column);
 
-    const readyConstraint = constraint.rows[0]?.definition ?? null;
+    const readyRow = constraint.rows.find(
+      (r) => r.conname === "chk_ready_requires_core_data"
+    );
+    const readyConstraint = readyRow?.definition ?? null;
     // The rewrite branches on the technology; the original never mentioned it.
     const readyConstraintKnowsResin = !!readyConstraint && /MSLA/i.test(readyConstraint);
+
+    // The rule this whole subsystem has been fighting. Three versions have
+    // shipped under one name:
+    //   1. original      — gated on the slicer FILE (slicer_file_url NOT NULL)
+    //   2. 2026-06-30    — gated on the slicer METADATA instead (time + grams)
+    //   3. 2026-07-27    — same, but branching per technology (resin: ml + tank)
+    //
+    // If (1) is still live, typing print data can NEVER satisfy it: the file is
+    // optional in the UI and bulk-assign explicitly nulls slicer_file_url, so
+    // every save that promotes a piece to 'ready' without an uploaded file
+    // violates the constraint and returns a bare 500. That is indistinguishable
+    // from an application bug from the outside, which is exactly why this
+    // reports it rather than leaving it to be inferred.
+    const readyConstraintStillWantsFile =
+      !!readyConstraint && /slicer_file_url/i.test(readyConstraint);
+    // Dropped by 2026-06-30 and re-added by 2026-07-01; without it, bed-owned
+    // pieces (whose own fields are nulled) cannot be scheduled at all.
+    const readyConstraintHasBedEscape =
+      !!readyConstraint && /bed_id/i.test(readyConstraint);
 
     const checks = {
       "order_pieces.resin_tank_id": has("order_pieces", "resin_tank_id"),
@@ -67,6 +92,11 @@ export class SchemaHealthController {
       "asset_instances.resin_color": has("asset_instances", "resin_color"),
       "asset_instances.resin_hex": has("asset_instances", "resin_hex"),
       "chk_ready_requires_core_data.knows_resin": readyConstraintKnowsResin,
+      // Inverted deliberately: every entry here is "true = healthy", so the
+      // `missing` list below reads as a to-do without special-casing.
+      "chk_ready_requires_core_data.metadata_gated_not_file_gated":
+        !!readyConstraint && !readyConstraintStillWantsFile,
+      "chk_ready_requires_core_data.has_bed_escape": readyConstraintHasBedEscape,
     };
 
     // Which migration to run for whatever is missing — the whole point is that
@@ -79,6 +109,10 @@ export class SchemaHealthController {
       "print_beds.slicer_resin_used_ml": "migrations/2026-07-29_resin_beds.sql",
       "asset_instances.resin_color": "migrations/2026-08-13_resin_color.sql",
       "asset_instances.resin_hex": "migrations/2026-08-13_resin_color.sql",
+      "chk_ready_requires_core_data.metadata_gated_not_file_gated":
+        "migrations/2026-06-30_metadata_driven_readiness.sql, THEN 2026-07-01_readiness_bed_escape_fix.sql",
+      "chk_ready_requires_core_data.has_bed_escape":
+        "migrations/2026-07-01_readiness_bed_escape_fix.sql",
     };
     const missing = Object.entries(checks)
       .filter(([, ok]) => !ok)
@@ -94,8 +128,10 @@ export class SchemaHealthController {
         null,
       resin: checks,
       missing,
-      // Verbatim, so a mismatch that these booleans do not model is still visible.
-      ready_constraint: readyConstraint,
+      // Verbatim, so a mismatch these booleans do not model is still visible.
+      constraints: Object.fromEntries(
+        constraint.rows.map((r) => [r.conname, r.definition])
+      ),
       timestamp: new Date().toISOString(),
     };
   }
