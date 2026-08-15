@@ -115,3 +115,42 @@ export function colorCompatible(
   if (!want || !have) return true;
   return want.toLowerCase() === have.toLowerCase();
 }
+
+/** A resin tank as the picker needs to judge it. */
+export interface TankChoice {
+  asset_id: string;
+  /** Free millilitres (remaining minus reserved). */
+  free_ml: number | null;
+  resin_color: string | null;
+}
+
+/**
+ * Which tank should this job pour from?
+ *
+ * The rule, in order:
+ *   1. Only tanks whose colour can produce the requested colour (colorCompatible
+ *      — an unrecorded colour on either side is a wildcard).
+ *   2. Among those, the MOST DEPLETED that still covers `needMl`. A shop should
+ *      finish an open bottle before breaching a sealed one.
+ *   3. Volume unknown yet (the operator fills it in at the slicer step) → the
+ *      most depleted compatible tank, same reasoning.
+ *   4. Nothing covers it → null. Leave the job unlinked rather than bind a tank
+ *      that will fail the volume check later with a confusing error.
+ *
+ * `tanks` MUST already be ordered emptiest-first; both callers order in SQL.
+ *
+ * Pure and shared because the two assign paths each needed it and a second
+ * hand-written copy is precisely how this subsystem accumulated its bugs — see
+ * the techFamily/`!==` split that made a resin piece assignable but uneditable.
+ */
+export function pickTank(
+  tanks: readonly TankChoice[],
+  opts: { needMl: number | null; wantColor: string | null | undefined }
+): string | null {
+  const usable = tanks.filter((t) => colorCompatible(opts.wantColor, t.resin_color));
+  if (usable.length === 0) return null;
+  if (opts.needMl == null || !(opts.needMl > 0)) {
+    return usable[usable.length - 1]?.asset_id ?? null;
+  }
+  return usable.find((t) => Number(t.free_ml ?? 0) >= opts.needMl!)?.asset_id ?? null;
+}

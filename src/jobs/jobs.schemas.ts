@@ -110,12 +110,19 @@ export const updatePieceFilesSchema = z.object({
   // way the assign flow does — the metadata, not the file, gates the lifecycle.
   slicer_print_time_minutes: z.number().int().positive().max(100_000).optional(),
   slicer_filament_used_grams: z.number().positive().max(100_000).optional(),
+  // Resin's quantity. Absent here originally, and because the schema is strict a
+  // resin piece could not send it at all — it could only send a print time, which
+  // then failed the grams-only readiness test and DEMOTED a ready resin piece
+  // back to 'assigned'. Every technology must be able to state its own unit on
+  // any endpoint that recomputes readiness from it.
+  slicer_resin_used_ml: z.number().positive().max(100_000).optional(),
 }).strict().refine(
   (v) =>
     v.slicer_file_url !== undefined ||
     v.stl_file_url !== undefined ||
     v.slicer_print_time_minutes !== undefined ||
-    v.slicer_filament_used_grams !== undefined,
+    v.slicer_filament_used_grams !== undefined ||
+    v.slicer_resin_used_ml !== undefined,
   { message: "Provide at least one of slicer_file_url, stl_file_url, or slicer metadata." }
 );
 export type UpdatePieceFilesInput = z.infer<typeof updatePieceFilesSchema>;

@@ -53,6 +53,8 @@ import {
   techCompatible,
   sameColor,
   colorCompatible,
+  pickTank,
+  type TankChoice,
 } from "./matching";
 
 export {
@@ -63,6 +65,8 @@ export {
   techCompatible,
   sameColor,
   colorCompatible,
+  pickTank,
+  type TankChoice,
 };
 
 // ────────────────────────────────────────────────────────────
@@ -1229,6 +1233,40 @@ export class JobsService {
       }
     }
 
+    // A resin piece cannot be 'ready' without a tank (chk_ready_requires_core_data),
+    // and this wizard never asks for one — it collects the print data and nothing
+    // else. Without resolving one here the piece lands 'assigned' and stops: the
+    // operator has filled in everything the screen asked for and the job still
+    // will not schedule, with nothing saying why.
+    //
+    // So resolve it the same way the one-click assign does, through the SAME
+    // shared rule (pickTank): emptiest colour-matching tank that still covers the
+    // draw. Only when the piece has none already and the caller named none.
+    let resolvedTankId = input.resin_tank_id ?? null;
+    if (isResin && !resolvedTankId && !piece.resin_tank_id) {
+      const printerTech = (piece.required_print_technology ?? "").trim().toUpperCase();
+      const tanks = await this.databaseService.query<TankChoice>(
+        `SELECT ai.asset_id,
+                (COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0))::double precision AS free_ml,
+                NULLIF(TRIM(ai.resin_color), '') AS resin_color
+           FROM asset_instances ai
+           JOIN asset_stock ast ON ast.asset_id = ai.asset_id
+          WHERE ai.company_id = $1
+            AND ai.asset_type = 'resin_tank'
+            AND ai.split_at IS NULL
+            AND COALESCE(ast.status, 'available') NOT IN ('damaged', 'empty')
+            AND (ai.resin_expiry_date IS NULL OR ai.resin_expiry_date >= CURRENT_DATE)
+            AND (COALESCE(ai.resin_tech_compat, 'both') = 'both'
+                 OR COALESCE(ai.resin_tech_compat, 'both') = $2)
+          ORDER BY (COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0)) ASC`,
+        [companyId, printerTech]
+      );
+      resolvedTankId = pickTank(tanks.rows, {
+        needMl: input.slicer_resin_used_ml ?? null,
+        wantColor: piece.required_color,
+      });
+    }
+
     const hasStl = await this.hasStlColumn();
     // Build the SET clause dynamically so we only touch the STL column when
     // the migration has been applied.
@@ -1249,7 +1287,7 @@ export class JobsService {
     // Resin's quantity + tank ride at the end so the FDM placeholders above keep
     // their numbers (and the optional STL slot stays where it is).
     const resinBase = values.length;
-    values.push(input.slicer_resin_used_ml ?? null, input.resin_tank_id ?? null);
+    values.push(input.slicer_resin_used_ml ?? null, resolvedTankId);
     const mlParam = `$${resinBase + 1}`;
     const tankParam = `$${resinBase + 2}`;
 
@@ -1271,15 +1309,28 @@ export class JobsService {
                slicer_resin_used_ml       = COALESCE(${mlParam}, slicer_resin_used_ml),
                resin_tank_id              = COALESCE(${tankParam}, resin_tank_id)
                ${stlSet},
-               -- Readiness is a function of the slicer METADATA in the job's own
-               -- unit: grams for filament, millilitres for resin. Gating a resin
-               -- piece on filament grams would leave it permanently un-ready.
+               -- Readiness must state the SAME rule as chk_ready_requires_core_data,
+               -- because the constraint is what actually decides: anything this
+               -- CASE calls 'ready' that the constraint does not is a CHECK
+               -- violation, and an unhandled Postgres error is a bare 500 with no
+               -- hint of the cause.
+               --
+               -- That is exactly what happened. This tested only the slicer
+               -- METADATA -- time plus the job's own quantity unit -- and omitted
+               -- the TOOLING half. A resin piece needs a TANK as well, and the
+               -- wizard does not send one, so filling in the print data flipped a
+               -- tankless piece to 'ready' and every resin assign died on
+               -- "Internal server error". The filament arm had the same hole: a
+               -- piece with time and grams but no nozzle would have violated it
+               -- too, and only ever escaped because the picker always supplies one.
                status = CASE
                  WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
                   AND CASE
                         WHEN required_print_technology IN ('MSLA', 'SLA')
                           THEN COALESCE(${mlParam}, slicer_resin_used_ml) IS NOT NULL
+                           AND COALESCE(${tankParam}, resin_tank_id) IS NOT NULL
                         ELSE COALESCE($7, slicer_filament_used_grams) IS NOT NULL
+                           AND $4 IS NOT NULL
                       END THEN 'ready'
                  ELSE 'assigned'
                END
@@ -1388,6 +1439,7 @@ export class JobsService {
     // and the STL/slicer file fields on their own still never change status.
     let timeExpr = "slicer_print_time_minutes";
     let gramsExpr = "slicer_filament_used_grams";
+    let mlExpr = "slicer_resin_used_ml";
     if (input.slicer_print_time_minutes !== undefined) {
       values.push(input.slicer_print_time_minutes);
       timeExpr = `$${values.length}`;
@@ -1398,14 +1450,30 @@ export class JobsService {
       gramsExpr = `$${values.length}`;
       sets.push(`slicer_filament_used_grams = ${gramsExpr}`);
     }
+    if (input.slicer_resin_used_ml !== undefined) {
+      values.push(input.slicer_resin_used_ml);
+      mlExpr = `$${values.length}`;
+      sets.push(`slicer_resin_used_ml = ${mlExpr}`);
+    }
     const touchedSlicerMeta =
       input.slicer_print_time_minutes !== undefined ||
-      input.slicer_filament_used_grams !== undefined;
+      input.slicer_filament_used_grams !== undefined ||
+      input.slicer_resin_used_ml !== undefined;
     if (touchedSlicerMeta && (piece.status === "assigned" || piece.status === "ready")) {
+      // Same rule as chk_ready_requires_core_data and as assign(), per technology.
+      // Written against grams alone this was false for every resin piece, so
+      // touching a resin job's print time here silently DEMOTED it from ready
+      // back to assigned — the endpoint that exists to record progress undid it.
       sets.push(
         `status = CASE
            WHEN COALESCE(${timeExpr}, slicer_print_time_minutes) IS NOT NULL
-            AND COALESCE(${gramsExpr}, slicer_filament_used_grams) IS NOT NULL
+            AND CASE
+                  WHEN required_print_technology IN ('MSLA', 'SLA')
+                    THEN COALESCE(${mlExpr}, slicer_resin_used_ml) IS NOT NULL
+                     AND resin_tank_id IS NOT NULL
+                  ELSE COALESCE(${gramsExpr}, slicer_filament_used_grams) IS NOT NULL
+                     AND assigned_nozzle_asset_id IS NOT NULL
+                END
            THEN 'ready' ELSE 'assigned' END`
       );
     }

@@ -12,8 +12,10 @@ import assert from "node:assert/strict";
 import {
   colorCompatible,
   isResinTech,
+  pickTank,
   techCompatible,
   techFamily,
+  type TankChoice,
 } from "../src/jobs/matching.ts";
 
 // ── techFamily / techCompatible ─────────────────────────────────────────────
@@ -103,4 +105,61 @@ test("isResinTech: only MSLA and SLA are resin", () => {
   assert.equal(isResinTech(null), false);
   assert.equal(isResinTech(undefined), false);
   assert.equal(isResinTech(""), false);
+});
+
+// ── pickTank ────────────────────────────────────────────────────────────────
+// Shared by BOTH assign paths (one-click and the wizard). It was written once
+// as a closure inside simple-jobs; the wizard then had no tank resolution at
+// all, so filling in a resin piece's print data left it permanently 'assigned'
+// — and, before the readiness CASE was corrected, threw a bare 500 instead.
+// Callers pass tanks EMPTIEST-FIRST (both order in SQL).
+
+const tanks = (...rows: Array<[string, number | null, string | null]>): TankChoice[] =>
+  rows.map(([asset_id, free_ml, resin_color]) => ({ asset_id, free_ml, resin_color }));
+
+test("pickTank: finishes the most depleted tank that still covers the draw", () => {
+  const shelf = tanks(["low", 40, "Black"], ["mid", 300, "Black"], ["full", 900, "Black"]);
+  assert.equal(pickTank(shelf, { needMl: 100, wantColor: "Black" }), "mid");
+});
+
+test("pickTank: an exact fit counts as covering", () => {
+  const shelf = tanks(["exact", 100, null], ["big", 900, null]);
+  assert.equal(pickTank(shelf, { needMl: 100, wantColor: null }), "exact");
+});
+
+test("pickTank: colour is a hard filter, not a preference", () => {
+  // The yellow tank has plenty of volume and comes first; it must still lose.
+  const shelf = tanks(["yellow", 50, "Yellow"], ["blue", 800, "Blue"]);
+  assert.equal(pickTank(shelf, { needMl: 100, wantColor: "Blue" }), "blue");
+});
+
+test("pickTank: no tank of the wanted colour returns null, never a wrong colour", () => {
+  const shelf = tanks(["yellow", 900, "Yellow"], ["red", 900, "Red"]);
+  assert.equal(pickTank(shelf, { needMl: 100, wantColor: "Blue" }), null);
+});
+
+test("pickTank: an unlabelled tank can serve a colour request", () => {
+  const shelf = tanks(["unlabelled", 900, null]);
+  assert.equal(pickTank(shelf, { needMl: 100, wantColor: "Blue" }), "unlabelled");
+});
+
+test("pickTank: nothing covers the draw → null, rather than a tank that will fail later", () => {
+  const shelf = tanks(["a", 10, null], ["b", 20, null]);
+  assert.equal(pickTank(shelf, { needMl: 500, wantColor: null }), null);
+});
+
+test("pickTank: volume not known yet takes the most depleted compatible tank", () => {
+  // needMl null = the operator fills it in at the slicer step.
+  const shelf = tanks(["low", 40, "Grey"], ["high", 900, "Grey"]);
+  assert.equal(pickTank(shelf, { needMl: null, wantColor: "Grey" }), "high");
+  assert.equal(pickTank(shelf, { needMl: 0, wantColor: "Grey" }), "high");
+});
+
+test("pickTank: an empty shelf is null, not a crash", () => {
+  assert.equal(pickTank([], { needMl: 100, wantColor: "Black" }), null);
+});
+
+test("pickTank: a null free_ml is treated as empty, never as unlimited", () => {
+  const shelf = tanks(["unknown", null, null], ["known", 500, null]);
+  assert.equal(pickTank(shelf, { needMl: 100, wantColor: null }), "known");
 });

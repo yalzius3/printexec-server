@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import type { PoolClient } from "pg";
 import { DatabaseService } from "../database/database.service";
-import { JobsService, colorCompatible, isResinTech, techFamily } from "../jobs/jobs.service";
+import { JobsService, colorCompatible, isResinTech, pickTank, techFamily } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
 import { FinanceService } from "../finance/finance.service";
 import {
@@ -235,16 +235,15 @@ export class SimpleJobsService {
      *  so pouring a blue print from the yellow vat scraps the part. An
      *  unrecorded colour on either side stays a wildcard (see colorCompatible),
      *  so shops that don't track colour are unaffected. */
-    const resolveTankFor = (needMl: number | null, wantColor: string | null): string | null => {
-      if (resinTankId) return resinTankId;
-      const usable = resinTanks.filter((t) => colorCompatible(wantColor, t.resin_color));
-      if (usable.length === 0) return null;
-      if (needMl == null || !(needMl > 0)) return usable[usable.length - 1]?.asset_id ?? null;
-      const fits = usable.find((t) => Number(t.free_ml ?? 0) >= needMl);
-      // Nothing covers it: leave it unlinked rather than pick a tank that will
-      // fail the volume check at schedule time with a confusing error.
-      return fits?.asset_id ?? null;
-    };
+    const resolveTankFor = (needMl: number | null, wantColor: string | null): string | null =>
+      resinTankId ?? pickTank(
+        resinTanks.map((t) => ({
+          asset_id: t.asset_id,
+          free_ml: t.free_ml == null ? null : Number(t.free_ml),
+          resin_color: t.resin_color,
+        })),
+        { needMl, wantColor }
+      );
 
     // The operator's explicit picks (bulk: one per requirement). De-duped.
     // Every pick must be compatible with the chosen printer.
