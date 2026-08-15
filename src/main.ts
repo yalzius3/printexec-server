@@ -9,6 +9,65 @@ import {
 
 import { AppModule } from "./app.module";
 
+// A raw Postgres failure reaches the browser as "Internal server error" and
+// nothing else. The cause is in the server log, so anyone WITHOUT log access —
+// an operator, or someone debugging a deployed environment remotely — has no
+// way to tell a missing migration from a genuine bug. Every resin failure in
+// this subsystem cost a round-trip for exactly that reason.
+//
+// These are the failure modes that are about the SHAPE of the database rather
+// than the request, and each has an obvious next action, so say it.
+type PgError = {
+  code?: string;
+  column?: string;
+  constraint?: string;
+  table?: string;
+  message?: string;
+};
+const isPgError = (e: unknown): e is PgError =>
+  !!e && typeof e === "object" && typeof (e as PgError).code === "string";
+
+/** Postgres SQLSTATE → (http status, actionable message). Schema names only —
+ *  never row values, which could carry customer data. */
+function describePgError(e: PgError): { status: number; message: string } | null {
+  switch (e.code) {
+    case "42703": // undefined_column
+      return {
+        // 503, not 400: the request was fine, the deployment is incomplete.
+        status: 503,
+        message:
+          `The database is missing a column this feature needs${e.column ? ` ("${e.column}")` : ""}. ` +
+          `A migration in printexec-server/migrations/ has not been applied to this database yet.`,
+      };
+    case "42P01": // undefined_table
+      return {
+        status: 503,
+        message:
+          `The database is missing a table this feature needs${e.table ? ` ("${e.table}")` : ""}. ` +
+          `A migration in printexec-server/migrations/ has not been applied to this database yet.`,
+      };
+    case "23514": // check_violation
+      return {
+        status: 409,
+        message:
+          `The database rejected this change: it violates ${e.constraint ? `"${e.constraint}"` : "a check constraint"}. ` +
+          `The record is missing something that status or state requires.`,
+      };
+    case "23503": // foreign_key_violation
+      return {
+        status: 409,
+        message: `This references a record that does not exist${e.constraint ? ` (${e.constraint})` : ""}.`,
+      };
+    case "23502": // not_null_violation
+      return {
+        status: 409,
+        message: `A required field was empty${e.column ? ` ("${e.column}")` : ""}.`,
+      };
+    default:
+      return null;
+  }
+}
+
 // Log the stack for any non-HTTP (i.e. unexpected 500) exception so "Internal
 // server error" responses are diagnosable instead of opaque.
 @Catch()
@@ -18,6 +77,18 @@ class LoggingExceptionFilter extends BaseExceptionFilter {
     const req = host.switchToHttp().getRequest<{ method?: string; url?: string }>();
     if (!(exception instanceof HttpException)) {
       this.logger.error(`500 on ${req?.method} ${req?.url}: ${(exception as Error)?.message}`, (exception as Error)?.stack);
+      // Re-throw as a described HttpException so the browser gets the reason,
+      // not just the fact. The full stack is already logged above.
+      if (isPgError(exception)) {
+        const described = describePgError(exception);
+        if (described) {
+          this.logger.error(`  ↳ pg ${exception.code}: ${described.message}`);
+          return super.catch(
+            new HttpException(described.message, described.status),
+            host
+          );
+        }
+      }
     } else if (exception.getStatus() >= 400) {
       // Log client errors too (temporarily) so opaque "loads then fails" UI
       // failures are diagnosable — includes the human message.

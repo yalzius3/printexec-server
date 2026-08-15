@@ -9,6 +9,7 @@ import { DatabaseModule } from "./database/database.module";
 import { EmailModule } from "./email/email.module";
 import { FinanceModule } from "./finance/finance.module";
 import { HealthController } from "./health/health.controller";
+import { SchemaHealthController } from "./health/schema-health.controller";
 import { BedsModule } from "./beds/beds.module";
 import { JobsModule } from "./jobs/jobs.module";
 import { LicensingModule } from "./licensing/licensing.module";
@@ -48,7 +49,7 @@ import { LicenseGuard } from "./licensing/license.guard";
     StaffModule,
     UploadsModule
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, SchemaHealthController],
   providers: [
     // Order matters: SupabaseAuthGuard must run first (sets req.permissions),
     // then PermissionGuard reads them, then LicenseGuard (needs req.companyId).

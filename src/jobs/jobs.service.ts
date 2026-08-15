@@ -1246,9 +1246,16 @@ export class JobsService {
     if (isResin && !resolvedTankId && !piece.resin_tank_id) {
       const printerTech = (piece.required_print_technology ?? "").trim().toUpperCase();
       const tanks = await this.databaseService.query<TankChoice>(
+        // resin_color is read through to_jsonb rather than named directly: its
+        // migration (2026-08-13_resin_color.sql) may not be applied yet, and
+        // naming a missing column makes the whole statement fail — which would
+        // turn "colour is not recorded" into "no resin piece can be assigned at
+        // all". Missing column reads as NULL, which colorCompatible treats as a
+        // wildcard, so an un-migrated database simply skips colour matching.
+        // Same idiom as the automated-messages column in order-notifications.
         `SELECT ai.asset_id,
                 (COALESCE(ast.remaining_volume_ml, 0) - COALESCE(ast.reserved_volume_ml, 0))::double precision AS free_ml,
-                NULLIF(TRIM(ai.resin_color), '') AS resin_color
+                NULLIF(TRIM(to_jsonb(ai) ->> 'resin_color'), '') AS resin_color
            FROM asset_instances ai
            JOIN asset_stock ast ON ast.asset_id = ai.asset_id
           WHERE ai.company_id = $1
