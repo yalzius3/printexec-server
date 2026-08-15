@@ -1627,8 +1627,15 @@ export class JobsService {
     // means the slicer metadata is missing. The DB's chk_scheduled_requires_core_data
     // would reject anyway; the explicit check gives a friendlier message.
     if (piece.status !== "ready" && piece.status !== "scheduled") {
+      // Name the quantity in the piece's OWN unit. Telling a resin operator to
+      // enter "filament grams" sends them looking for a figure their job does
+      // not have — the checks below already branch correctly, only this message
+      // was still written for filament.
+      const quantity = isResinTech(piece.required_print_technology)
+        ? "resin millilitres"
+        : "filament grams";
       throw new ConflictException(
-        `Cannot schedule a '${piece.status}' piece. Enter its print time + filament grams (typed, quote-assumed, or read from a G-code) so it reaches 'ready' first.`
+        `Cannot schedule a '${piece.status}' piece. Enter its print time + ${quantity} (typed, quote-assumed, or read from a G-code) so it reaches 'ready' first.`
       );
     }
     // Friendly preflight — the DB enforces these via chk_scheduled_requires_core_data,
