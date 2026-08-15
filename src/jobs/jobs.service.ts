@@ -1315,32 +1315,7 @@ export class JobsService {
                slicer_filament_used_grams = COALESCE($7, slicer_filament_used_grams),
                slicer_resin_used_ml       = COALESCE(${mlParam}, slicer_resin_used_ml),
                resin_tank_id              = COALESCE(${tankParam}, resin_tank_id)
-               ${stlSet},
-               -- Readiness must state the SAME rule as chk_ready_requires_core_data,
-               -- because the constraint is what actually decides: anything this
-               -- CASE calls 'ready' that the constraint does not is a CHECK
-               -- violation, and an unhandled Postgres error is a bare 500 with no
-               -- hint of the cause.
-               --
-               -- That is exactly what happened. This tested only the slicer
-               -- METADATA -- time plus the job's own quantity unit -- and omitted
-               -- the TOOLING half. A resin piece needs a TANK as well, and the
-               -- wizard does not send one, so filling in the print data flipped a
-               -- tankless piece to 'ready' and every resin assign died on
-               -- "Internal server error". The filament arm had the same hole: a
-               -- piece with time and grams but no nozzle would have violated it
-               -- too, and only ever escaped because the picker always supplies one.
-               status = CASE
-                 WHEN COALESCE($5, slicer_print_time_minutes) IS NOT NULL
-                  AND CASE
-                        WHEN required_print_technology IN ('MSLA', 'SLA')
-                          THEN COALESCE(${mlParam}, slicer_resin_used_ml) IS NOT NULL
-                           AND COALESCE(${tankParam}, resin_tank_id) IS NOT NULL
-                        ELSE COALESCE($7, slicer_filament_used_grams) IS NOT NULL
-                           AND $4 IS NOT NULL
-                      END THEN 'ready'
-                 ELSE 'assigned'
-               END
+               ${stlSet}
          WHERE company_id = $1 AND piece_id = $2
          RETURNING piece_id
       `,
@@ -1348,6 +1323,44 @@ export class JobsService {
     );
     if (updated.rowCount === 0) {
       throw new NotFoundException("Piece not found.");
+    }
+
+    // ── Status is set SEPARATELY, and deliberately so. ──────────────────────
+    //
+    // This used to ride along in the UPDATE above as a CASE. That coupled the
+    // operator's DATA to a derived flag: if our CASE and the database's
+    // chk_ready_requires_core_data disagreed by even one term, Postgres rejected
+    // the whole statement, the print data the operator had just typed was thrown
+    // away, and the browser got a bare "Internal server error" naming nothing.
+    //
+    // The two rules are maintained in different places (TypeScript here, SQL in
+    // migrations/) and applied to databases at different times, so they WILL
+    // disagree eventually — most obviously when a migration has not been applied
+    // yet and an older constraint is still live. Writing the data first makes
+    // that disagreement cost a status promotion instead of the operator's work.
+    const after = await this.loadJob(companyId, pieceId);
+    const target = this.isPieceSchedulable(after) ? "ready" : "assigned";
+    if (after.status !== target) {
+      try {
+        await this.databaseService.query(
+          `UPDATE order_pieces SET status = $3 WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, pieceId, target]
+        );
+      } catch (err) {
+        // 23514 = check_violation. The database's readiness rule is stricter than
+        // ours, which in practice means a pending migration. The slicer data is
+        // already saved, so report what is actually wrong and let the operator
+        // carry on rather than failing the whole save.
+        const code = (err as { code?: string })?.code;
+        if (code !== "23514") throw err;
+        const constraint = (err as { constraint?: string })?.constraint ?? "a check constraint";
+        throw new ConflictException(
+          `The print data was saved, but this piece could not be marked '${target}': the database's ` +
+          `readiness rule (${constraint}) rejected it. This normally means a migration in ` +
+          `printexec-server/migrations/ has not been applied to this database yet — check ` +
+          `GET /api/health/schema.`
+        );
+      }
     }
 
     // Multicolor: persist the per-slot slicer demand and sync the piece total
@@ -1466,24 +1479,12 @@ export class JobsService {
       input.slicer_print_time_minutes !== undefined ||
       input.slicer_filament_used_grams !== undefined ||
       input.slicer_resin_used_ml !== undefined;
-    if (touchedSlicerMeta && (piece.status === "assigned" || piece.status === "ready")) {
-      // Same rule as chk_ready_requires_core_data and as assign(), per technology.
-      // Written against grams alone this was false for every resin piece, so
-      // touching a resin job's print time here silently DEMOTED it from ready
-      // back to assigned — the endpoint that exists to record progress undid it.
-      sets.push(
-        `status = CASE
-           WHEN COALESCE(${timeExpr}, slicer_print_time_minutes) IS NOT NULL
-            AND CASE
-                  WHEN required_print_technology IN ('MSLA', 'SLA')
-                    THEN COALESCE(${mlExpr}, slicer_resin_used_ml) IS NOT NULL
-                     AND resin_tank_id IS NOT NULL
-                  ELSE COALESCE(${gramsExpr}, slicer_filament_used_grams) IS NOT NULL
-                     AND assigned_nozzle_asset_id IS NOT NULL
-                END
-           THEN 'ready' ELSE 'assigned' END`
-      );
-    }
+    // Whether to recompute readiness AFTER the data lands. Deliberately not part
+    // of the same UPDATE — see the note in assign(): coupling the operator's data
+    // to a derived flag means one disagreement with the database's own readiness
+    // rule discards the data and returns a bare 500.
+    const recomputeStatus =
+      touchedSlicerMeta && (piece.status === "assigned" || piece.status === "ready");
 
     if (sets.length === 0) return this.loadJob(companyId, pieceId);
 
@@ -1492,6 +1493,28 @@ export class JobsService {
         WHERE company_id = $1 AND piece_id = $2`,
       values
     );
+    if (recomputeStatus) {
+      const after = await this.loadJob(companyId, pieceId);
+      const target = this.isPieceSchedulable(after) ? "ready" : "assigned";
+      if (after.status !== target) {
+        try {
+          await this.databaseService.query(
+            `UPDATE order_pieces SET status = $3 WHERE company_id = $1 AND piece_id = $2`,
+            [companyId, pieceId, target]
+          );
+        } catch (err) {
+          // Same contract as assign(): the files and metadata are already saved,
+          // so a stricter database rule costs the promotion, not the work.
+          if ((err as { code?: string })?.code !== "23514") throw err;
+          const constraint = (err as { constraint?: string })?.constraint ?? "a check constraint";
+          throw new ConflictException(
+            `The slicer details were saved, but this piece could not be marked '${target}': the ` +
+            `database's readiness rule (${constraint}) rejected it. This normally means a migration ` +
+            `in printexec-server/migrations/ has not been applied — check GET /api/health/schema.`
+          );
+        }
+      }
+    }
     // Fresh metadata flows to any still-empty duplicates of this piece.
     if (touchedSlicerMeta) {
       await propagateSlicerMetaToDuplicatesTx(this.databaseService, companyId, pieceId);
