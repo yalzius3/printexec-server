@@ -282,6 +282,22 @@ export class AuthController {
     } catch {
       // column not migrated yet — client treats undefined as on
     }
+    // Best-effort asset-form display default (2026-08-16 migration). Its own
+    // group for the same reason as the one above: this is a cosmetic preference
+    // and must never be the thing that takes a real flag — or a login — down.
+    // Absent reads as undefined, which the client treats as "show everything",
+    // matching the column default.
+    try {
+      const formPrefs = await this.db.query<{ hide_extra_asset_fields: boolean }>(
+        `SELECT c.hide_extra_asset_fields
+         FROM companies c JOIN users u ON u.company_id = c.company_id
+         WHERE u.id = $1`,
+        [userId]
+      );
+      if (formPrefs.rows[0]) Object.assign(profile, formPrefs.rows[0]);
+    } catch {
+      // column not migrated yet — client shows every field, as it does today
+    }
     // Best-effort terms state — drives the client's re-accept interstitial.
     // Only attached when the tos columns exist (2026-07-17 migration), so a
     // pre-migration DB simply doesn't gate anyone.
@@ -451,6 +467,35 @@ export class AuthController {
     await this.db.query(
       "UPDATE companies SET automated_messages_enabled = $1 WHERE company_id = $2",
       [parsed.data.automated_messages_enabled, companyId]
+    );
+
+    // Full profile, never a partial one — see composeProfile.
+    return this.composeProfile(userId);
+  }
+
+  // Owner-only: the house default for how much of an asset intake form is shown
+  // at once. Display only — nothing on the server reads this back, and no asset
+  // data changes shape because of it. Owner-set because the alternative is every
+  // operator tidying the same five forms for themselves.
+  @Post("extra-asset-fields")
+  async setExtraAssetFields(
+    @UserId() userId: string,
+    @CompanyId() companyId: string,
+    @UserRole() role: "owner" | "staff",
+    @Body() body: unknown
+  ) {
+    const parsed = z.object({ hide_extra_asset_fields: z.boolean() }).safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException("hide_extra_asset_fields must be a boolean.");
+    }
+
+    if (role !== "owner") {
+      throw new UnauthorizedException("Only the company owner can change the asset form default.");
+    }
+
+    await this.db.query(
+      "UPDATE companies SET hide_extra_asset_fields = $1 WHERE company_id = $2",
+      [parsed.data.hide_extra_asset_fields, companyId]
     );
 
     // Full profile, never a partial one — see composeProfile.
