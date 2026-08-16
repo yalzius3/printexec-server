@@ -518,6 +518,8 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
       const { rows } = await db.query<{
         printer_id: string;
         label: string | null;
+        print_technology: string | null;
+        marker: string | null;
         booked_hours: number;
         pieces_done: number;
         waste_events: number;
@@ -527,6 +529,11 @@ export const ANALYTICS_TOOLS: AnalyticsTool[] = [
         `
           SELECT pi.printer_id,
                  NULLIF(TRIM(CONCAT_WS(' ', pi.brand, pi.model)), '') AS label,
+                 -- Identity alongside the name: a leaderboard of five identical
+                 -- models is unreadable without the marker, and FDM and resin
+                 -- machines are not comparable on hours alone.
+                 pi.print_technology,
+                 pi.marker,
                  COALESCE(bh.hours, 0)::float8 AS booked_hours,
                  COALESCE(pc.n, 0)::int AS pieces_done,
                  COALESCE(w.events, 0)::int AS waste_events,

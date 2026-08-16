@@ -75,6 +75,8 @@ type PieceRow = {
   last_updated_at: string;
   order_status: string;
   assigned_printer_label?: string | null;
+  assigned_printer_technology?: string | null;
+  assigned_printer_marker?: string | null;
   assigned_nozzle_label?: string | null;
 };
 
@@ -292,6 +294,10 @@ export class OrderPiecesService {
               THEN NULLIF(TRIM(CONCAT_WS(' ', pi.brand, pi.model)), '')
             ELSE NULL
           END AS assigned_printer_label,
+          -- The machine's own technology + operator marker, so an order row can
+          -- show WHICH box a piece is going to rather than just its model name.
+          pi.print_technology AS assigned_printer_technology,
+          pi.marker           AS assigned_printer_marker,
           CASE
             WHEN noz.asset_id IS NOT NULL
               THEN NULLIF(
@@ -380,6 +386,10 @@ export class OrderPiecesService {
               THEN NULLIF(TRIM(CONCAT_WS(' ', pi.brand, pi.model)), '')
             ELSE NULL
           END AS assigned_printer_label,
+          -- The machine's own technology + operator marker, so an order row can
+          -- show WHICH box a piece is going to rather than just its model name.
+          pi.print_technology AS assigned_printer_technology,
+          pi.marker           AS assigned_printer_marker,
           CASE
             WHEN noz.asset_id IS NOT NULL
               THEN NULLIF(

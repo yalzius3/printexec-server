@@ -237,6 +237,11 @@ export const createPrinterSchema = z
     purchase_price: z.coerce.number().min(0).nullable().optional(),
     power_watts: z.coerce.number().nullable().optional(),
     location: z.string().trim().min(1).optional(),
+    // Optional short freeform marker to physically distinguish otherwise-identical
+    // printers. Same shape as the spool/tank marker, and the same shape the
+    // update schema below already accepted — intake dropped it, so a marker
+    // could only be set by editing the printer after the fact.
+    marker: z.string().trim().min(1).max(16).optional(),
     notes: z.string().optional(),
     // Operator-set starting meter for hours already worked before this printer
     // was added to the system. Editable later via the stock PATCH.

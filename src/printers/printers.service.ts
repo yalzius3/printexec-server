@@ -366,12 +366,13 @@ export class PrintersService {
             has_filament_sensor,
             network_capability,
             location,
+            marker,
             notes
           )
           VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
             $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-            $25, $26, $27, $28, $29, $30
+            $25, $26, $27, $28, $29, $30, $31
           )
           RETURNING printer_id
         `,
@@ -405,6 +406,7 @@ export class PrintersService {
           printerReference.has_filament_sensor,
           printerReference.network_capability,
           input.location ?? null,
+          input.marker ?? null,
           input.notes ?? null
         ],
         client
@@ -576,6 +578,13 @@ export class PrintersService {
       `
         SELECT
           ai.asset_id,
+          -- Identity, not just spec. Without these every nozzle of the same
+          -- diameter+material renders as the same string, which makes a picker
+          -- (and especially a MULTI-select picker) impossible to use: you
+          -- cannot tick the right one out of three identical rows.
+          ai.nozzle_name,
+          ai.nozzle_brand,
+          ai.location,
           ai.nozzle_diameter_mm,
           ai.nozzle_material,
           ai.nozzle_max_temp,
@@ -615,6 +624,11 @@ export class PrintersService {
           pnc.nozzle_asset_id,
           pnc.confirmed_at,
           pnc.notes,
+          -- Same identity fields the options list carries, so a nozzle reads
+          -- identically once it's compatible as it did in the picker.
+          ai.nozzle_name,
+          ai.nozzle_brand,
+          ai.location,
           ai.nozzle_diameter_mm,
           ai.nozzle_material,
           ai.nozzle_max_temp,

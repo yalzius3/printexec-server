@@ -99,6 +99,8 @@ interface JobRow {
   status: JobStatus;
   assigned_printer_id: string | null;
   assigned_printer_label: string | null;
+  assigned_printer_technology: string | null;
+  assigned_printer_marker: string | null;
   assigned_nozzle_asset_id: string | null;
   required_print_technology: string | null;
   required_nozzle_diameter_mm: number | null;
@@ -547,6 +549,13 @@ export class JobsService {
           WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model
           ELSE NULL
         END AS assigned_printer_label,
+        -- The assigned machine's OWN identity, alongside its label. Distinct
+        -- from op.required_print_technology below: that is what the piece asks
+        -- for, this is what the box actually is. They must agree once assigned,
+        -- and showing the machine's own value is what makes a disagreement
+        -- visible instead of assumed.
+        pi.print_technology AS assigned_printer_technology,
+        pi.marker           AS assigned_printer_marker,
         op.assigned_nozzle_asset_id,
         op.required_print_technology,
         op.required_nozzle_diameter_mm,
@@ -2427,6 +2436,8 @@ export class JobsService {
              pb.status,
              pb.assigned_printer_id,
              CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS assigned_printer_label,
+             pi.print_technology AS assigned_printer_technology,
+             pi.marker           AS assigned_printer_marker,
              pb.assigned_nozzle_asset_id,
              pb.required_print_technology,
              pb.required_nozzle_diameter_mm,
@@ -2503,10 +2514,13 @@ export class JobsService {
         // the pieces on it, which is exactly backwards — a resin printer is a
         // resin printer with an empty board.
         print_technology: string | null;
+        // The operator's physical tag for this machine. Travels with the board
+        // so a lane can name the box in the room, not just its model.
+        marker: string | null;
         is_under_maintenance: boolean;
         is_offline: boolean;
       }>(
-        `SELECT pi.printer_id, pi.brand, pi.model, pi.location, pi.print_technology,
+        `SELECT pi.printer_id, pi.brand, pi.model, pi.location, pi.print_technology, pi.marker,
                 COALESCE(ps.is_under_maintenance, FALSE) AS is_under_maintenance,
                 COALESCE(ps.is_offline, FALSE) AS is_offline
            FROM printer_instances pi
@@ -2768,6 +2782,8 @@ export class JobsService {
                 pb.status,
                 pb.assigned_printer_id,
                 CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS assigned_printer_label,
+                pi.print_technology AS assigned_printer_technology,
+                pi.marker           AS assigned_printer_marker,
                 pb.assigned_nozzle_asset_id,
                 pb.required_print_technology,
                 pb.required_nozzle_diameter_mm,
@@ -2928,6 +2944,8 @@ export class JobsService {
                 pb.status,
                 pb.assigned_printer_id,
                 CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS assigned_printer_label,
+                pi.print_technology AS assigned_printer_technology,
+                pi.marker           AS assigned_printer_marker,
                 pb.assigned_nozzle_asset_id,
                 pb.required_print_technology,
                 pb.required_nozzle_diameter_mm,
@@ -3437,10 +3455,17 @@ export class JobsService {
         model: string;
         serial_number: string | null;
         location: string | null;
+        // Same two identity facts the single-printer board already carries, so
+        // a lane on the multi-printer timeline can say what the machine is and
+        // which physical box it is — a row of identical models is otherwise
+        // indistinguishable here.
+        print_technology: string | null;
+        marker: string | null;
         is_under_maintenance: boolean;
         is_offline: boolean;
       }>(
         `SELECT pi.printer_id, pi.brand, pi.model, pi.serial_number, pi.location,
+                pi.print_technology, pi.marker,
                 COALESCE(ps.is_under_maintenance, FALSE) AS is_under_maintenance,
                 COALESCE(ps.is_offline, FALSE) AS is_offline
            FROM printer_instances pi
@@ -3490,6 +3515,8 @@ export class JobsService {
                 pb.status,
                 pb.assigned_printer_id,
                 CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END AS assigned_printer_label,
+                pi.print_technology AS assigned_printer_technology,
+                pi.marker           AS assigned_printer_marker,
                 pb.assigned_nozzle_asset_id,
                 pb.required_print_technology,
                 pb.required_nozzle_diameter_mm,

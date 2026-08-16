@@ -50,6 +50,8 @@ export interface BedRow {
   slicer_resin_used_ml: number | null;
   assigned_printer_id: string | null;
   assigned_printer_label: string | null;
+  assigned_printer_technology: string | null;
+  assigned_printer_marker: string | null;
   assigned_nozzle_asset_id: string | null;
   status:
     | "pending" | "assigned" | "ready" | "scheduled"
@@ -384,6 +386,8 @@ export class BedsService {
         CASE WHEN pi.printer_id IS NOT NULL
              THEN pi.brand || ' ' || pi.model
              ELSE NULL END AS assigned_printer_label,
+        pi.print_technology AS assigned_printer_technology,
+        pi.marker           AS assigned_printer_marker,
         pb.assigned_nozzle_asset_id,
         pb.status,
         pb.scheduled_at,

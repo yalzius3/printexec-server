@@ -1273,6 +1273,8 @@ export class SimpleJobsService {
       printer_id: string;
       brand: string;
       model: string;
+      print_technology: string | null;
+      marker: string | null;
       running_until: string | null;
       busy_minutes: string | number;
     }>(
@@ -1281,6 +1283,11 @@ export class SimpleJobsService {
           pi.printer_id,
           pi.brand,
           pi.model,
+          -- Identity for the picker's badge. This is the screen where the
+          -- operator CHOOSES a machine, so "which physical box is this" and
+          -- "what can it run" matter more here than anywhere else.
+          pi.print_technology,
+          pi.marker,
           MAX(CASE WHEN op.scheduled_start_at <= now() AND op.scheduled_end_at > now()
                    THEN op.scheduled_end_at END) AS running_until,
           COALESCE(SUM(
@@ -1302,7 +1309,7 @@ export class SimpleJobsService {
           AND op.scheduled_start_at IS NOT NULL
           AND op.scheduled_end_at IS NOT NULL
         WHERE ${filters.join(" AND ")}
-        GROUP BY pi.printer_id, pi.brand, pi.model
+        GROUP BY pi.printer_id, pi.brand, pi.model, pi.print_technology, pi.marker
         ORDER BY pi.brand, pi.model
       `,
       params
@@ -1485,6 +1492,8 @@ export class SimpleJobsService {
         printer_id: r.printer_id,
         brand: r.brand,
         model: r.model,
+        print_technology: r.print_technology,
+        marker: r.marker,
         // null = idle now; otherwise when the current block (piece or bed) ends.
         next_idle_at: runningUntil,
         free_minutes: Math.max(0, Math.round(windowMinutes - busy)),
