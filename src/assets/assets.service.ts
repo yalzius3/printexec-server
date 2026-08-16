@@ -110,24 +110,31 @@ export class AssetsService {
     private readonly financeService: FinanceService
   ) {}
 
-  async listFilamentReferences(query: ListFilamentReferencesQuery) {
-    const values: unknown[] = [];
+  // The catalog is global, but "which of these do WE actually buy" is not, so
+  // every row carries this company's spool count. The asset pickers rank on it
+  // (most-added first) instead of making the operator hunt a 75-row alphabet
+  // for the four references the shop restocks every week.
+  async listFilamentReferences(
+    companyId: string,
+    query: ListFilamentReferencesQuery
+  ) {
+    const values: unknown[] = [companyId];
     const filters: string[] = [];
 
     if (query.brand) {
       values.push(query.brand);
-      filters.push(`brand = $${values.length}`);
+      filters.push(`fr.brand = $${values.length}`);
     }
 
     if (query.material_type) {
       values.push(query.material_type);
-      filters.push(`material_type = $${values.length}`);
+      filters.push(`fr.material_type = $${values.length}`);
     }
 
     if (query.search) {
       values.push(`%${query.search}%`);
       filters.push(
-        `(brand ILIKE $${values.length} OR material_type ILIKE $${values.length} OR color ILIKE $${values.length})`
+        `(fr.brand ILIKE $${values.length} OR fr.material_type ILIKE $${values.length} OR fr.color ILIKE $${values.length})`
       );
     }
 
@@ -137,32 +144,46 @@ export class AssetsService {
     const result = await this.databaseService.query(
       `
         SELECT
-          filament_ref_id,
-          brand,
-          material_type,
-          color,
-          diameter,
-          melting_temp,
-          max_print_speed_mm_s,
-          hex,
-          density,
-          bed_temp,
-          bed_temp_range,
-          extruder_temp_range,
-          finish,
-          fill,
-          pattern,
-          multi_color_direction,
-          translucent,
-          glow,
-          description,
-          notes,
-          source_type,
-          company_id,
-          created_by_company_id
-        FROM filament_reference
+          fr.filament_ref_id,
+          fr.brand,
+          fr.material_type,
+          fr.color,
+          fr.diameter,
+          fr.melting_temp,
+          fr.max_print_speed_mm_s,
+          fr.hex,
+          fr.density,
+          fr.bed_temp,
+          fr.bed_temp_range,
+          fr.extruder_temp_range,
+          fr.finish,
+          fr.fill,
+          fr.pattern,
+          fr.multi_color_direction,
+          fr.translucent,
+          fr.glow,
+          fr.description,
+          fr.notes,
+          fr.source_type,
+          fr.company_id,
+          fr.created_by_company_id,
+          COALESCE(u.usage_count, 0) AS usage_count
+        FROM filament_reference fr
+        -- Aggregated in a subquery rather than joined-then-grouped: the catalog
+        -- is the driving table and must not be fanned out by spool rows. Hits
+        -- idx_asset_instances_company_type (company_id, asset_type).
+        LEFT JOIN (
+          SELECT
+            filament_ref_id,
+            COUNT(*)::int AS usage_count
+          FROM asset_instances
+          WHERE company_id = $1
+            AND asset_type = 'filament_spool'
+            AND filament_ref_id IS NOT NULL
+          GROUP BY filament_ref_id
+        ) u ON u.filament_ref_id = fr.filament_ref_id
         ${whereClause}
-        ORDER BY brand, material_type, color
+        ORDER BY fr.brand, fr.material_type, fr.color
       `,
       values
     );

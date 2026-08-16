@@ -36,8 +36,9 @@ export class AssetsController {
   // this catalogue, so order staff must read it without Assets access.
   @Get("filament-references")
   @RequirePermission(["view_assets", "view_orders"])
-  listFilamentReferences(@Query() query: unknown) {
+  listFilamentReferences(@CompanyId() companyId: string, @Query() query: unknown) {
     return this.assetsService.listFilamentReferences(
+      companyId,
       parseWithSchema(listFilamentReferencesQuerySchema, query)
     );
   }
