@@ -8,6 +8,7 @@ import {
   createResinTankSchema,
   createSparePartSchema,
   createSpoolSchema,
+  listAssetBatchesQuerySchema,
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
   listFilamentReferencesQuerySchema,
@@ -27,6 +28,7 @@ type UpdateAssetInput = z.infer<typeof updateAssetSchema>;
 type UpdateAssetStockInput = z.infer<typeof updateAssetStockSchema>;
 type ListFilamentReferencesQuery = z.infer<typeof listFilamentReferencesQuerySchema>;
 type ListAssetHistoryQuery = z.infer<typeof listAssetHistoryQuerySchema>;
+type ListAssetBatchesQuery = z.infer<typeof listAssetBatchesQuerySchema>;
 type SplitAssetInput = z.infer<typeof splitAssetSchema>;
 
 type AssetRow = {
@@ -66,6 +68,13 @@ type AssetRow = {
   location: string | null;
   marker: string | null;
   notes: string | null;
+  // Intake lot (filament spools only; NULL everywhere else). batch_size is the
+  // lot's CURRENT spool count, counted on read rather than stored — spools get
+  // deleted and split, and a stored counter would drift away from the shelf.
+  batch_id: string | null;
+  batch_number: string | null;
+  batch_name: string | null;
+  batch_size: string | null;
   created_at: string;
   stock_status: string;
   remaining_grams: string | null;
@@ -970,6 +979,13 @@ export class AssetsService {
       filters.push(`ast.status = $${values.length}`);
     }
 
+    // Exact lot. Narrower than `search` on purpose: clicking a spool's badge
+    // must show that lot and nothing that merely shares its name.
+    if (query.batch_id) {
+      values.push(query.batch_id);
+      filters.push(`ai.batch_id = $${values.length}`);
+    }
+
     if (query.search) {
       values.push(`%${query.search}%`);
       filters.push(`
@@ -990,6 +1006,11 @@ export class AssetsService {
           OR ai.resin_brand ILIKE $${values.length}
           OR ai.resin_type ILIKE $${values.length}
           OR ai.resin_color ILIKE $${values.length}
+          -- Both halves of a lot's identity are searchable, because operators
+          -- know a delivery by whichever one they wrote down: the number they
+          -- read off the badge, or the name they gave it ("lab batch").
+          OR ab.batch_number ILIKE $${values.length}
+          OR ab.name ILIKE $${values.length}
         )
       `);
     }
@@ -1057,6 +1078,15 @@ export class AssetsService {
       const quantity = input.quantity ?? 1;
       const createdAssetIds: string[] = [];
 
+      // The lot these spools arrive in — resolved once, shared by all of them.
+      const batch = await this.resolveIntakeBatch(
+        companyId,
+        filamentRefId,
+        input.batch_name,
+        quantity,
+        client
+      );
+
       for (let i = 0; i < quantity; i++) {
         const createdAsset = await this.databaseService.query<{ asset_id: string }>(
           `
@@ -1070,9 +1100,10 @@ export class AssetsService {
               production_date,
               location,
               marker,
-              notes
+              notes,
+              batch_id
             )
-            VALUES ($1, 'filament_spool', $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, 'filament_spool', $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING asset_id
           `,
           [
@@ -1084,7 +1115,8 @@ export class AssetsService {
             input.production_date ?? null,
             input.location ?? null,
             input.marker ?? null,
-            input.notes ?? null
+            input.notes ?? null,
+            batch?.batch_id ?? null
           ],
           client
         );
@@ -1120,9 +1152,17 @@ export class AssetsService {
           "filament_spool",
           "addition",
           "New Filament Spool",
-          quantity > 1
-            ? `New spool added to inventory (${i + 1} of ${quantity})`
-            : "New spool added to inventory",
+          [
+            quantity > 1
+              ? `New spool added to inventory (${i + 1} of ${quantity})`
+              : "New spool added to inventory",
+            // The lot is part of the intake's provenance, so the history entry
+            // carries it too — that's where an operator looks to reconstruct
+            // "which delivery did this spool come off?".
+            batch ? `Batch ${batch.batch_number} — ${batch.name}` : null
+          ]
+            .filter(Boolean)
+            .join(" · "),
           client
         );
 
@@ -1154,6 +1194,183 @@ export class AssetsService {
     // Stay backwards-compatible: a single spool returns the asset object, while
     // a multiplier batch returns the array of created spools.
     return (input.quantity ?? 1) > 1 ? spools : spools[0];
+  }
+
+  // ── Intake lots ─────────────────────────────────────────────────────────────
+  // Decide which batch a spool intake belongs to, minting one if needed.
+  //
+  // Returns null — no batch at all — for a plain ×1 intake with no name typed.
+  // That's the point of the feature: batches exist because checking a hundred
+  // spools one at a time is unworkable, so a lone spool entered on its own is
+  // exactly the case that doesn't need one. Badging every single spool "batch of
+  // 1" would spend the badge's signal on nothing. An explicitly typed name still
+  // wins at ×1, because that operator has said what they mean.
+  //
+  // Name resolution follows the unique index (company, reference, lower(name)):
+  // an existing lot of the same type under that name is JOINED, not cloned, so
+  // topping a lot up later works and one delivery of one material reads as one
+  // lot. The advisory lock makes the look-then-insert atomic without burning a
+  // sequence number on a losing race; the unique index is the final backstop.
+  private async resolveIntakeBatch(
+    companyId: string,
+    filamentRefId: string,
+    requestedName: string | undefined,
+    quantity: number,
+    client: SqlExecutor
+  ): Promise<{ batch_id: string; batch_number: string; name: string } | null> {
+    const typedName = requestedName?.trim();
+    if (!typedName && quantity <= 1) return null;
+
+    // Default label = the intake date, in the SERVER's calendar terms. A lot
+    // named for the day it arrived is the overwhelmingly common case and must
+    // cost the operator no typing at all.
+    const now = new Date();
+    const name = typedName || now.toISOString().slice(0, 10);
+
+    await this.databaseService.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1))`,
+      [`asset_batches:${companyId}:${filamentRefId}:${name.toLowerCase()}`],
+      client
+    );
+
+    const existing = await this.databaseService.query<{
+      batch_id: string;
+      batch_number: string;
+      name: string;
+    }>(
+      `
+        SELECT batch_id, batch_number, name
+        FROM asset_batches
+        WHERE company_id = $1
+          AND filament_ref_id = $2
+          AND lower(name) = lower($3)
+        LIMIT 1
+      `,
+      [companyId, filamentRefId, name],
+      client
+    );
+
+    const found = existing.rows[0];
+    if (found) return found;
+
+    // B-<year>-<seq>, from the same atomic per-tenant/per-year counter shape the
+    // order numbers use: the ON CONFLICT path takes a row lock, so concurrent
+    // intakes can never be handed the same sequence value.
+    const year = now.getUTCFullYear();
+    const seq = await this.databaseService.query<{ last_value: string }>(
+      `
+        INSERT INTO asset_batch_sequences (company_id, year, last_value)
+        VALUES ($1, $2, 1)
+        ON CONFLICT (company_id, year)
+        DO UPDATE SET last_value = asset_batch_sequences.last_value + 1
+        RETURNING last_value
+      `,
+      [companyId, year],
+      client
+    );
+
+    const nextValue = Number(seq.rows[0]?.last_value ?? 0);
+    if (!nextValue) throw new BadRequestException("Could not allocate a batch number.");
+    const batchNumber = `B-${year}-${String(nextValue).padStart(5, "0")}`;
+
+    const created = await this.databaseService.query<{
+      batch_id: string;
+      batch_number: string;
+      name: string;
+    }>(
+      `
+        INSERT INTO asset_batches (company_id, batch_number, name, filament_ref_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING batch_id, batch_number, name
+      `,
+      [companyId, batchNumber, name, filamentRefId],
+      client
+    );
+
+    const row = created.rows[0];
+    if (!row) throw new BadRequestException("Batch insert failed.");
+    return row;
+  }
+
+  // Every lot this tenant has taken in, newest first, with what's left of it.
+  // Powers the Filaments batch filter and the intake form's recent-lots hint;
+  // `search` matches the number or the name, the same two things the asset
+  // search matches.
+  async listAssetBatches(companyId: string, query: ListAssetBatchesQuery) {
+    const values: unknown[] = [companyId];
+    const filters = ["ab.company_id = $1"];
+
+    if (query.filament_ref_id) {
+      values.push(query.filament_ref_id);
+      filters.push(`ab.filament_ref_id = $${values.length}`);
+    }
+
+    if (query.search) {
+      values.push(`%${query.search}%`);
+      filters.push(`(ab.batch_number ILIKE $${values.length} OR ab.name ILIKE $${values.length})`);
+    }
+
+    values.push(query.limit ?? 100);
+
+    const result = await this.databaseService.query(
+      `
+        SELECT
+          ab.batch_id,
+          ab.batch_number,
+          ab.name,
+          ab.filament_ref_id,
+          ab.created_at,
+          TRIM(CONCAT_WS(' ', fr.brand, fr.material_type, fr.color)) AS filament_label,
+          fr.hex AS filament_hex,
+          COUNT(ai.asset_id)                                   AS spool_count,
+          COALESCE(SUM(ast.remaining_grams), 0)                AS remaining_grams,
+          COALESCE(SUM(ai.purchase_price), 0)                  AS purchase_value
+        FROM asset_batches ab
+        LEFT JOIN filament_reference fr ON fr.filament_ref_id = ab.filament_ref_id
+        LEFT JOIN asset_instances ai    ON ai.batch_id = ab.batch_id
+        LEFT JOIN asset_stock ast       ON ast.asset_id = ai.asset_id
+        WHERE ${filters.join(" AND ")}
+        GROUP BY ab.batch_id, ab.batch_number, ab.name, ab.filament_ref_id,
+                 ab.created_at, fr.brand, fr.material_type, fr.color, fr.hex
+        ORDER BY ab.created_at DESC
+        LIMIT $${values.length}
+      `,
+      values
+    );
+
+    return result.rows;
+  }
+
+  // Rename a lot. The only mutable thing about it — its number, its type and
+  // which spools are in it are facts about a delivery that already happened.
+  // The unique index means renaming onto another lot of the same type is a
+  // conflict rather than a silent merge; say so in those terms.
+  async renameAssetBatch(companyId: string, batchId: string, name: string) {
+    const result = await this.databaseService.query<{
+      batch_id: string;
+      batch_number: string;
+      name: string;
+    }>(
+      `
+        UPDATE asset_batches
+        SET name = $3
+        WHERE company_id = $1 AND batch_id = $2
+        RETURNING batch_id, batch_number, name
+      `,
+      [companyId, batchId, name]
+    ).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("uq_asset_batches_company_ref_name")) {
+        throw new BadRequestException(
+          "Another batch of this filament already uses that name. Pick a different one, or keep them apart with a suffix."
+        );
+      }
+      throw error;
+    });
+
+    const row = result.rows[0];
+    if (!row) throw new NotFoundException("Batch not found.");
+    return row;
   }
 
   // Book a just-completed asset intake as an itemized purchase bill in Finance.
@@ -1986,6 +2203,14 @@ export class AssetsService {
         ai.location,
         ai.marker,
         ai.notes,
+        ai.batch_id,
+        ab.batch_number,
+        ab.name AS batch_name,
+        -- Counted live: the badge reads "1 of 40", and 40 must mean forty spools
+        -- that still exist, not forty that were once unboxed.
+        (SELECT COUNT(*) FROM asset_instances sib
+          WHERE sib.batch_id = ai.batch_id
+            AND sib.company_id = ai.company_id) AS batch_size,
         ai.created_at,
         ast.status AS stock_status,
         ast.remaining_grams,
@@ -2061,6 +2286,8 @@ export class AssetsService {
         ON ast.asset_id = ai.asset_id
       LEFT JOIN filament_reference fr
         ON fr.filament_ref_id = ai.filament_ref_id
+      LEFT JOIN asset_batches ab
+        ON ab.batch_id = ai.batch_id
       -- ── The job this asset is feeding RIGHT NOW ──────────────────────────
       -- One lateral instead of a COALESCE pair per column: the "is this asset
       -- attached to this piece?" test differs per asset kind, but everything

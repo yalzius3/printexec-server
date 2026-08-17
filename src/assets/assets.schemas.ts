@@ -65,10 +65,32 @@ const purchaseBillFields = {
   already_paid: z.boolean().optional()
 } as const;
 
+// A filament intake lot's operator-facing label. Free text so "1", "lab batch"
+// and "Aug17 lot B" are all valid; capped short because it renders as a badge on
+// every spool in the lot. Absent = the API names the lot after the intake date.
+const batchNameSchema = z.string().trim().min(1).max(60).optional();
+
 export const listAssetsQuerySchema = z.object({
   asset_type: z.enum(["filament_spool", "nozzle", "resin_tank", "spare_part"]).optional(),
   status: z.enum(["available", "in_use", "installed", "empty", "damaged"]).optional(),
-  search: z.string().trim().min(1).optional()
+  search: z.string().trim().min(1).optional(),
+  // Exact-lot filter, for "show me the rest of this batch" from a spool's badge.
+  // Distinct from `search`, which also matches lot names loosely.
+  batch_id: uuidSchema.optional()
+});
+
+// The batch list backs the intake form's recent-lots hint and the Filaments
+// batch filter. `search` matches number or name.
+export const listAssetBatchesQuerySchema = z.object({
+  search: z.string().trim().min(1).optional(),
+  filament_ref_id: uuidSchema.optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional()
+});
+
+// The only mutable thing about a lot. Its number, type and contents are facts
+// about a delivery that happened; the label is the operator's to correct.
+export const updateAssetBatchSchema = z.object({
+  name: z.string().trim().min(1).max(60)
 });
 
 export const createFilamentReferenceSchema = z
@@ -141,6 +163,10 @@ export const createSpoolSchema = z
     // submission (e.g. a box of 4). Defaults to 1. Each spool becomes its own
     // physical inventory row; they share the resolved filament reference.
     quantity: quantitySchema,
+    // Intake lot. A ×N intake forms one automatically (named after today);
+    // supplying a name here overrides that, and re-using an existing name for
+    // this same filament reference tops that lot up instead of cloning it.
+    batch_name: batchNameSchema,
     notes: z.string().optional(),
     ...purchaseBillFields
   })

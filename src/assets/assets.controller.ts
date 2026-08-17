@@ -19,10 +19,12 @@ import {
   createResinTankSchema,
   createSparePartSchema,
   createSpoolSchema,
+  listAssetBatchesQuerySchema,
   listAssetsQuerySchema,
   listAssetHistoryQuerySchema,
   listFilamentReferencesQuerySchema,
   splitAssetSchema,
+  updateAssetBatchSchema,
   updateAssetSchema,
   updateAssetStockSchema
 } from "./assets.schemas";
@@ -121,6 +123,30 @@ export class AssetsController {
   getAssetsOverview(@CompanyId() companyId: string, @Query() query: unknown) {
     const { period } = parseWithSchema(assetsOverviewQuerySchema, query);
     return this.assetsService.getAssetsOverview(companyId, period);
+  }
+
+  // Filament intake lots, newest first. Static path — same rule as the ones
+  // above: it must be declared before :assetId or "batches" parses as an id.
+  @Get("batches")
+  @RequirePermission("view_assets")
+  listAssetBatches(@CompanyId() companyId: string, @Query() query: unknown) {
+    return this.assetsService.listAssetBatches(
+      companyId,
+      parseWithSchema(listAssetBatchesQuerySchema, query)
+    );
+  }
+
+  // Relabel a lot. Renaming is an edit to inventory records, so it takes the
+  // same action permission every other asset mutation does.
+  @Patch("batches/:batchId")
+  @RequirePermission("action_assets")
+  renameAssetBatch(
+    @CompanyId() companyId: string,
+    @Param("batchId") batchId: string,
+    @Body() body: unknown
+  ) {
+    const { name } = parseWithSchema(updateAssetBatchSchema, body);
+    return this.assetsService.renameAssetBatch(companyId, batchId, name);
   }
 
   @Get(":assetId")
