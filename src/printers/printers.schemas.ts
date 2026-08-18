@@ -245,9 +245,38 @@ export const createPrinterSchema = z
     notes: z.string().optional(),
     // Operator-set starting meter for hours already worked before this printer
     // was added to the system. Editable later via the stock PATCH.
-    total_print_hours: z.coerce.number().min(0).optional()
+    total_print_hours: z.coerce.number().min(0).optional(),
+    // Multiplier: create this many identical printers from one submission — a
+    // shop commissioning a rack of eight identical machines. Same 1–100 shape
+    // as the asset intakes. Capped harder in practice by the licence's printer
+    // allowance, which the service re-checks for EVERY unit (see createPrinter).
+    quantity: z.coerce.number().int().min(1).max(100).optional()
   })
   .superRefine((value, ctx) => {
+    // Per-unit identity cannot be shared across a multiplier. A serial number
+    // names exactly one physical machine, and a marker exists precisely to tell
+    // identical machines apart — copying either across N rows produces data
+    // that is wrong the moment it is written. Both are set per machine
+    // afterwards, from the printer's own window.
+    if ((value.quantity ?? 1) > 1) {
+      if (value.serial_number) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["serial_number"],
+          message:
+            "A serial number identifies one machine, so it can't be applied to several at once. Add them without it, then set each printer's serial from its window."
+        });
+      }
+      if (value.marker) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["marker"],
+          message:
+            "A marker is what tells two identical printers apart, so it can't be shared. Add them without it, then mark each printer from its window."
+        });
+      }
+    }
+
     if (!value.printer_ref_id && !value.custom_reference) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

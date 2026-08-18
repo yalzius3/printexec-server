@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from "@nes
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import { FinanceService } from "../finance/finance.service";
 import { buildUpdateClause } from "../common/sql";
+import { deriveTenantCodeBase, padOrderSequence } from "../common/tenant-code";
 import {
   createFilamentReferenceSchema,
   createNozzleSchema,
@@ -1056,6 +1057,13 @@ export class AssetsService {
   }
 
   async createSpool(companyId: string, userId: string, input: CreateSpoolInput) {
+    // Resolved BEFORE the transaction opens, deliberately. resolveTenantCode
+    // tolerates an un-migrated companies.tenant_code by catching 42703 and
+    // re-querying — and a failed statement poisons the whole transaction in
+    // Postgres, so that recovery only works on a connection that isn't inside
+    // one. See the comment on the method.
+    const tenantCode = await this.resolveTenantCode(companyId);
+
     const spools = await this.databaseService.transaction(async (client) => {
       const resolvedReference = input.filament_ref_id
         ? input.filament_ref_id
@@ -1081,6 +1089,7 @@ export class AssetsService {
       // The lot these spools arrive in — resolved once, shared by all of them.
       const batch = await this.resolveIntakeBatch(
         companyId,
+        tenantCode,
         filamentRefId,
         input.batch_name,
         quantity,
@@ -1206,13 +1215,22 @@ export class AssetsService {
   // 1" would spend the badge's signal on nothing. An explicitly typed name still
   // wins at ×1, because that operator has said what they mean.
   //
-  // Name resolution follows the unique index (company, reference, lower(name)):
-  // an existing lot of the same type under that name is JOINED, not cloned, so
-  // topping a lot up later works and one delivery of one material reads as one
-  // lot. The advisory lock makes the look-then-insert atomic without burning a
-  // sequence number on a losing race; the unique index is the final backstop.
+  // A TYPED name resolves against the unique index (company, reference,
+  // lower(name)): an existing lot of the same type under that name is JOINED,
+  // not cloned, so topping a lot up later works and a five-material delivery
+  // files as five type-pure lots under one label. The advisory lock makes the
+  // look-then-insert atomic without burning a sequence number on a losing race;
+  // the unique index is the final backstop.
+  //
+  // An UNTYPED intake mints a fresh lot every time and names it after its own
+  // number. There is nothing to look up, so that path takes no lock — and it
+  // means two unnamed intakes of the same filament no longer merge the way they
+  // did when the default name was the date. That follows directly from a
+  // sequence-based default: each unnamed intake is its own numbered delivery.
+  // Operators who want them merged type the same name into both.
   private async resolveIntakeBatch(
     companyId: string,
+    tenantCode: string,
     filamentRefId: string,
     requestedName: string | undefined,
     quantity: number,
@@ -1221,42 +1239,70 @@ export class AssetsService {
     const typedName = requestedName?.trim();
     if (!typedName && quantity <= 1) return null;
 
-    // Default label = the intake date, in the SERVER's calendar terms. A lot
-    // named for the day it arrived is the overwhelmingly common case and must
-    // cost the operator no typing at all.
-    const now = new Date();
-    const name = typedName || now.toISOString().slice(0, 10);
+    const year = new Date().getUTCFullYear();
 
-    await this.databaseService.query(
-      `SELECT pg_advisory_xact_lock(hashtext($1))`,
-      [`asset_batches:${companyId}:${filamentRefId}:${name.toLowerCase()}`],
-      client
-    );
+    if (typedName) {
+      await this.databaseService.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1))`,
+        [`asset_batches:${companyId}:${filamentRefId}:${typedName.toLowerCase()}`],
+        client
+      );
 
-    const existing = await this.databaseService.query<{
+      const existing = await this.databaseService.query<{
+        batch_id: string;
+        batch_number: string;
+        name: string;
+      }>(
+        `
+          SELECT batch_id, batch_number, name
+          FROM asset_batches
+          WHERE company_id = $1
+            AND filament_ref_id = $2
+            AND lower(name) = lower($3)
+          LIMIT 1
+        `,
+        [companyId, filamentRefId, typedName],
+        client
+      );
+
+      const found = existing.rows[0];
+      if (found) return found;
+    }
+
+    const batchNumber = await this.mintBatchNumber(companyId, tenantCode, year, client);
+
+    const created = await this.databaseService.query<{
       batch_id: string;
       batch_number: string;
       name: string;
     }>(
       `
-        SELECT batch_id, batch_number, name
-        FROM asset_batches
-        WHERE company_id = $1
-          AND filament_ref_id = $2
-          AND lower(name) = lower($3)
-        LIMIT 1
+        INSERT INTO asset_batches (company_id, batch_number, name, filament_ref_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING batch_id, batch_number, name
       `,
-      [companyId, filamentRefId, name],
+      // An unnamed lot is named after its own number, so `name` is never null
+      // and the badge always has something to show. The UI collapses the two
+      // when they are equal rather than printing the identifier twice.
+      [companyId, batchNumber, typedName || batchNumber, filamentRefId],
       client
     );
 
-    const found = existing.rows[0];
-    if (found) return found;
+    const row = created.rows[0];
+    if (!row) throw new BadRequestException("Batch insert failed.");
+    return row;
+  }
 
-    // B-<year>-<seq>, from the same atomic per-tenant/per-year counter shape the
-    // order numbers use: the ON CONFLICT path takes a row lock, so concurrent
-    // intakes can never be handed the same sequence value.
-    const year = now.getUTCFullYear();
+  // B-<TENANT_CODE>-<YEAR>-<NNNNN>, e.g. B-ABC-2026-00041. Same atomic
+  // per-tenant/per-year counter shape as the order numbers: the ON CONFLICT
+  // path takes a row lock, so two concurrent intakes can never be handed the
+  // same sequence value, and a new year starts back at 1.
+  private async mintBatchNumber(
+    companyId: string,
+    tenantCode: string,
+    year: number,
+    client: SqlExecutor
+  ): Promise<string> {
     const seq = await this.databaseService.query<{ last_value: string }>(
       `
         INSERT INTO asset_batch_sequences (company_id, year, last_value)
@@ -1271,25 +1317,36 @@ export class AssetsService {
 
     const nextValue = Number(seq.rows[0]?.last_value ?? 0);
     if (!nextValue) throw new BadRequestException("Could not allocate a batch number.");
-    const batchNumber = `B-${year}-${String(nextValue).padStart(5, "0")}`;
+    return `B-${tenantCode}-${year}-${padOrderSequence(nextValue)}`;
+  }
 
-    const created = await this.databaseService.query<{
-      batch_id: string;
-      batch_number: string;
-      name: string;
-    }>(
-      `
-        INSERT INTO asset_batches (company_id, batch_number, name, filament_ref_id)
-        VALUES ($1, $2, $3, $4)
-        RETURNING batch_id, batch_number, name
-      `,
-      [companyId, batchNumber, name, filamentRefId],
-      client
-    );
-
-    const row = created.rows[0];
-    if (!row) throw new BadRequestException("Batch insert failed.");
-    return row;
+  // The tenant's stable prefix, shared with the order numbers so a shop reads
+  // one code across both. Mirrors OrdersService.resolveTenantCode /
+  // NumberingService.resolveTenantCode: the DB trigger owns persistence, and a
+  // company row from before that migration just derives the base code on the
+  // fly rather than failing the intake.
+  //
+  // MUST be called outside a transaction — the 42703 recovery below issues a
+  // second query, and in Postgres a failed statement aborts the surrounding
+  // transaction, so the retry would fail too.
+  private async resolveTenantCode(companyId: string): Promise<string> {
+    try {
+      const res = await this.databaseService.query<{
+        tenant_code: string | null;
+        name: string | null;
+      }>("SELECT tenant_code, name FROM companies WHERE company_id = $1", [companyId]);
+      const row = res.rows[0];
+      if (!row) throw new NotFoundException("Company not found.");
+      return row.tenant_code?.trim() || deriveTenantCodeBase(row.name);
+    } catch (e) {
+      // tenant_code column not migrated yet — derive from the name instead.
+      if ((e as { code?: string }).code !== "42703") throw e;
+      const res = await this.databaseService.query<{ name: string | null }>(
+        "SELECT name FROM companies WHERE company_id = $1",
+        [companyId]
+      );
+      return deriveTenantCodeBase(res.rows[0]?.name);
+    }
   }
 
   // Every lot this tenant has taken in, newest first, with what's left of it.

@@ -328,13 +328,29 @@ export class PrintersService {
         [companyId],
         client
       );
-      await this.licensingService.assertCanAddPrinter(companyId, client);
 
       const printerReference = input.printer_ref_id
         ? await this.getPrinterReferenceById(input.printer_ref_id, client)
         : await this.createPrinterReference(companyId, input.custom_reference!, client);
 
-      const createdPrinter = await this.databaseService.query<{ printer_id: string }>(
+      // Multiplier: N identical machines from one submission. The reference is
+      // resolved once above and shared, exactly as the asset intakes do it.
+      //
+      // Serial number and marker are deliberately absent from the loop body —
+      // the schema rejects them above a multiplier of 1, because each names one
+      // specific machine (see createPrinterSchema).
+      const quantity = input.quantity ?? 1;
+      const createdPrinterIds: string[] = [];
+
+      for (let i = 0; i < quantity; i++) {
+        // Re-asserted per unit, NOT once for the batch. assertCanAddPrinter
+        // recounts printer_instances inside this transaction, so it sees the
+        // rows earlier iterations already inserted — a shop one printer under
+        // its cap therefore gets one printer and a clear error, instead of
+        // slipping forty past a single up-front check.
+        await this.licensingService.assertCanAddPrinter(companyId, client);
+
+        const createdPrinter = await this.databaseService.query<{ printer_id: string }>(
         `
           INSERT INTO printer_instances (
             company_id,
@@ -412,14 +428,14 @@ export class PrintersService {
         client
       );
 
-      const createdPrinterRow = createdPrinter.rows[0];
+        const createdPrinterRow = createdPrinter.rows[0];
 
-      if (!createdPrinterRow) {
-        throw new BadRequestException("Printer insert failed.");
-      }
+        if (!createdPrinterRow) {
+          throw new BadRequestException("Printer insert failed.");
+        }
 
-      await this.databaseService.query(
-        `
+        await this.databaseService.query(
+          `
           INSERT INTO printer_stock (
             printer_id,
             company_id,
@@ -444,11 +460,20 @@ export class PrintersService {
             NULL, NULL, NULL, $3, NULL
           )
         `,
-        [createdPrinterRow.printer_id, companyId, input.total_print_hours ?? 0],
-        client
+          [createdPrinterRow.printer_id, companyId, input.total_print_hours ?? 0],
+          client
+        );
+
+        createdPrinterIds.push(createdPrinterRow.printer_id);
+      }
+
+      const createdPrinters = await Promise.all(
+        createdPrinterIds.map((id) => this.getPrinterById(companyId, id, client))
       );
 
-      return this.getPrinterById(companyId, createdPrinterRow.printer_id, client);
+      // Same convention as every asset intake: a single create returns the
+      // object, a multiplier batch returns the array.
+      return quantity > 1 ? createdPrinters : createdPrinters[0];
     });
   }
 
