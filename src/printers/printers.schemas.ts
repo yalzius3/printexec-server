@@ -407,3 +407,23 @@ export const addCompatibleNozzleSchema = z.object({
   nozzle_asset_id: uuidSchema,
   notes: z.string().optional()
 });
+
+// One round trip for a whole edit of the compatibility set, so a shop fitting
+// out a machine sends a single request instead of one POST per ticked nozzle
+// (which reported partial success and left the set half-written when the tab
+// closed mid-flight). Both lists are optional, but at least one has to carry
+// work — an empty body would otherwise "succeed" while doing nothing.
+//
+// apply_to_reference propagates the ADDS to every other printer instance
+// sharing this one's printer_ref_id. Removals stay local by design; see
+// bulkNozzleCompatibility for why.
+export const bulkNozzleCompatibilitySchema = z
+  .object({
+    add: z.array(uuidSchema).max(500).optional(),
+    remove: z.array(uuidSchema).max(500).optional(),
+    apply_to_reference: z.boolean().optional(),
+    notes: z.string().optional()
+  })
+  .refine((value) => (value.add?.length ?? 0) + (value.remove?.length ?? 0) > 0, {
+    message: "Provide at least one nozzle to add or remove."
+  });

@@ -7,6 +7,7 @@ import { isResinTech } from "../jobs/matching";
 import { LicensingService } from "../licensing/licensing.service";
 import {
   addCompatibleNozzleSchema,
+  bulkNozzleCompatibilitySchema,
   createPrinterReferenceSchema,
   createPrinterSchema,
   listPrinterReferencesQuerySchema,
@@ -22,6 +23,7 @@ type ListPrintersQuery = z.infer<typeof listPrintersQuerySchema>;
 type UpdatePrinterInput = z.infer<typeof updatePrinterSchema>;
 type UpdatePrinterStockInput = z.infer<typeof updatePrinterStockSchema>;
 type AddCompatibleNozzleInput = z.infer<typeof addCompatibleNozzleSchema>;
+type BulkNozzleCompatibilityInput = z.infer<typeof bulkNozzleCompatibilitySchema>;
 
 type PrinterReferenceRow = {
   printer_ref_id: string;
@@ -798,6 +800,198 @@ export class PrintersService {
     );
 
     return this.listNozzleCompatibility(companyId, printerId);
+  }
+
+  /**
+   * The other printer instances this company owns that were built from the SAME
+   * catalog reference — i.e. the physically identical machines. This is what
+   * makes "do the same for all printers of this reference" answerable before the
+   * operator commits to it: the UI can name the machines it is about to touch
+   * instead of asking them to trust a count.
+   *
+   * The subject printer is deliberately excluded (it is the one being edited),
+   * and a printer with no printer_ref_id has no siblings at all — a custom
+   * one-off reference identifies one machine, so propagation would be a lie.
+   */
+  async listReferenceSiblings(companyId: string, printerId: string) {
+    const printer = await this.getPrinterById(companyId, printerId);
+    const refId = printer.printer_ref_id as string | null;
+    if (!refId) return [];
+
+    const result = await this.databaseService.query(
+      `
+        SELECT
+          pi.printer_id,
+          COALESCE(pr.brand, pi.brand) AS brand,
+          COALESCE(pr.model, pi.model) AS model,
+          COALESCE(pr.print_technology, pi.print_technology) AS print_technology,
+          pi.marker,
+          pi.serial_number,
+          pi.location,
+          -- What each sibling already has, so the confirmation can say "2 of
+          -- these 3 already carry every nozzle you ticked" rather than implying
+          -- the whole set is about to change.
+          (SELECT count(*) FROM printer_nozzle_compatibility pnc
+            WHERE pnc.company_id = pi.company_id AND pnc.printer_id = pi.printer_id
+          )::int AS compatible_count
+        FROM printer_instances pi
+        LEFT JOIN printer_reference pr
+          ON pr.printer_ref_id = pi.printer_ref_id
+        WHERE pi.company_id = $1
+          AND pi.printer_ref_id = $2
+          AND pi.printer_id <> $3
+        ORDER BY pi.created_at ASC
+      `,
+      [companyId, refId, printerId]
+    );
+
+    return result.rows;
+  }
+
+  /**
+   * Apply a whole compatibility edit in one transaction: everything ticked is
+   * added, everything unticked is removed, and either the lot lands or none of
+   * it does. Replaces the per-nozzle POST loop the picker used to run.
+   *
+   * `apply_to_reference` extends the ADDS to every sibling printer built from
+   * the same reference. Removals are NOT propagated, and that asymmetry is
+   * deliberate: identical machines can legitimately hold different nozzles
+   * (one has the 0.6 fitted, the drawer's other 0.6 lives by the second
+   * printer), so an add is a safe statement about a machine TYPE while a
+   * removal is a statement about one machine's drawer. Silently stripping
+   * nozzles off four other printers because one was untidied here is the kind
+   * of write an operator cannot see happening and cannot undo.
+   */
+  async bulkNozzleCompatibility(
+    companyId: string,
+    printerId: string,
+    input: BulkNozzleCompatibilityInput
+  ) {
+    const printer = await this.getPrinterById(companyId, printerId);
+
+    // Same rule the single-add route enforces: a resin machine cures from a
+    // vat and has no hotend to mount a nozzle on.
+    if (isResinTech(printer.print_technology as string | null)) {
+      throw new BadRequestException(
+        "This is a resin printer — it cures resin from a tank and has no nozzle to mount."
+      );
+    }
+
+    // Dedupe, and never let one id sit in both lists — the add and the remove
+    // would race on ordering and the result would depend on statement order
+    // rather than on what the operator asked for. Remove wins is arbitrary, so
+    // reject instead of guessing.
+    const addIds = [...new Set(input.add ?? [])];
+    const removeIds = [...new Set(input.remove ?? [])];
+    const overlap = addIds.filter((id) => removeIds.includes(id));
+    if (overlap.length > 0) {
+      throw new BadRequestException(
+        "A nozzle cannot be added and removed in the same request."
+      );
+    }
+
+    // Every id being added has to be this company's, and has to be a nozzle.
+    // Checked in ONE query rather than per id, and before any write, so a bad
+    // id fails the whole request instead of leaving a half-applied set.
+    if (addIds.length > 0) {
+      const owned = await this.databaseService.query<{ asset_id: string; asset_type: string }>(
+        `
+          SELECT asset_id, asset_type
+          FROM asset_instances
+          WHERE company_id = $1
+            AND asset_id = ANY($2::uuid[])
+        `,
+        [companyId, addIds]
+      );
+
+      if (owned.rowCount !== addIds.length) {
+        throw new NotFoundException("One or more nozzle assets were not found.");
+      }
+      if (owned.rows.some((row) => row.asset_type !== "nozzle")) {
+        throw new BadRequestException(
+          "Only nozzle assets can be added to printer compatibility."
+        );
+      }
+    }
+
+    // Targets for the adds: this printer, plus its identical siblings when the
+    // operator asked for it. Resin siblings can't exist under a shared FDM
+    // reference (print_technology comes off the reference), but the filter
+    // costs nothing and keeps the invariant true even for legacy rows whose
+    // instance-level tech disagrees with the reference.
+    let targetPrinterIds = [printerId];
+    let propagatedTo = 0;
+    if (input.apply_to_reference && addIds.length > 0) {
+      const siblings = await this.listReferenceSiblings(companyId, printerId);
+      const eligible = siblings
+        .filter((s) => !isResinTech((s as { print_technology: string | null }).print_technology))
+        .map((s) => (s as { printer_id: string }).printer_id);
+      targetPrinterIds = [printerId, ...eligible];
+      propagatedTo = eligible.length;
+    }
+
+    const counts = await this.databaseService.transaction(async (client) => {
+      let linksAdded = 0;
+      if (addIds.length > 0) {
+        // One INSERT for the whole cross product of (target printers × ticked
+        // nozzles). ON CONFLICT keeps re-ticking an already-compatible nozzle
+        // idempotent, which is exactly what propagation needs — most siblings
+        // already carry most of the set.
+        const inserted = await this.databaseService.query(
+          `
+            INSERT INTO printer_nozzle_compatibility (
+              printer_id,
+              nozzle_asset_id,
+              company_id,
+              notes
+            )
+            SELECT p.printer_id, n.nozzle_asset_id, $3, $4
+            FROM unnest($1::uuid[]) AS p(printer_id)
+            CROSS JOIN unnest($2::uuid[]) AS n(nozzle_asset_id)
+            ON CONFLICT (printer_id, nozzle_asset_id)
+            DO UPDATE
+            SET
+              confirmed_at = now(),
+              notes = COALESCE(EXCLUDED.notes, printer_nozzle_compatibility.notes),
+              company_id = EXCLUDED.company_id
+          `,
+          [targetPrinterIds, addIds, companyId, input.notes ?? null],
+          client
+        );
+        linksAdded = inserted.rowCount ?? 0;
+      }
+
+      let linksRemoved = 0;
+      if (removeIds.length > 0) {
+        // Local to this printer only — see the doc comment above.
+        const deleted = await this.databaseService.query(
+          `
+            DELETE FROM printer_nozzle_compatibility
+            WHERE company_id = $1
+              AND printer_id = $2
+              AND nozzle_asset_id = ANY($3::uuid[])
+          `,
+          [companyId, printerId, removeIds],
+          client
+        );
+        linksRemoved = deleted.rowCount ?? 0;
+      }
+
+      return { linksAdded, linksRemoved };
+    });
+
+    // Read the resulting set AFTER the commit, not inside the callback:
+    // listNozzleCompatibility runs its own queries on a pool connection, so
+    // called from inside the transaction it would answer from outside it and
+    // hand the client back the pre-edit list.
+    return {
+      added: addIds.length,
+      removed: counts.linksRemoved,
+      links_written: counts.linksAdded,
+      printers_affected: targetPrinterIds.length,
+      propagated_to: propagatedTo,
+      compatibility: await this.listNozzleCompatibility(companyId, printerId)
+    };
   }
 
   async removeNozzleCompatibility(

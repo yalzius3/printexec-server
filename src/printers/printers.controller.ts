@@ -13,6 +13,7 @@ import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import {
   addCompatibleNozzleSchema,
+  bulkNozzleCompatibilitySchema,
   createPrinterReferenceSchema,
   createPrinterSchema,
   listPrinterReferencesQuerySchema,
@@ -132,6 +133,34 @@ export class PrintersController {
       excludePieceId: excludePiece || undefined,
       excludeBedId: excludeBed || undefined,
     });
+  }
+
+  // The identical machines this printer's reference produced, so the bulk
+  // editor can name what "do the same for all printers of this reference" is
+  // about to touch before the operator ticks it.
+  @Get(":printerId/reference-siblings")
+  @RequirePermission(["view_assets", "view_orders"])
+  listReferenceSiblings(
+    @CompanyId() companyId: string,
+    @Param("printerId") printerId: string
+  ) {
+    return this.printersService.listReferenceSiblings(companyId, printerId);
+  }
+
+  // Whole-set edit in one transaction. Declared BEFORE the single-nozzle POST
+  // is unnecessary (the paths differ in depth) but keeps the two together.
+  @Post(":printerId/nozzle-compatibility/bulk")
+  @RequirePermission("action_assets")
+  bulkNozzleCompatibility(
+    @CompanyId() companyId: string,
+    @Param("printerId") printerId: string,
+    @Body() body: unknown
+  ) {
+    return this.printersService.bulkNozzleCompatibility(
+      companyId,
+      printerId,
+      parseWithSchema(bulkNozzleCompatibilitySchema, body)
+    );
   }
 
   @Post(":printerId/nozzle-compatibility")
