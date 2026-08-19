@@ -763,6 +763,128 @@ export class OrderPiecesService {
     return { deleted: uniqueIds.length, piece_ids: uniqueIds };
   }
 
+  /**
+   * Create many pieces in ONE transaction, with ONE order-status recompute.
+   *
+   * WHY THIS EXISTS. The grid used to POST one piece per row, all at once, and
+   * each of those requests independently ran createPiece — which ends with
+   * `syncOrderStatus`, and that AGGREGATES EVERY PIECE IN THE ORDER. So piece N
+   * scanned N pieces, and adding N pieces cost O(N²): at the 80,000 rows this
+   * was reported with, roughly 3.2 billion row-touches on a single order, plus
+   * 80,000 separate transactions. It did not complete, and the browser gave up
+   * first — Chrome caps its socket pool around 256, which is exactly the ceiling
+   * that was observed.
+   *
+   * The recompute now runs ONCE, after the last piece lands, because an order's
+   * derived status is a function of its final piece set — computing it 79,999
+   * times on the way there produced intermediate answers nobody ever read.
+   *
+   * Returns IDS ONLY, deliberately. createPiece ends with getPieceById, which is
+   * three further queries (the row, its spool allocations, its scheduling
+   * diagnostics) serialised into a response the grid then throws away — it reads
+   * only whether the promise settled. At 80,000 pieces that was 240,000 queries
+   * computed and discarded.
+   *
+   * PARTIAL SUCCESS IS PRESERVED, per piece, via savepoints — and that is a
+   * deliberate reversal. An all-or-nothing batch loses 499 good rows to one bad
+   * one, which on a paste this size is the wrong trade: the operator has no way
+   * to find the offender and no partial progress to build on. The old
+   * per-request path had the same losing outcome with none of the reporting —
+   * it could leave 40,000 saved and 40,000 not, with no record of which.
+   *
+   * So every row that cannot be written is returned in `failed` with its index,
+   * name and reason, the rest are committed, and the status recompute runs once
+   * after the last piece that actually landed. A batch where nothing lands
+   * writes nothing at all, leaving the order exactly as it was.
+   */
+  async createPieces(
+    companyId: string,
+    orderId: string,
+    inputs: CreateOrderPieceInput[]
+  ): Promise<{ created: number; piece_ids: string[]; failed: BulkPieceFailure[] }> {
+    const order = await this.assertOrderExists(companyId, orderId);
+    this.assertOrderOpenForPieceChanges(order.status);
+
+    const failed: BulkPieceFailure[] = [];
+
+    // Reference checks run BEFORE the transaction: they are read-only (does this
+    // filament / nozzle / tank exist for this company), so keeping them outside
+    // holds the write transaction — and its locks on order_pieces — open only
+    // for the inserts. A row that fails here is recorded and SKIPPED, not fatal.
+    const valid: Array<{ index: number; input: CreateOrderPieceInput }> = [];
+    for (let i = 0; i < inputs.length; i += 1) {
+      const input = inputs[i]!;
+      try {
+        await this.validatePieceReferences(companyId, input);
+        valid.push({ index: i, input });
+      } catch (err) {
+        failed.push({
+          index: i,
+          piece_name: input.piece_name ?? "",
+          reason: err instanceof Error ? err.message : "invalid reference",
+        });
+      }
+    }
+
+    if (valid.length === 0) return { created: 0, piece_ids: [], failed };
+
+    const pieceIds = await this.databaseService.transaction(async (client) => {
+      const ids: string[] = [];
+
+      // SAVEPOINT per piece so one bad row cannot take the batch down with it.
+      //
+      // Without this, a single constraint violation — the resin readiness CHECK
+      // is the realistic one, since reference validation cannot see it — aborts
+      // the whole transaction, and 500 good rows are lost with the one bad one.
+      // On an 800-row paste that is the difference between "row 412 needs a
+      // tank" and "nothing saved, find it yourself". The savepoint name is
+      // built from the loop index, never from input, so it cannot be injected.
+      for (const { index, input } of valid) {
+        const sp = `sp_${index}`;
+        await client.query(`SAVEPOINT ${sp}`);
+        try {
+          ids.push(await this.insertPieceRecord(companyId, orderId, input, client));
+          await client.query(`RELEASE SAVEPOINT ${sp}`);
+        } catch (err) {
+          // Undo just this piece; the transaction stays usable for the rest.
+          await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+          failed.push({
+            index,
+            piece_name: input.piece_name ?? "",
+            reason: err instanceof Error ? err.message : "could not be created",
+          });
+        }
+      }
+
+      // ONCE, after the last piece that actually landed. The order's derived
+      // status is a function of its final piece set, so computing it per insert
+      // produced intermediate answers nobody read — and made adding N pieces
+      // cost O(N²), since each recompute aggregates every piece in the order.
+      // Skipped entirely when nothing landed, so a fully-failed batch leaves the
+      // order exactly as it was.
+      if (ids.length > 0) {
+        await this.syncOrderStatus(companyId, orderId, client);
+        // One history line for the batch. 80,000 lines reading "Piece X added"
+        // is not a history anyone can read, and writing them is another 80,000
+        // inserts.
+        await this.logPieceHistory(
+          client,
+          companyId,
+          ids.length === 1 ? ids[0]! : null,
+          orderId,
+          ids.length === 1 ? (valid[0]!.input.piece_name ?? "") : `${ids.length} pieces`,
+          "created",
+          ids.length === 1
+            ? `Piece "${valid[0]!.input.piece_name}" added.`
+            : `${ids.length} pieces added.`
+        );
+      }
+      return ids;
+    });
+
+    return { created: pieceIds.length, piece_ids: pieceIds, failed };
+  }
+
   async duplicatePiece(
     companyId: string,
     pieceId: string,
@@ -1896,4 +2018,13 @@ export class OrderPiecesService {
       description
     });
   }
+}
+
+/** One row that could not be created, and why. Carries `index` so the caller can
+ *  map it back to the row the operator is looking at — a reason without a row is
+ *  not actionable on an 800-row paste. */
+export interface BulkPieceFailure {
+  index: number;
+  piece_name: string;
+  reason: string;
 }

@@ -584,3 +584,15 @@ export const failPieceExecutionSchema = z.object({
   actual_filament_used_grams: boundedNumber(0, 100000).optional(),
   notes: z.string().nullable().optional()
 });
+
+/**
+ * POST /api/orders/:orderId/pieces/bulk
+ *
+ * Capped at 500 to match order-pieces' bulk-delete. The number bounds how long
+ * one transaction holds locks on order_pieces, not how many pieces an order may
+ * have — the client sends successive batches for anything larger.
+ */
+export const bulkCreateOrderPiecesSchema = z.object({
+  pieces: z.array(createOrderPieceSchema).min(1).max(500)
+}).strict();
+export type BulkCreateOrderPiecesInput = z.infer<typeof bulkCreateOrderPiecesSchema>;

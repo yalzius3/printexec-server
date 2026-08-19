@@ -14,6 +14,7 @@ import { parseWithSchema } from "../common/zod";
 import { OrderPiecesService } from "../order-pieces/order-pieces.service";
 import {
   createOrderPieceSchema,
+  bulkCreateOrderPiecesSchema,
   createOrderSchema,
   listOrderPiecesQuerySchema,
   listOrdersQuerySchema,
@@ -125,6 +126,30 @@ export class OrdersController {
       orderId,
       parseWithSchema(createOrderPieceSchema, body)
     );
+  }
+
+  /**
+   * Create many pieces in one transaction, with one order-status recompute.
+   *
+   * The single-piece route above stays for every other caller. This exists for
+   * the bulk grid, which used to fire one request per row: each of those ran a
+   * full order-status recompute, so adding N pieces was O(N²) — and 80,000 rows
+   * also exceeded the browser's socket pool long before the database gave up.
+   *
+   * Capped at 500 per call, matching order-pieces' bulk-delete. The cap is what
+   * keeps one transaction short enough not to hold locks on order_pieces while
+   * the shop floor is trying to work; the client sends several batches in
+   * sequence for anything larger.
+   */
+  @Post(":orderId/pieces/bulk")
+  @RequirePermission("action_orders")
+  createOrderPiecesBulk(
+    @CompanyId() companyId: string,
+    @Param("orderId") orderId: string,
+    @Body() body: unknown
+  ) {
+    const { pieces } = parseWithSchema(bulkCreateOrderPiecesSchema, body);
+    return this.orderPiecesService.createPieces(companyId, orderId, pieces);
   }
 
   @Delete(":orderId")
