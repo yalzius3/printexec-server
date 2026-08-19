@@ -17,6 +17,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import { AdminEmail } from "./admin-email.decorator";
 import { UserId } from "../common/user-id.decorator";
 import { parseWithSchema } from "../common/zod";
+import { blockedUploadExtension, blockedUploadMessage } from "../common/upload-file-types";
 import { DatabaseService } from "../database/database.service";
 import { EmailService } from "../email/email.service";
 import { composePlatformEmail } from "../email/email-templates";
@@ -1231,6 +1232,16 @@ export class LicensingAdminController {
     }
     const data = await req.file();
     if (!data) throw new BadRequestException("No file received.");
+    // Same gate as the tenant upload route. It matters more here, not less:
+    // storeOfficialFile() keeps the ORIGINAL filename in the storage key
+    // instead of renaming to a uuid, and sendInvoice() then mails that file to
+    // the tenant — so a name accepted here is a name that lands in a
+    // customer's inbox.
+    const blockedExt = blockedUploadExtension(data.filename);
+    if (blockedExt) {
+      await data.toBuffer().catch(() => undefined); // drain, or the request never completes
+      throw new BadRequestException(blockedUploadMessage(blockedExt));
+    }
     const officialNumber = String(
       (data.fields as Record<string, { value?: unknown } | undefined>)?.["official_number"]?.value ?? ""
     ).trim();

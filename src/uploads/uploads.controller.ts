@@ -25,6 +25,7 @@ import * as path from "path";
 import * as zlib from "zlib";
 import { v4 as uuidv4 } from "uuid";
 import { promisify } from "util";
+import { blockedUploadExtension, blockedUploadMessage } from "../common/upload-file-types";
 
 const inflateRaw = promisify(zlib.inflateRaw);
 
@@ -187,6 +188,19 @@ export class UploadsController {
       throw new BadRequestException("No file uploaded");
     }
 
+    // Refuse web-executable file types before a single byte is buffered. See
+    // common/upload-file-types.ts for what is on the list, and why it is a deny
+    // list rather than an allow list.
+    const blocked = blockedUploadExtension(data.filename);
+    if (blocked) {
+      // The multipart part still has to be read to completion, or the request
+      // never finishes and the client sees a reset socket instead of this
+      // message. resume() drains it without holding it — the whole point of
+      // rejecting here rather than after toBuffer().
+      await this.drainMultipartFile(data.file);
+      throw new BadRequestException(blockedUploadMessage(blocked));
+    }
+
     const extension = path.extname(data.filename);
     const filename = `${uuidv4()}${extension}`;
     const objectKey = `${companyId}/${filename}`;
@@ -250,6 +264,19 @@ export class UploadsController {
       ...(parsed.slicer_print_time_minutes != null ? { slicer_print_time_minutes: parsed.slicer_print_time_minutes } : {}),
       ...(parsed.slicer_filament_used_grams != null ? { slicer_filament_used_grams: parsed.slicer_filament_used_grams } : {}),
     };
+  }
+
+  // Read a multipart file stream to its end and throw the bytes away. Used
+  // only on the rejection path above; an 'error' (the size limit tripping
+  // mid-drain, say) is as good as an end here — the bytes are being discarded
+  // either way and the caller's exception is already decided.
+  private drainMultipartFile(stream: NodeJS.ReadableStream): Promise<void> {
+    return new Promise<void>((resolve) => {
+      stream.on("end", () => resolve());
+      stream.on("error", () => resolve());
+      stream.on("close", () => resolve());
+      stream.resume();
+    });
   }
 
   private async parseSlicerFile(
