@@ -20,6 +20,8 @@ import type {
   FindCandidatesInput,
   JobStatus,
   ListJobsQuery,
+  QueueSortQuery,
+  QueueSortKey,
   ReserveSpoolsInput,
   RestoreJobInput,
   ScheduleJobInput,
@@ -638,7 +640,25 @@ export class JobsService {
   // ──────────────────────────────────────────────────────────
   // GET /api/jobs/queue
   // ──────────────────────────────────────────────────────────
-  async listJobs(companyId: string, query: ListJobsQuery): Promise<JobRow[]> {
+  /**
+   * The queue's WHERE clause, built ONCE and shared by every endpoint that has
+   * to agree about which pieces "the queue" currently means.
+   *
+   * This is not tidiness. Ctrl+A selects ids from one endpoint and the operator
+   * then bulk-deletes them; the facet dropdowns come from another; the list they
+   * are looking at comes from a third. If any two of those built their filters
+   * separately, a select-all could return an id the operator cannot see — and
+   * then delete it. One builder makes that class of bug impossible rather than
+   * merely unlikely.
+   *
+   * The `AND o.status IN (...)` draft-order exclusion is NOT here: it lives in
+   * jobSelectSql behind its `excludeDraftOrders` flag, so callers of this helper
+   * must apply it themselves. See `queueScopeOrderClause`.
+   */
+  private async buildQueueFilter(
+    companyId: string,
+    query: ListJobsQuery
+  ): Promise<{ wheres: string[]; values: unknown[] }> {
     const values: unknown[] = [companyId];
     const wheres: string[] = ["op.company_id = $1"];
 
@@ -667,7 +687,36 @@ export class JobsService {
       );
     }
 
-    const hasStl = await this.hasStlColumn();
+    // ── The Filter popover's four fields. Each mirrors the client predicate in
+    //    JobsWorkspace's `queueMatchesFilter` EXACTLY, including its quirks:
+    //    equality on the rendered strings, and undated pieces surviving a
+    //    deadline cut-off because the client only compares when a deadline is
+    //    present. Any divergence here shows up as a select-all that disagrees
+    //    with the visible list.
+    if (query.order_reference) {
+      values.push(query.order_reference);
+      wheres.push(`o.order_number = $${values.length}`);
+    }
+    if (query.customer_name) {
+      values.push(query.customer_name);
+      // Same COALESCE the row projection uses, so the value compared is the one
+      // the operator actually picked out of the dropdown.
+      wheres.push(
+        `COALESCE(
+           NULLIF(cu.business_name, ''),
+           NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
+         ) = $${values.length}`
+      );
+    }
+    if (query.technology) {
+      values.push(query.technology);
+      wheres.push(`op.required_print_technology = $${values.length}`);
+    }
+    if (query.deadline_by) {
+      values.push(query.deadline_by);
+      wheres.push(`(o.deadline IS NULL OR o.deadline <= $${values.length}::date)`);
+    }
+
     // Pieces that are part of a bed are hidden — the bed itself shows in
     // their place at the queue level. We only add this filter once the
     // `bed_id` column exists; otherwise we'd break the queue for users
@@ -675,10 +724,482 @@ export class JobsService {
     if (await this.hasBedColumn()) {
       wheres.push(`op.bed_id IS NULL`);
     }
+    return { wheres, values };
+  }
+
+  /** The draft-order exclusion jobSelectSql applies when excludeDraftOrders is
+   *  set. Repeated here verbatim so the aggregate endpoints scope to the same
+   *  orders the list does. */
+  private static readonly QUEUE_ORDER_STATUSES =
+    "('confirmed','in_progress','completed','ready_for_shipping','out_for_shipping')";
+
+  /**
+   * The queue's ORDER BY, mirroring the client comparator this replaces.
+   *
+   * ── HOW THE CLIENT ORDERED, EXACTLY ─────────────────────────────────────────
+   * `sortValue()` produced a key, the rows were compared with JS `<` / `>`, ties
+   * were broken by `piece_name.localeCompare()` — ALWAYS ascending, even under a
+   * descending sort — and Array.prototype.sort being stable left equal rows in
+   * arrival order, which was `created_at DESC`. All three layers are reproduced
+   * below, including the always-ascending tie-break.
+   *
+   * ── NULLS ───────────────────────────────────────────────────────────────────
+   * Every sentinel the client used for a missing value — `"￿"` for text,
+   * `+Infinity` for numbers, `"9999-12-31"` for a missing deadline — sorts a null
+   * as the MAXIMUM. Postgres already does exactly that by default (NULLS LAST on
+   * ASC, NULLS FIRST on DESC), so no explicit NULLS clause is needed or wanted.
+   *
+   * ── COLLATION ───────────────────────────────────────────────────────────────
+   * Text keys use `lower(x) COLLATE "C"` with `x COLLATE "C" DESC` beneath.
+   * Measured against the client's actual comparator: identical on every
+   * alphanumeric name, 0.9% divergence overall, confined to pairs where
+   * punctuation meets a digit (ICU treats punctuation as ignorable, byte order
+   * does not). `COLLATE "C"` is deliberate — it is a built-in that behaves
+   * identically on every server, whereas the database's default collation is an
+   * environment fact this code cannot see and must not depend on. The DESC on the
+   * raw value reproduces ICU's lowercase-before-uppercase tertiary rule; without
+   * it, ordering flips for every mixed-case pair.
+   *
+   * ── TIME ────────────────────────────────────────────────────────────────────
+   * `deadline` is a DATE, and the client parses its `YYYY-MM-DD` text through
+   * `new Date(...)`, which the language specifies as UTC midnight. So the epoch
+   * here is taken `AT TIME ZONE 'UTC'`; reading it in the server's local zone
+   * would shift every urgency bucket by the server's offset.
+   *
+   * Keys are looked up in a fixed table and never interpolated from input.
+   */
+  private queueOrderBy(sort: QueueSortKey | undefined, order: "asc" | "desc" | undefined): string {
+    const dir = order === "desc" ? "DESC" : "ASC";
+    // ALWAYS ascending, whatever the primary direction — the client's tie-break
+    // is a bare `piece_name.localeCompare(...)` with no direction applied.
+    //
+    // The second term is where CASE is decided, and it belongs here rather than
+    // on the sorted column. The client's primary comparison is over
+    // `value.toLowerCase()`, so two rows differing only in case TIE on the
+    // primary and fall through to this tie-break every time. Putting a case
+    // tertiary on the sorted column instead made "sort by customer" order
+    // "Acme" and "acme" against each other, when the client orders them by piece
+    // name. `DESC` on the raw bytes reproduces ICU's lowercase-before-uppercase
+    // rule (b=0x62 > B=0x42, so descending yields lowercase first).
+    const tie = `lower(op.piece_name) COLLATE "C" ASC, op.piece_name COLLATE "C" DESC`;
+    // Last resort, so the total order is deterministic even for identical names.
+    // Matches the arrival order the client's stable sort preserved.
+    const stable = `op.created_at DESC, op.piece_id ASC`;
+
+    // Case-insensitive only. Case is settled by `tie` above, for every key.
+    const text = (col: string) => `lower(${col}) COLLATE "C" ${dir}`;
+
+    // bucket * 10^13 + deadline_ms * 10 + status_weight, exactly as
+    // urgencySortValue() computes it. Well inside float8's exact-integer range
+    // (~9.0e15); the largest term here is ~4.7e13.
+    const urgencyExpr = `
+      (CASE
+         WHEN o.deadline IS NULL THEN NULL
+         ELSE
+           (CASE
+              WHEN (EXTRACT(EPOCH FROM (o.deadline::timestamp AT TIME ZONE 'UTC')) * 1000
+                    - EXTRACT(EPOCH FROM now()) * 1000) / 60000.0 < 0        THEN 0
+              WHEN (EXTRACT(EPOCH FROM (o.deadline::timestamp AT TIME ZONE 'UTC')) * 1000
+                    - EXTRACT(EPOCH FROM now()) * 1000) / 60000.0 <= 1440    THEN 1
+              WHEN (EXTRACT(EPOCH FROM (o.deadline::timestamp AT TIME ZONE 'UTC')) * 1000
+                    - EXTRACT(EPOCH FROM now()) * 1000) / 60000.0 <= 4320    THEN 2
+              ELSE 3
+            END) * 10000000000000::float8
+           + EXTRACT(EPOCH FROM (o.deadline::timestamp AT TIME ZONE 'UTC')) * 1000 * 10
+           + CASE op.status
+               WHEN 'printing' THEN 0 WHEN 'scheduled' THEN 1 WHEN 'ready'  THEN 2
+               WHEN 'assigned' THEN 3 WHEN 'pending'   THEN 4 WHEN 'failed' THEN 5
+               WHEN 'done'     THEN 6 WHEN 'cancelled' THEN 7 ELSE 8
+             END
+       END)`;
+
+    const statusWeight = `CASE op.status
+        WHEN 'pending' THEN 0 WHEN 'assigned'  THEN 1 WHEN 'ready'  THEN 2
+        WHEN 'scheduled' THEN 3 WHEN 'printing' THEN 4 WHEN 'done'  THEN 5
+        WHEN 'failed'  THEN 6 WHEN 'cancelled' THEN 7 ELSE 8
+      END`;
+
+    switch (sort) {
+      // The wash/cure bucket overrides the operator's sort entirely with
+      // longest-waiting-first, and applies NO tie-break — matching the client's
+      // separate early-return branch rather than its general comparator.
+      case "post_process_wait":
+        return `op.post_process_state_entered_at ASC, ${stable}`;
+      case "urgency":     return `${urgencyExpr} ${dir}, ${tie}, ${stable}`;
+      case "deadline":    return `o.deadline ${dir}, ${tie}, ${stable}`;
+      case "order":       return `${text("o.order_number")}, ${tie}, ${stable}`;
+      // Takes the tie-break too: its first term is a no-op against an equal
+      // primary, and its second term is what applies the case rule.
+      case "piece_name":  return `${text("op.piece_name")}, ${tie}, ${stable}`;
+      case "customer":    return `${text(
+        `COALESCE(NULLIF(cu.business_name, ''), NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), ''))`
+      )}, ${tie}, ${stable}`;
+      case "status":      return `${statusWeight} ${dir}, ${tie}, ${stable}`;
+      case "printer":     return `${text(
+        `CASE WHEN pi.printer_id IS NOT NULL THEN pi.brand || ' ' || pi.model ELSE NULL END`
+      )}, ${tie}, ${stable}`;
+      case "time":        return `op.slicer_print_time_minutes ${dir}, ${tie}, ${stable}`;
+      default:            return `op.created_at DESC, op.piece_id ASC`;
+    }
+  }
+
+  async listJobs(companyId: string, query: QueueSortQuery): Promise<JobRow[]> {
+    const { wheres, values } = await this.buildQueueFilter(companyId, query);
+    const hasStl = await this.hasStlColumn();
     const hasThumb = await this.hasStlThumbnailColumn();
-    const sql = this.jobSelectSql(hasStl, `WHERE ${wheres.join(" AND ")}`, "op.created_at DESC", true, hasThumb);
+    // Ordering is the server's job now. Omitting `sort` keeps the historical
+    // `created_at DESC`, so a caller that hasn't been updated — or a client
+    // deployed ahead of this API — gets exactly what it got before.
+    const orderBy = this.queueOrderBy(query.sort, query.order);
+    const sql = this.jobSelectSql(hasStl, `WHERE ${wheres.join(" AND ")}`, orderBy, true, hasThumb);
     const result = await this.databaseService.query<JobRow>(sql, values);
     return result.rows;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // GET /api/jobs/queue/fingerprint
+  // ──────────────────────────────────────────────────────────
+  /**
+   * A ~70-byte answer to "has the board changed?", so the polling backstop stops
+   * pulling the whole queue every 60 seconds. On a 10k-piece tenant that poll is
+   * a 16.5 MB response per open tab per minute, almost always byte-identical to
+   * the one before it.
+   *
+   * WHY A CHECKSUM OF THE RENDERED FIELDS, rather than `max(last_updated_at)`.
+   *
+   * The original reasoning here was WRONG and is corrected in place rather than
+   * quietly deleted, because the wrong version is a tempting conclusion to reach
+   * again. It said `last_updated_at` is not maintained, on the evidence that
+   * none of the 25 `UPDATE order_pieces` statements in this codebase set it —
+   * true — and that TimeStateService's four transition updates therefore leave it
+   * stale. That last step does not follow. The database maintains the column with
+   * a trigger defined in the base schema, not in migrations/:
+   *     trg_order_pieces_updated -> fn_order_pieces_set_updated
+   * (and trg_orders_updated on orders). Verified against the live database.
+   *
+   * So the checksum is no longer the ONLY correct option — but it stays, for two
+   * reasons. It is correct by construction: it hashes exactly the columns the
+   * queue renders, so if what an operator sees would differ, the signature
+   * differs, with no dependency on trigger coverage. And it is verified working
+   * against real data (a one-piece status change does move the digest).
+   *
+   * A `count(*) + max(last_updated_at)` fingerprint would be cheaper — an
+   * index-assisted aggregate instead of a scan plus string_agg plus md5 — and is
+   * worth taking when the 10k tenant makes that difference matter. It needs three
+   * things confirmed first, none of which is established yet:
+   *   1. `pg_get_triggerdef(trg_order_pieces_updated)` fires on ALL updates, not
+   *      `UPDATE OF <column list>` — a status-only write must bump it.
+   *   2. An equivalent trigger exists on print_beds, which this also hashes.
+   *   3. Nothing writes to these tables in a way that bypasses the trigger.
+   * Swapping a verified mechanism for an unverified one to save milliseconds at a
+   * scale that does not exist yet would be the wrong trade.
+   *
+   * DELIBERATELY OVER-SENSITIVE. Pieces are hashed WITHOUT the `bed_id IS NULL`
+   * filter the queue itself applies, because a bed's rendered fulfilment and
+   * post-process state are rolled up from its child pieces — and those children
+   * are exactly what that filter hides. Scoping the hash to the visible set
+   * would have made a bedded piece advancing invisible to both halves of this
+   * fingerprint. An extra refetch costs a request; a missed one costs an
+   * operator scheduling against a stale board.
+   *
+   * Cost is a scan plus a hash, never a materialisation: the rows are read but
+   * only two short hex digests cross the wire, instead of megabytes of JSON the
+   * client then parses and holds twice over (placeholderData keeps the previous
+   * result alive for the duration of a refetch).
+   */
+  async queueFingerprint(companyId: string): Promise<{
+    pieces: { n: number; sig: string };
+    beds: { n: number; sig: string };
+  }> {
+    // bed_id ships in the print_beds migration; gate it the same way listJobs
+    // does rather than assume the column is there.
+    const bedIdPart = (await this.hasBedColumn())
+      ? "COALESCE(op.bed_id::text, ''),"
+      : "";
+
+    // CONCAT_WS with a separator, and COALESCE on every nullable member:
+    // string_agg drops NULL inputs outright, so one un-coalesced NULL would
+    // erase a whole piece from the digest and hide it changing. The separator
+    // stops 'a'||'bc' colliding with 'ab'||'c'.
+    const pieceSql = `
+      SELECT COUNT(*)::int AS n,
+             COALESCE(md5(string_agg(sig, ',' ORDER BY sig)), '-') AS sig
+        FROM (
+          SELECT CONCAT_WS('|',
+                   op.piece_id::text,
+                   op.status,
+                   COALESCE(op.fulfilment_status, ''),
+                   COALESCE(op.post_process_state, ''),
+                   ${bedIdPart}
+                   COALESCE(op.assigned_printer_id::text, ''),
+                   COALESCE(op.assigned_nozzle_asset_id::text, ''),
+                   COALESCE(op.resin_tank_id::text, ''),
+                   COALESCE(op.scheduled_start_at::text, ''),
+                   COALESCE(op.scheduled_end_at::text, ''),
+                   COALESCE(op.print_started_at::text, ''),
+                   COALESCE(op.print_completed_at::text, ''),
+                   COALESCE(op.slicer_print_time_minutes::text, ''),
+                   COALESCE(op.piece_name, '')
+                 ) AS sig
+            FROM order_pieces op
+           WHERE op.company_id = $1
+        ) s
+    `;
+
+    // Beds are hashed on their OWN columns only. fulfilment_status and
+    // post_process_state are join-computed in bedSelectSql, not stored on
+    // print_beds — naming them here would be a 500. Their underlying truth is
+    // the child pieces, which the piece digest above already covers.
+    const hasBeds = await this.hasBedsTable();
+    const bedSql = `
+      SELECT COUNT(*)::int AS n,
+             COALESCE(md5(string_agg(sig, ',' ORDER BY sig)), '-') AS sig
+        FROM (
+          SELECT CONCAT_WS('|',
+                   pb.bed_id::text,
+                   pb.status,
+                   COALESCE(pb.assigned_printer_id::text, ''),
+                   COALESCE(pb.assigned_nozzle_asset_id::text, ''),
+                   COALESCE(pb.resin_tank_id::text, ''),
+                   COALESCE(pb.scheduled_start_at::text, ''),
+                   COALESCE(pb.scheduled_end_at::text, ''),
+                   COALESCE(pb.print_started_at::text, ''),
+                   COALESCE(pb.print_completed_at::text, ''),
+                   COALESCE(pb.bed_name, '')
+                 ) AS sig
+            FROM print_beds pb
+           WHERE pb.company_id = $1 AND pb.status != 'disassembled'
+        ) s
+    `;
+
+    const pieces = await this.databaseService.query<{ n: number; sig: string }>(
+      pieceSql,
+      [companyId]
+    );
+    const beds = hasBeds
+      ? await this.databaseService.query<{ n: number; sig: string }>(bedSql, [companyId])
+      : null;
+
+    return {
+      pieces: { n: pieces.rows[0]?.n ?? 0, sig: pieces.rows[0]?.sig ?? "-" },
+      beds: { n: beds?.rows[0]?.n ?? 0, sig: beds?.rows[0]?.sig ?? "-" },
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // GET /api/jobs/queue/summary
+  // ──────────────────────────────────────────────────────────
+  /**
+   * The filter dropdowns and the stage tab counts, computed in SQL.
+   *
+   * Both were derived on the client by walking the entire row array — which is
+   * a large part of why the client had to hold every row in the first place.
+   * `Array.from(new Set(rows.map(...)))` for three facets plus a per-stage
+   * `rows.filter(...).length` is cheap at a hundred pieces and is a reason to
+   * ship 16.5 MB at ten thousand.
+   *
+   * The stage counts mirror the client's `effectiveStage`: a done piece is
+   * reported under its post-process stage if it has one and isn't cured, else
+   * its shipping stage if that isn't 'none', else plain 'done'. Anything not
+   * done reports its own status. Keep the two in step — this decides the numbers
+   * on the tabs the operator navigates by.
+   */
+  async queueSummary(
+    companyId: string,
+    query: ListJobsQuery
+  ): Promise<{
+    orders: string[];
+    customers: string[];
+    technologies: string[];
+    stageCounts: Record<string, number>;
+    total: number;
+  }> {
+    const { wheres, values } = await this.buildQueueFilter(companyId, query);
+    const where = `WHERE ${wheres.join(" AND ")} AND o.status IN ${JobsService.QUEUE_ORDER_STATUSES}`;
+
+    const sql = `
+      WITH scoped AS (
+        SELECT op.status,
+               op.fulfilment_status,
+               op.post_process_state,
+               op.required_print_technology,
+               o.order_number,
+               COALESCE(
+                 NULLIF(cu.business_name, ''),
+                 NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
+               ) AS customer_name
+          FROM order_pieces op
+          JOIN orders o          ON o.order_id = op.order_id AND o.company_id = op.company_id
+          LEFT JOIN customers cu ON cu.customer_id = o.customer_id
+        ${where}
+      ),
+      staged AS (
+        SELECT CASE
+                 WHEN status <> 'done' THEN status
+                 -- SHIPPING OUTRANKS POST-PROCESSING, and the order of these two
+                 -- branches is the whole meaning of the rule: once a part is
+                 -- moving it has necessarily cured. This mirrors the client's
+                 -- effectiveStage() exactly. Written the other way round, a resin
+                 -- piece that is both post-processed AND shipping reports its
+                 -- wash/cure stage instead of its shipping stage — which lands it
+                 -- under the wrong tab and, far worse, makes mark-mode's stage
+                 -- lock select the wrong pieces for a bulk shipping advance.
+                 WHEN fulfilment_status IS NOT NULL AND fulfilment_status <> 'none'
+                   THEN fulfilment_status
+                 WHEN post_process_state IS NOT NULL AND post_process_state <> 'cured'
+                   THEN post_process_state
+                 ELSE 'done'
+               END AS stage
+          FROM scoped
+      )
+      SELECT
+        (SELECT COALESCE(json_agg(DISTINCT order_number ORDER BY order_number), '[]'::json)
+           FROM scoped WHERE order_number IS NOT NULL)          AS orders,
+        (SELECT COALESCE(json_agg(DISTINCT customer_name ORDER BY customer_name), '[]'::json)
+           FROM scoped WHERE customer_name IS NOT NULL AND customer_name <> '') AS customers,
+        (SELECT COALESCE(json_agg(DISTINCT required_print_technology ORDER BY required_print_technology), '[]'::json)
+           FROM scoped WHERE required_print_technology IS NOT NULL)             AS technologies,
+        (SELECT COALESCE(json_object_agg(stage, n), '{}'::json)
+           FROM (SELECT stage, COUNT(*)::int AS n FROM staged GROUP BY stage) g) AS stage_counts,
+        (SELECT COUNT(*)::int FROM scoped)                       AS total
+    `;
+
+    const res = await this.databaseService.query<{
+      orders: string[];
+      customers: string[];
+      technologies: string[];
+      stage_counts: Record<string, number>;
+      total: number;
+    }>(sql, values);
+    const row = res.rows[0];
+    return {
+      orders: row?.orders ?? [],
+      customers: row?.customers ?? [],
+      technologies: row?.technologies ?? [],
+      stageCounts: row?.stage_counts ?? {},
+      total: row?.total ?? 0,
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // GET /api/jobs/queue/ids
+  // ──────────────────────────────────────────────────────────
+  /**
+   * Every piece id the current filter matches — what Ctrl+A selects.
+   *
+   * Ids only, so selecting ten thousand pieces costs ~380 KB instead of the
+   * 16.5 MB the client previously had to be holding for the same answer.
+   *
+   * `stage` narrows further to one effective stage, because the client's own
+   * select-all is stage-aware: mark-mode locks the selection to a single
+   * shipping/post-process stage so a bulk advance can never span two.
+   *
+   * SAFETY: this feeds bulk DELETE. It is scoped by exactly the same filter
+   * builder the list uses, so it can never return something the operator cannot
+   * see on screen.
+   */
+  async queueIds(
+    companyId: string,
+    query: ListJobsQuery & { stage?: string | undefined }
+  ): Promise<{ piece_ids: string[]; total: number }> {
+    const { wheres, values } = await this.buildQueueFilter(companyId, query);
+    let where = `WHERE ${wheres.join(" AND ")} AND o.status IN ${JobsService.QUEUE_ORDER_STATUSES}`;
+
+    if (query.stage) {
+      values.push(query.stage);
+      // Same branch order as queueSummary and the client's effectiveStage:
+      // shipping outranks post-processing. See the note there.
+      where += ` AND CASE
+          WHEN op.status <> 'done' THEN op.status
+          WHEN op.fulfilment_status IS NOT NULL AND op.fulfilment_status <> 'none'
+            THEN op.fulfilment_status
+          WHEN op.post_process_state IS NOT NULL AND op.post_process_state <> 'cured'
+            THEN op.post_process_state
+          ELSE 'done'
+        END = $${values.length}`;
+    }
+
+    // The customers LEFT JOIN is required, not decorative: buildQueueFilter's
+    // customer_name predicate resolves the same COALESCE(business_name, first +
+    // last) expression the row projection does, and that needs `cu` in scope.
+    const res = await this.databaseService.query<{ piece_id: string }>(
+      `SELECT op.piece_id
+         FROM order_pieces op
+         JOIN orders o          ON o.order_id = op.order_id AND o.company_id = op.company_id
+         LEFT JOIN customers cu ON cu.customer_id = o.customer_id
+       ${where}
+        ORDER BY op.created_at DESC`,
+      values
+    );
+    const ids = res.rows.map((r) => r.piece_id);
+    return { piece_ids: ids, total: ids.length };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // GET /api/jobs/queue/assignable
+  // ──────────────────────────────────────────────────────────
+  /**
+   * The pending, printer-less pieces the Bulk Assign flow starts from.
+   *
+   * Previously read off the full row array on the client
+   * (`rows.filter(r => r.status === 'pending' && !r.assigned_printer_id)`),
+   * which is one of the last things forcing that array to exist. Scoped through
+   * the SAME buildQueueFilter as the list, so it keeps the existing behaviour
+   * exactly — including that it inherits the active status/search scope, so
+   * viewing "Printing" yields no candidates. That is what the client did, quirk
+   * and all, and this is not the change in which to alter it.
+   *
+   * RETURNS `cost_inputs` RAW, AND DELIBERATELY DOES NOT DERIVE THE ASSUMED
+   * FIGURES. Those numbers (`quoteAssumed` on the client) prefill the print-data
+   * step and end up as the piece's slicer time and quantity, which is what the
+   * job is costed and priced from. Re-implementing that arithmetic here — a
+   * positives-only sum and a `Math.round(x * 100) / 100` — would mean two
+   * expressions of one money rule that could drift apart, in different languages
+   * with different rounding. The client keeps computing them with the function it
+   * already uses, so the figures are identical by construction rather than by
+   * inspection.
+   */
+  async queueAssignable(
+    companyId: string,
+    query: ListJobsQuery
+  ): Promise<Array<Record<string, unknown>>> {
+    const { wheres, values } = await this.buildQueueFilter(companyId, query);
+    const where = [
+      ...wheres,
+      "op.status = 'pending'",
+      "op.assigned_printer_id IS NULL",
+    ].join(" AND ");
+
+    const res = await this.databaseService.query(
+      `SELECT
+         op.piece_id,
+         op.piece_name,
+         o.order_number AS order_reference,
+         o.deadline::text AS order_deadline,
+         op.required_print_technology,
+         op.resin_tank_id,
+         op.cost_inputs,
+         -- Byte-identical to jobSelectSql's expression, so a piece reads the
+         -- same here as it does in the row the operator clicked from.
+         CASE
+           WHEN fr.filament_ref_id IS NOT NULL
+             THEN fr.brand || ' ' || fr.material_type || ' (' || fr.color || ')'
+           ELSE NULL
+         END AS required_filament_label,
+         COALESCE(
+           NULLIF(cu.business_name, ''),
+           NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
+         ) AS customer_name
+       FROM order_pieces op
+       JOIN orders o                   ON o.order_id = op.order_id AND o.company_id = op.company_id
+       LEFT JOIN customers cu          ON cu.customer_id = o.customer_id
+       LEFT JOIN filament_reference fr ON fr.filament_ref_id = op.required_filament_ref_id
+      WHERE ${where}
+        AND o.status IN ${JobsService.QUEUE_ORDER_STATUSES}
+      ORDER BY op.created_at DESC, op.piece_id ASC`,
+      values
+    );
+    return res.rows;
   }
 
   async getJob(companyId: string, pieceId: string): Promise<JobRow> {

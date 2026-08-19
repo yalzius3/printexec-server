@@ -669,12 +669,56 @@ export class OrderPiecesService {
     const uniqueIds = [...new Set(pieceIds)];
 
     // Same guards the single delete applies, validated up front.
+    //
+    // Loaded in ONE query rather than per piece. The previous shape called
+    // getPieceById + assertOrderExists per id, and getPieceById itself fans out
+    // to listSpoolAllocations + getSchedulingDiagnostics — so a 500-piece batch
+    // cost ~1500 sequential round trips before the transaction even opened, none
+    // of whose results this path uses beyond six columns.
+    //
+    // `op.*` is kept deliberately instead of a named column list: bed_id ships in
+    // the print_beds migration and is read off the row (`piece.bed_id`) but never
+    // named in SQL anywhere in this service, so naming it here would break any
+    // deploy that hasn't run that migration. The star keeps today's semantics —
+    // the field is present if the column is, absent if it isn't.
+    const loaded = await this.databaseService.query<{
+      piece_id: string;
+      order_id: string;
+      bed_id: string | null;
+      piece_name: string;
+      status: string;
+      assigned_printer_id: string | null;
+      order_status: string;
+    }>(
+      `SELECT op.*, o.status AS order_status
+         FROM order_pieces op
+         JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
+        WHERE op.company_id = $1 AND op.piece_id = ANY($2::uuid[])`,
+      [companyId, uniqueIds]
+    );
+    const byId = new Map(loaded.rows.map((r) => [r.piece_id, r]));
+
+    // Validated in the caller's id order, applying the same four checks in the
+    // same sequence as the per-piece loop did, so the FIRST failure a caller sees
+    // is unchanged — same exception type, same message.
     const pieces: Array<{ piece_id: string; order_id: string; bed_id: string | null; piece_name: string; status: string; assigned_printer_id: string | null }> = [];
     for (const pieceId of uniqueIds) {
-      const piece = await this.getPieceById(companyId, pieceId);
-      const order = await this.assertOrderExists(companyId, piece.order_id);
+      const piece = byId.get(pieceId);
+      // The join above is inner, so a missing row means either the piece doesn't
+      // exist for this company or its order doesn't. Probe which, so each case
+      // still reports the error it always reported.
+      if (!piece) {
+        const probe = await this.databaseService.query<{ order_id: string }>(
+          `SELECT order_id FROM order_pieces WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, pieceId]
+        );
+        if (!probe.rowCount) {
+          throw new NotFoundException("Order piece not found.");
+        }
+        throw new BadRequestException("Order does not exist for this company.");
+      }
       if (!force) {
-        this.assertOrderOpenForPieceChanges(order.status);
+        this.assertOrderOpenForPieceChanges(piece.order_status);
         if (["printing", "done", "failed"].includes(piece.status)) {
           throw new BadRequestException(
             "Printing or completed piece records cannot be deleted."

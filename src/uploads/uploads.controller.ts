@@ -171,6 +171,22 @@ export class UploadsController {
     const contentType = CONTENT_TYPES[path.extname(filename).toLowerCase()] ?? "application/octet-stream";
     reply.header("Content-Type", contentType);
     reply.header("Content-Length", bytes.byteLength);
+    // Immutable for a year. Safe because uploadFile() below names every object
+    // `${uuidv4()}${extension}` and uploads with `upsert: false` — a given key's
+    // bytes can never change, so there is nothing to revalidate. Replacing a
+    // file always mints a NEW url, which is what the piece/company row then
+    // points at.
+    //
+    // PRIVATE, deliberately not public: this route is company-scoped behind
+    // UploadCookieGuard, and production serves it through a Cloudflare Pages
+    // Function proxy. `public` would license that proxy — or any shared cache on
+    // the path — to hold one tenant's file and hand it to another. `private`
+    // keeps the copy in the requesting browser only.
+    //
+    // Without this header the Jobs queue re-downloaded every piece thumbnail on
+    // every page load, and each one is a full round trip that buffers the object
+    // in the API process.
+    reply.header("Cache-Control", "private, max-age=31536000, immutable");
     return reply.send(bytes);
   }
 

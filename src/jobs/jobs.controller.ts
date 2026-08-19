@@ -21,6 +21,8 @@ import {
   scheduleJobSchema,
   timelineQuerySchema,
   updatePieceFilesSchema,
+  queueIdsQuerySchema,
+  queueSortQuerySchema,
 } from "./jobs.schemas";
 import { z } from "zod";
 
@@ -44,6 +46,62 @@ export class JobsController {
     @Query() query: unknown
   ) {
     return this.jobsService.listJobs(
+      companyId,
+      parseWithSchema(queueSortQuerySchema, query)
+    );
+  }
+
+  /**
+   * Cheap "has the board changed?" probe for the polling backstop, so an idle
+   * queue stops re-pulling every row every minute. Two segments, so it cannot be
+   * swallowed by the single-segment `:pieceId` route below whatever the
+   * declaration order.
+   */
+  @Get("queue/fingerprint")
+  @RequirePermission("view_orders")
+  queueFingerprint(@CompanyId() companyId: string) {
+    return this.jobsService.queueFingerprint(companyId);
+  }
+
+  /**
+   * Filter facets + stage tab counts, aggregated in SQL. Both were previously
+   * derived by walking every row on the client, which is a large part of why the
+   * client had to be holding every row at all.
+   */
+  @Get("queue/summary")
+  @RequirePermission("view_orders")
+  queueSummary(@CompanyId() companyId: string, @Query() query: unknown) {
+    return this.jobsService.queueSummary(
+      companyId,
+      parseWithSchema(listJobsQuerySchema, query)
+    );
+  }
+
+  /**
+   * Every piece id matching the current filter — what Ctrl+A selects, and what
+   * the bulk actions then operate on. Ids only: ten thousand of them is ~380 KB
+   * rather than the 16.5 MB of full rows the client used to hold to answer the
+   * same question.
+   */
+  @Get("queue/ids")
+  @RequirePermission("view_orders")
+  queueIds(@CompanyId() companyId: string, @Query() query: unknown) {
+    return this.jobsService.queueIds(
+      companyId,
+      parseWithSchema(queueIdsQuerySchema, query)
+    );
+  }
+
+  /**
+   * The pending, printer-less pieces Bulk Assign starts from. Returns
+   * `cost_inputs` raw — the assumed time/quantity are derived on the client with
+   * the same function that has always derived them, because those figures end up
+   * in what a job is priced from.
+   */
+  @Get("queue/assignable")
+  @RequirePermission("view_orders")
+  queueAssignable(@CompanyId() companyId: string, @Query() query: unknown) {
+    return this.jobsService.queueAssignable(
       companyId,
       parseWithSchema(listJobsQuerySchema, query)
     );

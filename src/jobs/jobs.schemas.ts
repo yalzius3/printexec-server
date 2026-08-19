@@ -36,6 +36,20 @@ export const listJobsQuerySchema = z.object({
   order_id: uuid.optional(),
   printer_id: uuid.optional(),
   search: z.string().trim().min(1).max(120).optional(),
+  // ── The Filter popover's four fields ────────────────────────────────────
+  // These used to be applied ONLY on the client, over rows it had already
+  // fetched. That was survivable while the client held every row, and became
+  // dangerous the moment anything else had to answer "which pieces does the
+  // queue currently mean?" — above all GET /queue/ids, whose answer feeds bulk
+  // delete. A select-all that returned pieces an active filter was hiding would
+  // let an operator delete work they could not see. The server has to know the
+  // same four narrowings the popover offers.
+  order_reference: z.string().trim().min(1).max(64).optional(),
+  customer_name: z.string().trim().min(1).max(200).optional(),
+  technology: z.string().trim().min(1).max(32).optional(),
+  /** Inclusive: keep pieces due on or before this date. Undated pieces are KEPT,
+   *  matching the client predicate, which only compares when a deadline exists. */
+  deadline_by: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 }).strict();
 export type ListJobsQuery = z.infer<typeof listJobsQuerySchema>;
 
@@ -187,3 +201,45 @@ export const timelineQuerySchema = z.object({
   { message: "`from` must be before `to`" }
 );
 export type TimelineQuery = z.infer<typeof timelineQuerySchema>;
+
+/**
+ * GET /api/jobs/queue/ids — the queue filter, plus an optional effective-stage
+ * narrowing.
+ *
+ * `stage` is deliberately a free string rather than an enum: an effective stage
+ * is a JobStatus OR a fulfilment_status OR a post_process_state, three separate
+ * vocabularies the client already unions in `effectiveStage`. Pinning an enum
+ * here would silently drop stages whenever one of those three grows a value, and
+ * a select-all that quietly returns fewer ids than the operator can see is worse
+ * than one that returns none. It is only ever compared, never interpolated.
+ */
+export const queueIdsQuerySchema = listJobsQuerySchema
+  .extend({ stage: z.string().trim().min(1).max(40).optional() })
+  .strict();
+export type QueueIdsQuery = z.infer<typeof queueIdsQuerySchema>;
+
+// ────────────────────────────────────────────────────────────
+// Queue ordering
+// ────────────────────────────────────────────────────────────
+/**
+ * The eight sort keys the Jobs queue offers, plus `post_process_wait`.
+ *
+ * `post_process_wait` is not a user-pickable option: viewing a wash/cure bucket
+ * OVERRIDES the operator's chosen sort with longest-waiting-first, so that a
+ * stale "Name A–Z" cannot hide the part that has been sitting on the bench since
+ * yesterday. The client decides when that applies; the server just needs a name
+ * for it.
+ */
+export const QUEUE_SORT_KEYS = [
+  "urgency", "deadline", "order", "piece_name",
+  "customer", "status", "printer", "time",
+  "post_process_wait",
+] as const;
+export type QueueSortKey = (typeof QUEUE_SORT_KEYS)[number];
+export const queueSortKeySchema = z.enum(QUEUE_SORT_KEYS);
+
+export const queueSortQuerySchema = listJobsQuerySchema.extend({
+  sort: queueSortKeySchema.optional(),
+  order: z.enum(["asc", "desc"]).optional(),
+}).strict();
+export type QueueSortQuery = z.infer<typeof queueSortQuerySchema>;
