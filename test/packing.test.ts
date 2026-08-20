@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import {
   earliestFit,
   earliestFitWithin,
+  earliestFitAcross,
+  pushInterval,
   isWithinWorkWindow,
   nextAllowedStart,
   chooseNozzle,
@@ -274,6 +276,84 @@ test("earliestFitWithin: alternating window and conflict pushes still converge",
     { s: at(8, 3), e: at(19, 3) },
   ];
   assert.equal(earliestFitWithin(busy, 1 * H, at(8, 1), 0, WIN(8, 18)), at(8, 4));
+});
+
+test("earliestFitWithin: a board booked past the old 512-iteration guard still starts IN hours", () => {
+  // THE REGRESSION THIS EXISTS FOR.
+  //
+  // The window and the conflicts push the start alternately, once per booked
+  // day. The previous implementation restarted the whole fit on each push and
+  // gave up after 512 of them, returning the last conflict-free instant it had
+  // — which had never been re-checked against the window. Nothing downstream
+  // checks working hours (schedule() validates overlaps only), so past that
+  // point the packer silently started prints in the middle of the night.
+  //
+  // Alternations grow with the backlog: measured at roughly one per twenty
+  // items on a five-printer fleet, so ~10,000 items reached it. 700 booked days
+  // reproduces it in one call.
+  const DAY = 24 * H;
+  const midnight = Date.parse("2026-08-01T00:00:00.000Z");
+  const busy: Interval[] = [];
+  for (let d = 0; d < 700; d++) {
+    busy.push({ s: midnight + d * DAY + 8 * H, e: midnight + d * DAY + 18 * H });
+  }
+  const start = earliestFitWithin(busy, 2 * H, midnight + 8 * H, 5 * MIN, WIN(8, 18));
+  assert.equal(isWithinWorkWindow(start, WIN(8, 18)), true, "must start inside working hours");
+  // ...and it must still be a real placement, not merely a legal-looking hour.
+  for (const iv of busy) {
+    assert.ok(!(iv.s - 5 * MIN < start + 2 * H && iv.e + 5 * MIN > start), "must not overlap a booked block");
+  }
+  // The first free day is the one after the last booked one.
+  assert.equal(start, midnight + 700 * DAY + 8 * H);
+});
+
+// ── earliestFitAcross + pushInterval ───────────────────────────────────────
+// The packer calls these rather than the two above: a job is constrained by its
+// printer AND its nozzle AND every spool or tank it draws from, and those are
+// separate lists it keeps ordered as it places.
+
+test("earliestFitAcross: separate lists answer exactly as one combined list", () => {
+  const printer: Interval[] = [{ s: at(9), e: at(11) }, { s: at(14), e: at(15) }];
+  const nozzle: Interval[] = [{ s: at(11), e: at(12) }];
+  const spool: Interval[] = [{ s: at(12), e: at(13) }];
+  const combined = [...printer, ...nozzle, ...spool];
+  assert.equal(
+    earliestFitAcross([printer, nozzle, spool], 1 * H, at(8), 0, null),
+    earliestFitWithin(combined, 1 * H, at(8), 0, null),
+  );
+  // 08:00-09:00 is the only hole before the wall of blocks, and a 1h job fits it.
+  assert.equal(earliestFitAcross([printer, nozzle, spool], 1 * H, at(8), 0, null), at(8));
+  // A 2h job cannot, so it lands after the whole run.
+  assert.equal(earliestFitAcross([printer, nozzle, spool], 2 * H, at(8), 0, null), at(15));
+});
+
+test("earliestFitAcross: an empty list contributes nothing", () => {
+  const printer: Interval[] = [{ s: at(8), e: at(10) }];
+  assert.equal(earliestFitAcross([printer, [], []], 1 * H, at(8), 0, null), at(10));
+  assert.equal(earliestFitAcross([[], [], []], 1 * H, at(8), 0, null), at(8));
+});
+
+test("earliestFitAcross: honours the working window like earliestFitWithin", () => {
+  const printer: Interval[] = [{ s: at(8), e: at(19) }];
+  assert.equal(earliestFitAcross([printer], 1 * H, at(8), 0, WIN(8, 18)), at(8, 2));
+});
+
+test("pushInterval: keeps a list ordered by start whatever order blocks arrive", () => {
+  const list: Interval[] = [];
+  const arrivals: Interval[] = [
+    { s: at(14), e: at(15) }, { s: at(9), e: at(10) }, { s: at(20), e: at(21) },
+    { s: at(9), e: at(9) + 30 * MIN }, { s: at(11), e: at(12) },
+  ];
+  for (const iv of arrivals) pushInterval(list, iv);
+  const starts = list.map((iv) => iv.s);
+  assert.deepEqual(starts, [...starts].sort((a, b) => a - b));
+  assert.equal(list.length, arrivals.length);
+  // Ordered insertion is what lets the fit skip sorting, so the answer must be
+  // the same as sorting would have given.
+  assert.equal(
+    earliestFitAcross([list], 1 * H, at(8), 0, null),
+    earliestFitWithin(arrivals, 1 * H, at(8), 0, null),
+  );
 });
 
 test("earliestFitWithin: no window behaves exactly like earliestFit", () => {

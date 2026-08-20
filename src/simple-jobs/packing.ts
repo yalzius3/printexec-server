@@ -27,22 +27,25 @@ export interface Interval {
  * `gapMs` of 0 lets blocks touch edge-to-edge but never overlap.
  *
  * ── Complexity ───────────────────────────────────────────────────────────
- * O(n log n), sort-dominated; O(n) over the intervals themselves.
+ * O(n log n) — and the sort is the whole of it, which is why the packer does
+ * not call this one. It sorts a COPY on every call, and a packer calls it once
+ * per nozzle option per job against a busy list that grows with every
+ * placement, so the sorting alone is quadratic across a run. `earliestFitAcross`
+ * below is the same rule over lists that are already ordered, and the packer
+ * keeps them ordered with `pushInterval`. This wrapper exists for callers that
+ * hold an unordered list and for the tests, and it delegates, so the rule is
+ * written once.
  *
  * A note, because the previous version looked worse than it was and someone
- * will eventually "re-optimise" this: the old fixed-point loop (rescan all
+ * will eventually "re-optimise" it: the old fixed-point loop (rescan all
  * intervals until a pass moves nothing) was NOT quadratic. It always settled
  * in one working pass plus one confirming pass, verified by fuzzing 200k
  * random boards — the observed maximum was 2.
  *
- * The reason is the same invariant this version relies on. Scanning in sorted
+ * The reason is the invariant everything here relies on. Scanning in sorted
  * order, if interval j does not overlap when visited then s_j >= start + dur;
  * every later interval has s >= s_j, so none of them overlap either, so
  * `start` can never grow again after j. One pass therefore fixes everything.
- *
- * So this rewrite buys clarity and roughly half the comparisons (one pass, and
- * an early break as soon as an interval starts beyond the job's end) — not a
- * complexity class. Don't expect it to change behaviour on a large board.
  */
 export function earliestFit(
   busy: readonly Interval[],
@@ -51,16 +54,118 @@ export function earliestFit(
   gapMs: number,
 ): number {
   if (busy.length === 0) return notBefore;
-  const padded = busy
-    .map((iv) => ({ s: iv.s - gapMs, e: iv.e + gapMs }))
-    .sort((a, b) => a.s - b.s);
-  let start = notBefore;
-  for (const iv of padded) {
-    if (iv.e <= start) continue;          // already behind the candidate
-    if (iv.s >= start + durMs) break;     // this and all later ones clear it
-    start = iv.e;                         // overlap — settle just past it
+  return earliestFitAcross([sortByStart(busy)], durMs, notBefore, gapMs, null);
+}
+
+/** A copy ordered by start — the shape `earliestFitAcross` expects. */
+export function sortByStart(busy: readonly Interval[]): Interval[] {
+  return busy.slice().sort((a, b) => a.s - b.s);
+}
+
+/**
+ * Add a placement to a resource's busy list, KEEPING IT ORDERED by start.
+ *
+ * The packer's lists are read far more often than they are written — once per
+ * nozzle option per candidate — so paying a binary insert on the write is what
+ * lets every read skip the sort. Ordinary `push` plus a sort inside the fit was
+ * measured at 61 seconds for a 5,000-item pack; the same pack with these two
+ * changes is under a second.
+ */
+export function pushInterval(list: Interval[], iv: Interval): void {
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid]!.s <= iv.s) lo = mid + 1;
+    else hi = mid;
   }
-  return start;
+  list.splice(lo, 0, iv);
+}
+
+/**
+ * Earliest instant ≥ `notBefore`, inside the working window if there is one,
+ * where a `durMs` job clears every interval in every list — each padded by
+ * `gapMs` on both sides.
+ *
+ * Takes SEVERAL already-ordered lists rather than one, because a job is
+ * constrained by a printer AND a nozzle AND every spool or tank it draws from,
+ * and those are separate timelines. Merging them by walking cursors avoids
+ * building the combined array at all: the previous shape was
+ * `[...printerIvs, ...nozzleIvs, ...materialIvs]`, an allocation and a copy per
+ * call, thirty thousand times in a 10,000-item pack.
+ *
+ * ── Why the window is handled HERE and not in a loop around this ──────────
+ * A conflict pushes the start forward, which can land outside working hours;
+ * opening to the next shift can land on new conflicts. The old code alternated
+ * by calling the whole fit again from the beginning — each pass re-sorting and
+ * re-scanning every interval. Measured on a 5,000-item pack with an 08:00–18:00
+ * window, that averaged 125 passes per call and 2.29 BILLION interval-sorts.
+ *
+ * Both pushes only ever move `start` FORWARD, and the cursors only move
+ * forward, so the alternation costs nothing extra: an interval consumed stays
+ * consumed. Every re-open resumes where the scan left off.
+ *
+ * That also retires a correctness cliff. The old loop gave up after 512
+ * alternations and returned whatever it had — an instant that was conflict-free
+ * but had NEVER been re-checked against the window, and nothing downstream
+ * checks working hours. Iterations grew linearly with the backlog (measured:
+ * one per twenty items), so around ten thousand items the packer would have
+ * begun starting prints at 03:00 in a shop that opens at 08:00, silently. Here
+ * the loop is bounded by the number of intervals, which is a real bound rather
+ * than a magic number, and the fallthrough returns a WINDOW-VALID instant: an
+ * overlap is caught and reported by the guarded schedule(), an out-of-hours
+ * start is caught by nobody.
+ */
+export function earliestFitAcross(
+  lists: ReadonlyArray<readonly Interval[]>,
+  durMs: number,
+  notBefore: number,
+  gapMs: number,
+  window: WorkWindow | null | undefined,
+): number {
+  let total = 0;
+  for (const l of lists) total += l.length;
+  if (total === 0) return nextAllowedStart(notBefore, window);
+
+  const cursors: number[] = new Array(lists.length).fill(0);
+  let start = notBefore;
+
+  // One pass per working-hours re-open. Each one after the first is preceded by
+  // a conflict that consumed an interval, so this cannot exceed the interval
+  // count — see the note above.
+  for (let pass = 0; pass <= total + 2; pass++) {
+    const opened = nextAllowedStart(start, window);
+    let moved = opened !== start;
+    start = opened;
+
+    // Forward scan across the ordered lists, always taking the earliest head.
+    for (;;) {
+      let best = -1;
+      let bestStart = Infinity;
+      for (let i = 0; i < lists.length; i++) {
+        const c = cursors[i]!;
+        const l = lists[i]!;
+        if (c >= l.length) continue;
+        const s = l[c]!.s;
+        if (s < bestStart) { bestStart = s; best = i; }
+      }
+      if (best < 0) break;                       // every list exhausted
+      const iv = lists[best]![cursors[best]!]!;
+      const paddedStart = iv.s - gapMs;
+      const paddedEnd = iv.e + gapMs;
+      if (paddedEnd <= start) { cursors[best]!++; continue; }  // behind us for good
+      if (paddedStart >= start + durMs) break;   // this and all later ones clear it
+      start = paddedEnd;                         // overlap — settle just past it
+      cursors[best]!++;
+      moved = true;
+    }
+
+    if (!moved) return start;
+  }
+  // Unreachable given the bound above. If it is ever reached, hand back an
+  // instant that is at least inside working hours — see the note above for why
+  // that is the safer of the two things to be wrong about.
+  return nextAllowedStart(start, window);
 }
 
 /* ── Working hours ─────────────────────────────────────────────────────────
@@ -144,15 +249,8 @@ export function earliestFitWithin(
   gapMs: number,
   window: WorkWindow | null | undefined,
 ): number {
-  if (!window) return earliestFit(busy, durMs, notBefore, gapMs);
-  let start = notBefore;
-  for (let guard = 0; guard < 512; guard++) {
-    const opened = nextAllowedStart(start, window);
-    const fitted = earliestFit(busy, durMs, opened, gapMs);
-    if (fitted === opened) return fitted;   // inside the window and conflict-free
-    start = fitted;
-  }
-  return start;
+  if (busy.length === 0) return nextAllowedStart(notBefore, window);
+  return earliestFitAcross([sortByStart(busy)], durMs, notBefore, gapMs, window);
 }
 
 export interface NozzleOption {

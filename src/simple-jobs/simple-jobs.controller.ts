@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Post } from "@nestjs/common";
 import { z } from "zod";
 import { CompanyId } from "../common/company-id.decorator";
 import { UserId } from "../common/user-id.decorator";
@@ -25,9 +25,17 @@ const assignSchema = z.object({
 const availabilitySchema = z.object({
   horizon: z.enum(["day", "week", "month", "deadline"]).default("week"),
   deadline: z.string().max(40).optional(),
-  // Comma-separated piece ids being assigned — used to show only the printers
-  // compatible with ALL of them (technology + multicolor; offline omitted).
-  pieces: z.string().max(20000).optional(),
+  // The piece ids being assigned — used to show only the printers compatible
+  // with ALL of them (technology + multicolor; offline omitted).
+  //
+  // In a BODY, and that is the whole reason this route is a POST rather than
+  // the GET it reads like. These ids used to travel as a comma-separated query
+  // string, where each one costs 39 bytes (36 for the uuid, 3 for the escaped
+  // comma). The request LINE counts against Node's 16 KiB header budget, so a
+  // selection of about 300 pieces produced a 431 from the runtime before any
+  // handler ran, and ten thousand reset the socket outright. Nothing was wrong
+  // with the query itself — the service reads these with a single = ANY(...).
+  piece_ids: z.array(z.string().uuid()).max(20_000).optional(),
   // Alternatively a bed id — requirements come from the bed row instead.
   bed: z.string().uuid().optional(),
 });
@@ -160,6 +168,11 @@ const autoScheduleAllSchema = z.object({
   allow_nozzle_swap: z.boolean().optional(),
   // Restrict to specific printers; omitted or empty = the whole fleet.
   printer_ids: z.array(z.string().uuid()).max(200).optional(),
+  // Run this as a background run whatever its size, and answer with the run id
+  // instead of the plan. Big packs take this path on their own (see
+  // RUN_THRESHOLD_ITEMS); this is for a caller that wants it either way, so a
+  // preview and the commit that follows behave the same.
+  as_run: z.boolean().optional(),
 });
 
 // The Jobs action surface — assign, auto-schedule, bulk g-code drop.
@@ -191,11 +204,13 @@ export class SimpleJobsController {
     );
   }
 
-  @Get("printer-availability")
+  // A read, deliberately spelled as a POST: the selection it describes can be
+  // ten thousand piece ids, which do not fit in a URL. See availabilitySchema.
+  @Post("printer-availability")
   @RequirePermission("view_orders")
-  availability(@CompanyId() companyId: string, @Query() query: unknown) {
-    const { horizon, deadline, pieces, bed } = parseWithSchema(availabilitySchema, query);
-    const pieceIds = pieces ? pieces.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+  availability(@CompanyId() companyId: string, @Body() body: unknown) {
+    const { horizon, deadline, piece_ids, bed } = parseWithSchema(availabilitySchema, body);
+    const pieceIds = piece_ids && piece_ids.length > 0 ? piece_ids : undefined;
     return this.simpleJobsService.printerAvailability(companyId, horizon, deadline, pieceIds, bed);
   }
 
@@ -252,11 +267,18 @@ export class SimpleJobsController {
   // resolved once, globally, instead of each printer's run guessing separately.
   @Post("auto-schedule-all")
   @RequirePermission("action_orders")
-  autoScheduleAll(@CompanyId() companyId: string, @Body() body: unknown) {
-    return this.simpleJobsService.autoScheduleAll(
-      companyId,
-      parseWithSchema(autoScheduleAllSchema, body)
-    );
+  autoScheduleAll(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Body() body: unknown
+  ) {
+    // Answers with the plan for an ordinary pack, or with { run_id, async_run }
+    // for one large enough to have become a background run. GET /runs/:id then
+    // carries the same plan shape in `result` when it finishes.
+    return this.simpleJobsService.autoScheduleAll(companyId, {
+      ...parseWithSchema(autoScheduleAllSchema, body),
+      user_id: userId,
+    });
   }
 
   // What the fleet-wide pack would operate on — every ready, unscheduled,

@@ -2177,11 +2177,40 @@ export class JobsService {
     } catch { /* ignore — history is non-critical */ }
   }
 
+  /**
+   * Commit a print window for one piece. The single door onto the board.
+   *
+   * `scheduleCommit` below is the whole of it; this adds the two things a
+   * ONE-PIECE caller needs and a batch caller must not pay for per piece:
+   *   · re-deriving the parent order's status, which aggregates EVERY piece in
+   *     that order — so doing it per piece makes scheduling N pieces of one
+   *     order O(N²). A batch does it once per distinct order at the end.
+   *   · re-reading the piece, which the packer discards.
+   * The rules themselves live in one place; only the epilogue differs.
+   */
   async schedule(
     companyId: string,
     pieceId: string,
     input: ScheduleJobInput
   ): Promise<JobRow> {
+    const { order_id } = await this.scheduleCommit(companyId, pieceId, input);
+    await this.syncOrderStatus(companyId, order_id);
+    return this.loadJob(companyId, pieceId);
+  }
+
+  /**
+   * The guarded commit, without the per-piece epilogue. Returns the parent
+   * order so a batch caller can roll every affected order up ONCE.
+   *
+   * Every precondition, every resource-conflict check and the write itself are
+   * here — a batch path that skipped them would be scheduling around the guard,
+   * which is the one thing this must never allow.
+   */
+  async scheduleCommit(
+    companyId: string,
+    pieceId: string,
+    input: ScheduleJobInput
+  ): Promise<{ order_id: string }> {
     const piece = await this.loadJob(companyId, pieceId);
     // 'assigned' is intentionally NOT allowed here — by design that status
     // means the slicer metadata is missing. The DB's chk_scheduled_requires_core_data
@@ -2454,8 +2483,13 @@ export class JobsService {
       companyId, piece, "scheduled",
       `Piece "${piece.piece_name}" scheduled on ${piece.assigned_printer_label ?? "a printer"} for ${start.toISOString()}.`
     );
-    await this.syncOrderStatus(companyId, piece.order_id);
-    return this.loadJob(companyId, pieceId);
+    return { order_id: piece.order_id };
+  }
+
+  /** Re-derive one order's status. Public only so a batch caller that used
+   *  `scheduleCommit` can settle the orders it touched, once each. */
+  async syncOrderStatusOnce(companyId: string, orderId: string): Promise<void> {
+    await this.syncOrderStatus(companyId, orderId);
   }
 
   /** First physical-resource conflict for a window, or null when everything is

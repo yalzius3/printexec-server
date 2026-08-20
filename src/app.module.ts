@@ -19,6 +19,7 @@ import { OrderAttachmentsModule } from "./order-attachments/order-attachments.mo
 import { OrderPiecesModule } from "./order-pieces/order-pieces.module";
 import { OrdersModule } from "./orders/orders.module";
 import { PrintersModule } from "./printers/printers.module";
+import { RunsModule } from "./runs/runs.module";
 import { SimpleJobsModule } from "./simple-jobs/simple-jobs.module";
 import { StaffModule } from "./staff/staff.module";
 import { UploadsModule } from "./uploads/uploads.module";
@@ -45,6 +46,8 @@ import { LicenseGuard } from "./licensing/license.guard";
     OrderPiecesModule,
     OrdersModule,
     PrintersModule,
+
+    RunsModule,
     SimpleJobsModule,
     StaffModule,
     UploadsModule

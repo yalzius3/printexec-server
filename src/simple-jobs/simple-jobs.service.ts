@@ -4,6 +4,7 @@ import { DatabaseService } from "../database/database.service";
 import { JobsService, colorCompatible, isResinTech, pickTank, techFamily } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
 import { FinanceService } from "../finance/finance.service";
+import { RunsService } from "../runs/runs.service";
 import {
   propagateSlicerMetaToDuplicatesTx,
   quoteAssumedMeta,
@@ -13,8 +14,8 @@ import {
 // The scheduling kernel — pure, unit-tested placement math (see packing.ts and
 // test/packing.test.ts). autoSchedule keeps the I/O and calls in here to decide.
 import {
-  earliestFit,
-  earliestFitWithin,
+  earliestFitAcross,
+  pushInterval,
   chooseNozzle,
   nozzleFits,
   nozzleSpecKey,
@@ -27,6 +28,18 @@ import {
   type NozzlePolicy,
   type WorkWindow,
 } from "./packing";
+
+/**
+ * Fleet packs of at least this many items go through a background run instead
+ * of the request that asked for one.
+ *
+ * Not really a performance threshold — an honesty one. Below it a pack is a
+ * second or two, and a single round trip is the better experience. Above it the
+ * operator is waiting on something they cannot see, cannot stop, and which the
+ * edge proxy may cut off part-way — and a commit cut off part-way is the worst
+ * of those three, because the placements it managed to make are real.
+ */
+const RUN_THRESHOLD_ITEMS = 300;
 
 // The piece as the two re-queue paths (markFailed, sendBackToProduction) need to
 // see it: enough to validate the move, reconcile its material, and free what it
@@ -50,7 +63,10 @@ export class SimpleJobsService {
     private readonly db: DatabaseService,
     private readonly jobsService: JobsService,
     private readonly bedsService: BedsService,
-    private readonly finance: FinanceService
+    private readonly finance: FinanceService,
+    // Progress + cancellation for packs too large to be one request. The pack
+    // itself never learns what a run is — see autoScheduleAll.
+    private readonly runs: RunsService
   ) {}
 
   // Every piece the company has, full stop.
@@ -406,17 +422,45 @@ export class SimpleJobsService {
       assignedCount++;
     }
 
-    // One UPDATE per (nozzle, seed) group. Mark the pieces 'assigned' — or
-    // straight to 'ready' when the quote supplied both numbers — and stamp the
-    // per-piece nozzle so the schedule wizard has everything it needs. COALESCE
-    // keeps any nozzle already on the piece when none could be resolved
-    // (printer has no nozzle). The slicer FILE is still cleared: a fresh
-    // assignment must never resurrect a previous session's g-code.
-    for (const g of groups.values()) {
-      if (g.ids.length === 0) continue;
+    // ONE set-based UPDATE for the whole batch, not one per (nozzle, seed)
+    // group. Grouping was already an improvement over a statement per piece,
+    // but the group key carries the piece's OWN quote — `assumed.minutes` and
+    // `assumed.grams` come from cost_inputs, which differ per piece — so on a
+    // mixed batch the groups degenerate to one per piece and the "grouped"
+    // write is a fan-out of N sequential round trips again. Two hundred pieces
+    // with two hundred different quotes was two hundred UPDATEs.
+    //
+    // unnest() carries the per-piece values in as parallel arrays, so every
+    // per-row decision below is IDENTICAL to the one the group loop made — same
+    // COALESCE, same status CASE, same clearing of the other technology's
+    // tooling — just resolved by the planner in a single statement.
+    //
+    // The SET expressions read op.* as the OLD row (Postgres evaluates them
+    // against the pre-update tuple), which is exactly what the group version
+    // relied on when it wrote COALESCE($4::uuid, assigned_nozzle_asset_id).
+    const seedGroups = Array.from(groups.values()).filter((g) => g.ids.length > 0);
+    if (seedGroups.length > 0) {
+      const upIds: string[] = [];
+      const upNozzles: (string | null)[] = [];
+      const upMinutes: (number | null)[] = [];
+      const upGrams: (number | null)[] = [];
+      const upTanks: (string | null)[] = [];
+      const upMls: (number | null)[] = [];
+      const upIsResin: boolean[] = [];
+      for (const g of seedGroups) {
+        for (const id of g.ids) {
+          upIds.push(id);
+          upNozzles.push(g.nozzle);
+          upMinutes.push(g.minutes);
+          upGrams.push(g.grams);
+          upTanks.push(g.tank);
+          upMls.push(g.ml);
+          upIsResin.push(g.isResin);
+        }
+      }
       await this.db.query(
         `
-          UPDATE order_pieces
+          UPDATE order_pieces op
           SET assigned_printer_id = $3,
               -- A piece holds the tooling of ONE technology, and assigning it
               -- clears the other's outright. COALESCE alone only ever ADDED:
@@ -426,42 +470,44 @@ export class SimpleJobsService {
               -- from a real one, so the schedule board drew a nozzle lane for a
               -- machine with no nozzle -- correctly rendering junk data.
               assigned_nozzle_asset_id = CASE
-                WHEN $9::boolean THEN NULL
-                ELSE COALESCE($4::uuid, assigned_nozzle_asset_id)
+                WHEN s.is_resin THEN NULL
+                ELSE COALESCE(s.nozzle, op.assigned_nozzle_asset_id)
               END,
               resin_tank_id = CASE
-                WHEN $9::boolean THEN COALESCE($7::uuid, resin_tank_id)
+                WHEN s.is_resin THEN COALESCE(s.tank, op.resin_tank_id)
                 ELSE NULL
               END,
               slicer_file_url            = NULL,
               slicer_file_uploaded_at    = NULL,
-              slicer_print_time_minutes  = $5,
-              slicer_filament_used_grams = $6,
-              slicer_resin_used_ml       = $8,
+              slicer_print_time_minutes  = s.minutes,
+              slicer_filament_used_grams = s.grams,
+              slicer_resin_used_ml       = s.ml,
               status = CASE
                 -- Each technology's own prerequisites, matching
                 -- chk_ready_requires_core_data exactly. Resin has no nozzle, so
                 -- the old nozzle-only test left every resin piece at its previous
                 -- status while stamping the printer — assigned in the UI, pending
                 -- in the database.
-                WHEN required_print_technology IN ('MSLA', 'SLA') THEN
+                WHEN op.required_print_technology IN ('MSLA', 'SLA') THEN
                   CASE
-                    WHEN $5::int IS NOT NULL AND $8::numeric IS NOT NULL
-                     AND COALESCE($7::uuid, resin_tank_id) IS NOT NULL THEN 'ready'
+                    WHEN s.minutes IS NOT NULL AND s.ml IS NOT NULL
+                     AND COALESCE(s.tank, op.resin_tank_id) IS NOT NULL THEN 'ready'
                     ELSE 'assigned'
                   END
                 -- 'ready' needs (printer, nozzle, time, grams); 'assigned' needs
                 -- printer + nozzle. If no nozzle could be resolved, leave the
                 -- status as-is rather than risk an inconsistent 'assigned'.
-                WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL
-                 AND $5::int IS NOT NULL AND $6::numeric IS NOT NULL THEN 'ready'
-                WHEN COALESCE($4::uuid, assigned_nozzle_asset_id) IS NOT NULL THEN 'assigned'
-                ELSE status
+                WHEN COALESCE(s.nozzle, op.assigned_nozzle_asset_id) IS NOT NULL
+                 AND s.minutes IS NOT NULL AND s.grams IS NOT NULL THEN 'ready'
+                WHEN COALESCE(s.nozzle, op.assigned_nozzle_asset_id) IS NOT NULL THEN 'assigned'
+                ELSE op.status
               END
-          WHERE company_id = $1
-            AND piece_id = ANY($2::uuid[])
+          FROM unnest($2::uuid[], $4::uuid[], $5::int[], $6::numeric[], $7::uuid[], $8::numeric[], $9::boolean[])
+            AS s(piece_id, nozzle, minutes, grams, tank, ml, is_resin)
+          WHERE op.company_id = $1
+            AND op.piece_id = s.piece_id
         `,
-        [companyId, g.ids, printerId, g.nozzle, g.minutes, g.grams, g.tank, g.ml, g.isResin]
+        [companyId, upIds, printerId, upNozzles, upMinutes, upGrams, upTanks, upMls, upIsResin]
       );
 
       // Resin draws from a tank, never a spool, so any spool reservation the
@@ -469,11 +515,12 @@ export class SimpleJobsService {
       // it holds grams against stock that will never be consumed AND puts the
       // piece on the Spool pivot's lanes — the same stale-data problem as the
       // nozzle above, one table over.
-      if (g.isResin) {
+      const resinIds = upIds.filter((_, i) => upIsResin[i]);
+      if (resinIds.length > 0) {
         await this.db.query(
           `DELETE FROM order_piece_spools
             WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
-          [companyId, g.ids]
+          [companyId, resinIds]
         );
       }
     }
@@ -481,27 +528,59 @@ export class SimpleJobsService {
     // Multicolor: mirror the quote's per-slot grams into the color slots (only
     // where still unset, and only when the quote has one figure per slot) so
     // the spool planner sees the same assumed demand.
-    for (const seed of slotSeeds) {
-      const slotCount = await this.db.query<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM order_piece_color_slots WHERE company_id = $1 AND piece_id = $2`,
-        [companyId, seed.piece_id]
-      );
-      if (Number(slotCount.rows[0]?.n) !== seed.grams.length) continue;
-      for (let i = 0; i < seed.grams.length; i++) {
-        await this.db.query(
-          `UPDATE order_piece_color_slots cs
-              SET slicer_grams = $3
-             FROM (
-               SELECT color_slot_id, ROW_NUMBER() OVER (ORDER BY sequence_order) AS rn
-                 FROM order_piece_color_slots
-                WHERE company_id = $1 AND piece_id = $2
-             ) ordered
-            WHERE cs.color_slot_id = ordered.color_slot_id
-              AND ordered.rn = $4
-              AND cs.slicer_grams IS NULL`,
-          [companyId, seed.piece_id, seed.grams[i], i + 1]
-        );
+    //
+    // Also ONE statement. This used to be a COUNT plus one UPDATE per SLOT per
+    // piece — a four-colour piece cost five sequential round trips, so five
+    // hundred of them cost two and a half thousand. The `eligible` CTE is the
+    // set-based spelling of the guard that was `if (count !== grams.length)
+    // continue`: a piece is seeded only when its slot count matches the number
+    // of figures its quote carries, so a quote that disagrees with the piece is
+    // skipped whole rather than half-applied.
+    if (slotSeeds.length > 0) {
+      const seedPieceIds: string[] = [];
+      const seedSeq: number[] = [];
+      const seedGrams: number[] = [];
+      for (const seed of slotSeeds) {
+        for (let i = 0; i < seed.grams.length; i++) {
+          seedPieceIds.push(seed.piece_id);
+          seedSeq.push(i + 1);
+          seedGrams.push(seed.grams[i]!);
+        }
       }
+      await this.db.query(
+        `
+          WITH seed AS (
+            SELECT * FROM unnest($2::uuid[], $3::int[], $4::numeric[])
+              AS t(piece_id, seq, grams)
+          ),
+          have AS (
+            SELECT piece_id, COUNT(*) AS n
+              FROM order_piece_color_slots
+             WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+             GROUP BY piece_id
+          ),
+          want AS (
+            SELECT piece_id, COUNT(*) AS n FROM seed GROUP BY piece_id
+          ),
+          eligible AS (
+            SELECT h.piece_id FROM have h JOIN want w ON w.piece_id = h.piece_id AND w.n = h.n
+          ),
+          ordered AS (
+            SELECT color_slot_id, piece_id,
+                   ROW_NUMBER() OVER (PARTITION BY piece_id ORDER BY sequence_order) AS rn
+              FROM order_piece_color_slots
+             WHERE company_id = $1 AND piece_id IN (SELECT piece_id FROM eligible)
+          )
+          UPDATE order_piece_color_slots cs
+             SET slicer_grams = seed.grams
+            FROM ordered o
+            JOIN seed ON seed.piece_id = o.piece_id AND seed.seq = o.rn
+           WHERE cs.company_id = $1
+             AND cs.color_slot_id = o.color_slot_id
+             AND cs.slicer_grams IS NULL
+        `,
+        [companyId, seedPieceIds, seedSeq, seedGrams]
+      );
     }
 
     // The picker chains straight into scheduling for pieces that are already
@@ -1659,6 +1738,11 @@ export class SimpleJobsService {
       /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
       printer_ids?: string[] | undefined;
+      /** Force the background-run path regardless of size. The review step uses
+       *  it so a preview and its commit behave the same way. */
+      as_run?: boolean | undefined;
+      /** Who started it, for the run's audit row. */
+      user_id?: string | undefined;
     }
   ) {
     const { items, printers } = await this.listSchedulable(companyId, input.printer_ids);
@@ -1671,6 +1755,54 @@ export class SimpleJobsService {
         printers,
       };
     }
+
+    // ── Big packs run as a BACKGROUND RUN, not as this request ──────────────
+    //
+    // Committing a placement goes through the guarded schedule(): ten-odd
+    // queries of preconditions and conflict checks per item, and that guard is
+    // exactly what must not be skipped to make it quicker. Thousands of items
+    // is therefore minutes of work, and production reaches this API through an
+    // edge proxy that will not hold a request open for it. It also should not:
+    // an action that rearranges the whole shop floor deserves a count that
+    // moves and a way to stop, and neither is a property a request has.
+    //
+    // Below the threshold nothing changes — the plan comes back inline, as it
+    // always has, which keeps the ordinary handful-of-jobs case a single round
+    // trip. And if the batch_runs migration has not been applied, `available()`
+    // says so and this falls through to running inline whatever the size: a
+    // missing table costs the progress bar, never the feature.
+    const wantsRun = input.as_run === true || items.length >= RUN_THRESHOLD_ITEMS;
+    if (wantsRun && (await this.runs.available())) {
+      const runId = await this.runs.start(
+        companyId,
+        input.user_id ?? null,
+        "auto_schedule",
+        { items: items.length, dry_run: input.dry_run === true, printers: printers.length },
+        async (ctx) => {
+          const planned = await this.autoSchedule(
+            companyId,
+            {
+              items: items.map((i) => ({ id: i.id, is_bed: i.is_bed })),
+              ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
+              ...(input.min_margin_minutes !== undefined ? { min_margin_minutes: input.min_margin_minutes } : {}),
+              ...(input.nozzle_policy !== undefined ? { nozzle_policy: input.nozzle_policy } : {}),
+              ...(input.work_start_hour !== undefined ? { work_start_hour: input.work_start_hour } : {}),
+              ...(input.work_latest_start_hour !== undefined ? { work_latest_start_hour: input.work_latest_start_hour } : {}),
+              ...(input.tz_offset_minutes !== undefined ? { tz_offset_minutes: input.tz_offset_minutes } : {}),
+              ...(input.allow_nozzle_swap !== undefined ? { allow_nozzle_swap: input.allow_nozzle_swap } : {}),
+            },
+            {
+              onTotal: (total) => ctx.setTotal(total),
+              onItem: (outcome) => ctx.advance(outcome),
+              shouldStop: () => ctx.cancelled(),
+            },
+          );
+          return { ...planned, printers };
+        },
+      );
+      return { run_id: runId, async_run: true as const, total: items.length, printers };
+    }
+
     const result = await this.autoSchedule(companyId, {
       items: items.map((i) => ({ id: i.id, is_bed: i.is_bed })),
       ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
@@ -1700,6 +1832,20 @@ export class SimpleJobsService {
       tz_offset_minutes?: number | undefined;
       /** @deprecated older spelling of nozzle_policy: "keep_assigned". */
       allow_nozzle_swap?: boolean | undefined;
+    },
+    /** Optional reporting for a pack running as a background run. Absent for
+     *  every synchronous caller, which is why the pack itself does not know
+     *  what a run is — it just says how far it has got and asks whether to
+     *  stop. See runs.service.ts. */
+    hooks?: {
+      /** Called once, as soon as the size of the pack is known. */
+      onTotal?: (total: number) => Promise<void>;
+      /** One candidate resolved. A SKIPPED candidate reports "failed": it did
+       *  not do the thing, and the operator counting progress cares about that
+       *  distinction more than about why. The reasons are in the result. */
+      onItem?: (outcome: "succeeded" | "failed") => Promise<void>;
+      /** Asked before each candidate. True stops the pack — see the loop. */
+      shouldStop?: () => Promise<boolean>;
     }
   ) {
     // dry_run simulates the whole pack and commits nothing — no schedule(), no
@@ -1760,6 +1906,10 @@ export class SimpleJobsService {
           }
         : null;
     const HORIZON_MS = 60 * 24 * 60 * 60_000;
+    // How many commits between order-status rollups. Big enough that the
+    // rollups are a rounding error next to the commits, small enough that an
+    // interrupted run leaves at most this many pieces ahead of their order.
+    const ORDER_SYNC_EVERY = 500;
     const now = Date.now();
 
     const printerBusy = new Map<string, Interval[]>();
@@ -1769,12 +1919,18 @@ export class SimpleJobsService {
     // question of them is identical — "is this thing free in that window?" — so
     // they share one map rather than duplicating the whole fit loop.
     const materialBusy = new Map<string, Interval[]>();
+    // Every list is kept ORDERED BY START, because that is what lets the fit
+    // below skip sorting. A plain push plus a sort inside the fit is what made
+    // a 5,000-item pack take a minute of CPU; see earliestFitAcross.
     const push = (m: Map<string, Interval[]>, k: string | null, iv: Interval) => {
       if (!k) return;
       const arr = m.get(k) ?? [];
-      arr.push(iv);
+      pushInterval(arr, iv);
       m.set(k, arr);
     };
+    /** Shared empty list, so a resource with no blocks costs no allocation on
+     *  the hot path (three lookups per nozzle option per candidate). */
+    const NO_BLOCKS: readonly Interval[] = [];
 
     // ── Snapshot every committed block (pieces + beds), bucketed per resource.
     const pieceWindow = new Map<string, Interval>();
@@ -2056,8 +2212,41 @@ export class SimpleJobsService {
       nozzle_move_from_printer_id?: string | null;
     }> = [];
     const skipped: Array<{ id: string; is_bed: boolean; name: string; reason: string }> = [];
+    /** Orders whose pieces this run committed. Their derived status is settled
+     *  once each — see the scheduleCommit call below. */
+    const touchedOrders = new Set<string>();
+    let committedSinceSync = 0;
+
+    // Progress is reported from the two result arrays rather than from a
+    // counter threaded through the loop: every exit path below pushes to
+    // exactly one of them, and there are a dozen such paths. Reading the
+    // lengths cannot drift out of step with the result the operator is shown.
+    let reportedPlaced = 0;
+    let reportedSkipped = 0;
+    const reportProgress = async () => {
+      if (!hooks?.onItem) return;
+      while (reportedPlaced < placed.length) { reportedPlaced += 1; await hooks.onItem("succeeded"); }
+      while (reportedSkipped < skipped.length) { reportedSkipped += 1; await hooks.onItem("failed"); }
+    };
+    await hooks?.onTotal?.(ordered.length);
+    /** Set once a cancel is seen, so the remaining candidates are reported as
+     *  stopped instead of silently vanishing from the plan. */
+    let stopped = false;
 
     for (const c of ordered) {
+      await reportProgress();
+      // Cancelling STOPS the pack; it never unwinds it. Everything already
+      // committed stays committed — so the honest thing is to name every
+      // candidate that will not now be attempted, rather than break out and
+      // return a plan that is quietly short.
+      if (!stopped && hooks?.shouldStop && (await hooks.shouldStop())) stopped = true;
+      if (stopped) {
+        skipped.push({
+          id: c.id, is_bed: c.is_bed, name: c.name,
+          reason: "the run was stopped before this one was reached",
+        });
+        continue;
+      }
       if (c.status !== "ready") {
         skipped.push({
           id: c.id, is_bed: c.is_bed, name: c.name,
@@ -2195,11 +2384,16 @@ export class SimpleJobsService {
       //    so short jobs backfill holes instead of queueing at the tail, which is
       //    where most of the utilisation comes from.
       const durMs = Math.max(1, c.minutes) * 60_000;
-      const printerIvs = printerBusy.get(c.printer_id) ?? [];
-      const materialIvs = mySpools.flatMap((sid) => materialBusy.get(sid) ?? []);
+      // The timelines this job has to clear, as SEPARATE ordered lists. They
+      // used to be spread into one combined array on every call — an allocation
+      // and a copy of every interval, once per nozzle option per candidate, so
+      // thirty thousand copies of a growing array in a 10,000-item pack.
+      // earliestFitAcross walks them with cursors instead and copies nothing.
+      const printerIvs = printerBusy.get(c.printer_id) ?? NO_BLOCKS;
+      const materialLists = mySpools.map((sid) => materialBusy.get(sid) ?? NO_BLOCKS);
       const earliestWith = (nozzleId: string | null): number =>
-        earliestFitWithin(
-          [...printerIvs, ...(nozzleId ? nozzleBusy.get(nozzleId) ?? [] : []), ...materialIvs],
+        earliestFitAcross(
+          [printerIvs, nozzleId ? nozzleBusy.get(nozzleId) ?? NO_BLOCKS : NO_BLOCKS, ...materialLists],
           durMs,
           now + LEAD_MS,
           GAP_MS,
@@ -2263,7 +2457,29 @@ export class SimpleJobsService {
         }
         try {
           if (c.is_bed) await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
-          else await this.jobsService.schedule(companyId, c.id, { start_at: startIso });
+          else {
+            // scheduleCommit, not schedule: same guards, same write, but it
+            // leaves the parent order's status to us. Rolling an order up costs
+            // an aggregate over EVERY piece in it, so doing it per piece makes
+            // packing one big order O(N²) — the same shape the bulk piece
+            // create fixed. Collected here, settled once each after the loop.
+            const { order_id } = await this.jobsService.scheduleCommit(companyId, c.id, { start_at: startIso });
+            touchedOrders.add(order_id);
+            committedSinceSync += 1;
+            // Settle periodically as well as at the end. Deferring the rollup
+            // entirely would mean an interrupted run — a cancel, a restart —
+            // left every touched order showing a status its pieces had already
+            // moved past. Draining here bounds that window to one batch while
+            // still costing a couple of rollups per order instead of one per
+            // piece.
+            if (committedSinceSync >= ORDER_SYNC_EVERY) {
+              committedSinceSync = 0;
+              for (const orderId of touchedOrders) {
+                await this.jobsService.syncOrderStatusOnce(companyId, orderId);
+              }
+              touchedOrders.clear();
+            }
+          }
         } catch (e) {
           skipped.push({
             id: c.id, is_bed: c.is_bed, name: c.name,
@@ -2303,6 +2519,17 @@ export class SimpleJobsService {
         } : {}),
         ...(dryRun ? { will_reserve_spool: willReserveSpool } : {}),
       });
+    }
+
+    await reportProgress();
+
+    // Settle every order this run touched, once each. Deliberately AFTER the
+    // whole loop and outside it: an order's status is a function of its final
+    // piece set, so the intermediate answers nobody read were pure cost. Errors
+    // are swallowed inside syncOrderStatus already — a derived status must
+    // never undo a commit that succeeded.
+    for (const orderId of touchedOrders) {
+      await this.jobsService.syncOrderStatusOnce(companyId, orderId);
     }
 
     // ── Per-printer utilisation of the plan. "Maximum machine utilisation" is
