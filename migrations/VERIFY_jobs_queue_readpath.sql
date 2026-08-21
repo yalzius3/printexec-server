@@ -88,12 +88,12 @@ SELECT table_name, column_name, data_type
  ORDER BY table_name, column_name;
 
 -- A4. Does the UTC conversion produce the epoch the client computes?
---     Client: new Date('2026-08-17').getTime() === 1755388800000
+--     Client: new Date('2026-08-17').getTime() === 1786924800000
 --     EXPECT: matches_client = true
 SELECT EXTRACT(EPOCH FROM ('2026-08-17'::date::timestamp AT TIME ZONE 'UTC')) * 1000
          AS epoch_ms,
        EXTRACT(EPOCH FROM ('2026-08-17'::date::timestamp AT TIME ZONE 'UTC')) * 1000
-         = 1755388800000 AS matches_client,
+         = 1786924800000 AS matches_client,
        current_setting('TimeZone') AS server_timezone;
 
 -- A5. Is `last_updated_at` maintained by a TRIGGER?

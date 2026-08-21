@@ -105,9 +105,10 @@ WITH
 
 -- ── A + B. Every input combination the write can see ──────────────────────
 --
--- 8 booleans, 256 rows. Columns prefixed row_ are the piece as it stands in the
--- table (what op.* reads); columns prefixed p_ are what the batch supplies for
--- that piece (what $4..$9 were, and what s.* is now).
+-- Four technologies x seven two-valued columns = 512 rows. Columns prefixed
+-- row_ are the piece as it stands in the table (what op.* reads); columns
+-- prefixed p_ are what the batch supplies for that piece (what $4..$9 were,
+-- and what s.* is now).
 matrix AS (
   SELECT
     tech.v            AS row_tech,

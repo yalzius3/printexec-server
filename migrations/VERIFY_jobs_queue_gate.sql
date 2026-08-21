@@ -144,7 +144,12 @@ SELECT jsonb_build_object(
   'A3_pass',                (SELECT (data_type::text = 'date') FROM information_schema.columns
                               WHERE table_schema='public' AND table_name='orders' AND column_name='deadline'),
   'A4_utc_epoch_ms',        (EXTRACT(EPOCH FROM ('2026-08-17'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint,
-  'A4_pass',                (EXTRACT(EPOCH FROM ('2026-08-17'::date::timestamp AT TIME ZONE 'UTC')) * 1000 = 1755388800000),
+  -- The constant is 2026-08-17T00:00:00Z, the same instant as the literal on
+  -- the line above. It read 1755388800000 until 2026-08-21 -- exactly 365 days
+  -- early, i.e. 2025-08-17 -- so this reported false on a database that was
+  -- answering correctly. A gate that cries wolf is worse than no gate: the run
+  -- that mattered was read as 'known failure, ignore it'.
+  'A4_pass',                (EXTRACT(EPOCH FROM ('2026-08-17'::date::timestamp AT TIME ZONE 'UTC')) * 1000 = 1786924800000),
   'A5_trigger_count',       (SELECT COUNT(*)::int FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
                               WHERE NOT t.tgisinternal AND c.relname IN ('order_pieces','orders')),
   'A5_note',                'informational — 0 means last_updated_at is NOT maintained, which the fingerprint assumes',
