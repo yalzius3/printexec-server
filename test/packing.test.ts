@@ -13,6 +13,7 @@ import {
   pushInterval,
   isWithinWorkWindow,
   nextAllowedStart,
+  openMsBetween,
   chooseNozzle,
   nozzleFits,
   nozzleSpecKey,
@@ -881,4 +882,79 @@ test("compareBySlack: equal slack falls back to deadline, then to the given orde
   const order = new Map([["a", 0], ["b", 1]]);
   assert.ok(compareBySlack(a, b, T0, order) < 0);
   assert.ok(compareBySlack(b, a, T0, order) > 0);
+});
+// ── openMsBetween ─────────────────────────────────────────────────────────
+// The denominator behind "share of the hours you could start work in". A plan's
+// wall-clock span counts closed nights against the shop, so a fleet that fills
+// every staffed hour still reads ~40% — the number that made auto-schedule look
+// like it was idling machines. These pin the rule the report divides by.
+
+test("openMsBetween: no window means every instant is open", () => {
+  const from = Date.parse("2026-08-24T00:00:00Z");
+  const to = Date.parse("2026-08-25T00:00:00Z");
+  assert.equal(openMsBetween(from, to, null), 24 * H);
+  // A window whose bounds are equal never blocks anything, same as none.
+  assert.equal(
+    openMsBetween(from, to, { startHour: 9, latestStartHour: 9, tzOffsetMinutes: 0 }),
+    24 * H,
+  );
+});
+
+test("openMsBetween: counts only the staffed band, per day", () => {
+  const w: WorkWindow = { startHour: 8, latestStartHour: 18, tzOffsetMinutes: 0 };
+  const midnight = Date.parse("2026-08-24T00:00:00Z");
+  assert.equal(openMsBetween(midnight, midnight + 24 * H, w), 10 * H);
+  assert.equal(openMsBetween(midnight, midnight + 72 * H, w), 30 * H);
+  // A range lying entirely after closing contributes nothing — this is the
+  // "ran the pack at 19:00" case, where the whole evening is shut.
+  assert.equal(
+    openMsBetween(Date.parse("2026-08-24T19:00:00Z"), Date.parse("2026-08-24T23:00:00Z"), w),
+    0,
+  );
+  assert.equal(openMsBetween(midnight + 24 * H, midnight, w), 0); // to <= from
+});
+
+test("openMsBetween: a night shift wraps midnight", () => {
+  const night: WorkWindow = { startHour: 22, latestStartHour: 6, tzOffsetMinutes: 0 };
+  const midnight = Date.parse("2026-08-24T00:00:00Z");
+  // 00:00–06:00 plus 22:00–24:00 = 8h in any single day.
+  assert.equal(openMsBetween(midnight, midnight + 24 * H, night), 8 * H);
+});
+
+test("openMsBetween: hours are the SHOP's, not the server's", () => {
+  // Cairo is UTC+2, so its 08:00–18:00 is 06:00–16:00 UTC. Counting a local day
+  // that starts at 22:00 UTC must still yield the full ten hours.
+  const cairo: WorkWindow = { startHour: 8, latestStartHour: 18, tzOffsetMinutes: 120 };
+  assert.equal(
+    openMsBetween(Date.parse("2026-08-23T22:00:00Z"), Date.parse("2026-08-24T22:00:00Z"), cairo),
+    10 * H,
+  );
+});
+
+test("openMsBetween: agrees with a minute-by-minute count over random windows", () => {
+  // Independent oracle — brute force asks isWithinWorkWindow once per minute,
+  // so agreement means the closed-form day walk carries no off-by-one at a
+  // band edge, a midnight wrap, or a timezone shift.
+  const MIN = 60_000;
+  const brute = (from: number, to: number, w: WorkWindow): number => {
+    let n = 0;
+    for (let t = from; t < to; t += MIN) if (isWithinWorkWindow(t, w)) n += MIN;
+    return n;
+  };
+  let seed = 20260821;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const base = Date.parse("2026-08-24T00:00:00Z");
+  const offsets = [0, 120, -300, 330, -480, 60];
+  for (let i = 0; i < 600; i++) {
+    const w: WorkWindow = {
+      startHour: Math.floor(rnd() * 24),
+      latestStartHour: Math.floor(rnd() * 24),
+      tzOffsetMinutes: offsets[Math.floor(rnd() * offsets.length)]!,
+    };
+    if (w.startHour === w.latestStartHour) continue; // no-op window, covered above
+    const from = base + Math.floor(rnd() * 5 * 1440) * MIN;
+    const to = from + Math.floor(rnd() * 4 * 1440) * MIN;
+    assert.equal(openMsBetween(from, to, w), brute(from, to, w),
+      `window ${JSON.stringify(w)} over ${new Date(from).toISOString()}..${new Date(to).toISOString()}`);
+  }
 });

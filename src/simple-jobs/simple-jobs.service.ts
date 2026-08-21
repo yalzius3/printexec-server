@@ -22,6 +22,8 @@ import {
   nozzleSpecOf,
   orderForFewestSetups,
   compareBySlack,
+  nextAllowedStart,
+  openMsBetween,
   UNUSABLE_NOZZLE_STATUS,
   type Interval,
   type NozzleOption,
@@ -146,7 +148,11 @@ export class SimpleJobsService {
     nozzleIds?: string[],
     /** Resin's counterpart of `nozzleId`: the operator overrode which tank this
      *  batch pours from. Omitted = auto-resolve (see resolveTankFor). */
-    resinTankId?: string
+    resinTankId?: string,
+    /** Packed PLATES assigned in the same call. Handled after the pieces, down
+     *  the same printer/nozzle/tank resolution, so a mixed selection is one
+     *  operator action and one set of compatibility rules. */
+    bedIds: string[] = []
   ) {
     const printerResult = await this.db.query<{ print_technology: string | null }>(
       `
@@ -583,18 +589,281 @@ export class SimpleJobsService {
       );
     }
 
+    // ── Packed plates in the same batch ──────────────────────────────────────
+    //
+    // A bed is a piece as far as ASSIGNING is concerned: it takes one printer,
+    // mounts one nozzle (or pours from one tank) and is gated on the same
+    // metadata. It runs down the identical resolution built above —
+    // `resolveNozzleFor`, `resolveTankFor`, `printerFamily` — rather than a
+    // parallel copy, because a bed resolving hardware differently from the
+    // pieces sitting ON it is the kind of divergence nobody notices until a
+    // plate is scheduled onto a nozzle the printer cannot mount.
+    //
+    // Beds were previously excluded from this route entirely, and the cost was
+    // not just the missing button: a bed only enters the fleet packer at
+    // status 'ready' with a printer, so with no bulk path they had to be
+    // assigned one modal at a time. In practice they never accumulated, and
+    // auto-schedule — which has handled beds all along — looked like it was
+    // ignoring them.
+    //
+    // Two rules differ from a piece and both come from BedsService.assign:
+    //   · print data is SEEDED from the constituent pieces' quotes (Σ time,
+    //     Σ quantity) when the plate has none, so one click still reaches
+    //     'ready'. A packed plate prints faster than its parts run
+    //     sequentially, so the sum is a deliberate over-estimate to trim.
+    //   · a resin plate's tank defaults to the one its pieces were costed
+    //     against — a plate pours from one vat, so the first is the honest
+    //     answer — before falling back to the auto-resolver.
+    let bedsAssigned = 0;
+    if (bedIds.length > 0) {
+      const bedRes = await this.db.query<{
+        bed_id: string;
+        bed_name: string;
+        status: string;
+        required_print_technology: string | null;
+        required_filament_material: string | null;
+        required_nozzle_diameter_mm: number | null;
+        required_nozzle_material: string | null;
+        slicer_print_time_minutes: number | null;
+        slicer_filament_used_grams: number | null;
+        slicer_resin_used_ml: number | null;
+        resin_tank_id: string | null;
+      }>(
+        `SELECT bed_id, bed_name, status, required_print_technology,
+                required_filament_material, required_nozzle_diameter_mm,
+                required_nozzle_material, slicer_print_time_minutes,
+                slicer_filament_used_grams, slicer_resin_used_ml, resin_tank_id
+           FROM print_beds
+          WHERE company_id = $1 AND bed_id = ANY($2::uuid[])`,
+        [companyId, bedIds]
+      );
+
+      // Every plate's constituent quotes in ONE round trip. Per-bed this was a
+      // query inside the loop, which is the fan-out this route was rebuilt to
+      // remove — five hundred plates would have been five hundred sequential
+      // awaits before a single row was written.
+      const bedSeeds = new Map<string, { minutes: number; quantity: number }>();
+      const bedTankSeed = new Map<string, string>();
+      // print_beds has no required_color of its own — unlike the nozzle spec,
+      // colour was never duplicated onto the plate — so a plate's colour demand
+      // is the colour of the parts packed on it. Carried here because the tank
+      // auto-resolver MUST see it: a resin part comes out the colour of the
+      // liquid it cured from and there is no correcting it afterwards, so
+      // pouring a blue plate from the yellow vat scraps every part on it.
+      // printerAvailability already derives the plate's colour this way when it
+      // filters the tank list; resolving the tank without it here would have
+      // let the auto-pick land on a vat the picker had just ruled out.
+      const bedColorSeed = new Map<string, string>();
+      const childRes = await this.db.query<{
+        bed_id: string;
+        cost_inputs: { grams?: string[]; time?: string } | null;
+        resin_tank_id: string | null;
+        required_color: string | null;
+      }>(
+        `SELECT bed_id, cost_inputs, resin_tank_id, required_color
+           FROM order_pieces
+          WHERE company_id = $1 AND bed_id = ANY($2::uuid[])`,
+        [companyId, bedIds]
+      );
+      for (const row of childRes.rows) {
+        const acc = bedSeeds.get(row.bed_id) ?? { minutes: 0, quantity: 0 };
+        const q = quoteAssumedMeta(row.cost_inputs);
+        if (q.minutes != null) acc.minutes += q.minutes;
+        if (q.grams != null) acc.quantity += q.grams;
+        bedSeeds.set(row.bed_id, acc);
+        if (row.resin_tank_id && !bedTankSeed.has(row.bed_id)) {
+          bedTankSeed.set(row.bed_id, row.resin_tank_id);
+        }
+        const color = (row.required_color ?? "").trim();
+        if (color && !bedColorSeed.has(row.bed_id)) bedColorSeed.set(row.bed_id, color);
+      }
+
+      const upBedIds: string[] = [];
+      const upBedNozzles: (string | null)[] = [];
+      const upBedMinutes: (number | null)[] = [];
+      const upBedGrams: (number | null)[] = [];
+      const upBedTanks: (string | null)[] = [];
+      const upBedMls: (number | null)[] = [];
+      const upBedIsResin: boolean[] = [];
+
+      for (const bed of bedRes.rows) {
+        // Mirrors BedsService.assign's status guard, reported instead of thrown:
+        // one plate the operator cannot assign must not cost them the batch.
+        if (bed.status !== "pending" && bed.status !== "assigned" && bed.status !== "ready") {
+          skipped.push({
+            piece_id: bed.bed_id,
+            piece_name: bed.bed_name,
+            reason: bed.status === "scheduled" ? "scheduled — unschedule it first" : `bed is '${bed.status}'`,
+          });
+          continue;
+        }
+        if (
+          bed.required_print_technology &&
+          printerFamily &&
+          techFamily(bed.required_print_technology) !== printerFamily
+        ) {
+          skipped.push({
+            piece_id: bed.bed_id,
+            piece_name: bed.bed_name,
+            reason: `needs ${bed.required_print_technology}, printer is ${printer.print_technology}`,
+          });
+          continue;
+        }
+        const bedIsResin = isResinTech(bed.required_print_technology);
+        // Printer compatibility is checked against the filament material, so an
+        // FDM plate without one cannot be placed. Resin has no filament at all —
+        // its material identity is the tank — so the check is asked only of the
+        // technology that has an answer.
+        if (!bedIsResin && !bed.required_filament_material) {
+          skipped.push({
+            piece_id: bed.bed_id,
+            piece_name: bed.bed_name,
+            reason: "choose a filament material for this bed first — compatibility is checked against it",
+          });
+          continue;
+        }
+
+        const seed = bedSeeds.get(bed.bed_id);
+        const seedMinutes = seed && seed.minutes > 0 ? Math.round(seed.minutes) : null;
+        const seedQuantity = seed && seed.quantity > 0 ? Math.round(seed.quantity * 100) / 100 : null;
+        const minutes = bed.slicer_print_time_minutes ?? seedMinutes;
+        const currentQuantity = bedIsResin ? bed.slicer_resin_used_ml : bed.slicer_filament_used_grams;
+        const quantity = currentQuantity ?? seedQuantity;
+
+        const nozzle = bedIsResin
+          ? null
+          : resolveNozzleFor(bed.required_nozzle_diameter_mm, bed.required_nozzle_material);
+        const tank = bedIsResin
+          ? (bed.resin_tank_id
+              ?? bedTankSeed.get(bed.bed_id)
+              ?? resolveTankFor(quantity, bedColorSeed.get(bed.bed_id) ?? null))
+          : null;
+        // Same silence-is-expensive rule the piece arm applies: the plate IS
+        // assigned, it simply cannot reach 'ready' without a vat, and saying so
+        // beats leaving the operator to infer it from a status that did not move.
+        if (bedIsResin && !tank) {
+          // The same three-way message the piece arm gives, because the three
+          // have different fixes: buy a tank, fetch the right colour, or top one
+          // up. "No tank available" sends the operator looking at all three.
+          const wantedColor = bedColorSeed.get(bed.bed_id) ?? "";
+          notes.push({
+            piece_id: bed.bed_id,
+            piece_name: bed.bed_name,
+            note: resinTanks.length === 0
+              ? "assigned, but no usable resin tank exists — add one to reach ready"
+              : wantedColor && !resinTanks.some((t) => colorCompatible(wantedColor, t.resin_color))
+                ? `assigned, but no ${wantedColor} resin tank is available — it needs one to reach ready`
+                : "assigned, but no resin tank has enough volume left — it needs one to reach ready",
+          });
+        }
+
+        upBedIds.push(bed.bed_id);
+        upBedNozzles.push(nozzle);
+        upBedMinutes.push(minutes);
+        upBedGrams.push(bedIsResin ? null : quantity);
+        upBedTanks.push(tank);
+        upBedMls.push(bedIsResin ? quantity : null);
+        upBedIsResin.push(bedIsResin);
+        bedsAssigned++;
+      }
+
+      if (upBedIds.length > 0) {
+        // One statement for the whole batch, the same unnest() shape the piece
+        // write uses and for the same reason: the seeded time/quantity come from
+        // each plate's OWN constituent quotes, so any grouping degenerates to one
+        // statement per plate.
+        //
+        // The status CASE is BedsService.assign's, transcribed rather than
+        // reinvented, so one plate cannot become 'ready' by two different rules.
+        // (print_beds carries no readiness CHECK — 2026-06-30 left that block
+        // commented and made bed readiness application-enforced — so unlike the
+        // piece path a mismatch here would be silently wrong rather than a loud
+        // constraint violation. That makes matching it more important, not less.)
+        //
+        // ONE DELIBERATE DIVERGENCE, in the quantity columns.
+        // BedsService.assign writes `COALESCE($7, slicer_filament_used_grams)`
+        // with $7 NULL for resin, so a plate KEEPS filament grams it can never
+        // consume; the arms below CLEAR the other technology's quantity outright,
+        // matching what the piece write already does. Stale cross-technology data
+        // is not inert here — it is what drew a 0.40mm nozzle lane on a resin
+        // board from perfectly real columns. Worth correcting in
+        // BedsService.assign too, which is why this says so rather than quietly
+        // differing.
+        await this.db.query(
+          `
+            UPDATE print_beds pb
+            SET assigned_printer_id       = $3,
+                -- A plate carries the tooling of ONE technology; assigning it
+                -- clears the other's, exactly as the piece write does. COALESCE
+                -- alone only ever added, so a plate that changed technology kept
+                -- a nozzle id no machine could mount.
+                assigned_nozzle_asset_id  = CASE
+                  WHEN s.is_resin THEN NULL
+                  ELSE COALESCE(s.nozzle, pb.assigned_nozzle_asset_id)
+                END,
+                resin_tank_id             = CASE
+                  WHEN s.is_resin THEN COALESCE(s.tank, pb.resin_tank_id)
+                  ELSE NULL
+                END,
+                slicer_print_time_minutes  = COALESCE(s.minutes, pb.slicer_print_time_minutes),
+                slicer_filament_used_grams = CASE
+                  WHEN s.is_resin THEN NULL
+                  ELSE COALESCE(s.grams, pb.slicer_filament_used_grams)
+                END,
+                slicer_resin_used_ml       = CASE
+                  WHEN s.is_resin THEN COALESCE(s.ml, pb.slicer_resin_used_ml)
+                  ELSE NULL
+                END,
+                status = CASE
+                  WHEN s.is_resin THEN
+                    CASE WHEN COALESCE(s.minutes, pb.slicer_print_time_minutes) IS NOT NULL
+                          AND COALESCE(s.ml, pb.slicer_resin_used_ml) IS NOT NULL
+                          AND COALESCE(s.tank, pb.resin_tank_id) IS NOT NULL
+                         THEN 'ready' ELSE 'assigned' END
+                  WHEN COALESCE(s.nozzle, pb.assigned_nozzle_asset_id) IS NOT NULL
+                   AND COALESCE(s.minutes, pb.slicer_print_time_minutes) IS NOT NULL
+                   AND COALESCE(s.grams, pb.slicer_filament_used_grams) IS NOT NULL THEN 'ready'
+                  WHEN COALESCE(s.nozzle, pb.assigned_nozzle_asset_id) IS NOT NULL THEN 'assigned'
+                  ELSE pb.status
+                END
+            FROM unnest($2::uuid[], $4::uuid[], $5::int[], $6::numeric[], $7::uuid[], $8::numeric[], $9::boolean[])
+              AS s(bed_id, nozzle, minutes, grams, tank, ml, is_resin)
+            WHERE pb.company_id = $1
+              AND pb.bed_id = s.bed_id
+          `,
+          [companyId, upBedIds, printerId, upBedNozzles, upBedMinutes, upBedGrams, upBedTanks, upBedMls, upBedIsResin]
+        );
+
+        // No read-back of which plates reached 'ready'.
+        //
+        // The piece path re-reads because the caller CHAINS on it — one schedule
+        // window per ready piece. A bed opens no such window (it schedules
+        // through /beds/:id, and a batch of them belongs in Auto-schedule), so
+        // the answer would have been a round trip per batch that nothing read.
+        // If a count is ever wanted here, the Auto-schedule button already
+        // reports it one click away, from the same gate the packer applies.
+      }
+    }
+
     // The picker chains straight into scheduling for pieces that are already
     // 'ready' (quote-seeded) — report which ones those are.
-    const readyRes = await this.db.query<{ piece_id: string }>(
-      `SELECT piece_id FROM order_pieces
-        WHERE company_id = $1 AND piece_id = ANY($2::uuid[]) AND status = 'ready'`,
-      [companyId, pieceIds]
-    );
+    const readyRes = pieceIds.length > 0
+      ? await this.db.query<{ piece_id: string }>(
+          `SELECT piece_id FROM order_pieces
+            WHERE company_id = $1 AND piece_id = ANY($2::uuid[]) AND status = 'ready'`,
+          [companyId, pieceIds]
+        )
+      : { rows: [] as { piece_id: string }[] };
 
     return {
-      assigned: assignedCount,
+      // Pieces and plates both count as assigned work — the operator selected
+      // one list and expects one number back.
+      assigned: assignedCount + bedsAssigned,
       skipped,
       notes,
+      // PIECE ids only, and the name is load-bearing: the caller chains a
+      // schedule window per id, and a bed does not open one. Plates that
+      // reached 'ready' show up in the Auto-schedule count instead.
       ready_ids: readyRes.rows.map((r) => r.piece_id),
     };
   }
@@ -1163,7 +1432,10 @@ export class SimpleJobsService {
     horizon: "day" | "week" | "month" | "deadline",
     deadlineIso?: string,
     pieceIds?: string[],
-    bedId?: string
+    /** Plates in the selection. One for the single-bed window, many when a bulk
+     *  selection mixes plates with loose pieces — the picker must only offer
+     *  printers compatible with EVERY item, so both kinds constrain it here. */
+    bedIds: string[] = []
   ) {
     const now = new Date();
     const dayMs = 24 * 60 * 60 * 1000;
@@ -1243,7 +1515,7 @@ export class SimpleJobsService {
     }
     // Bed target: requirements come from the bed row itself (single tech,
     // single nozzle spec spanning the whole plate).
-    if (bedId) {
+    if (bedIds.length > 0) {
       const bedRes = await this.db.query<{
         required_print_technology: string | null;
         required_multicolor_capable: boolean | null;
@@ -1254,9 +1526,9 @@ export class SimpleJobsService {
           SELECT required_print_technology, required_multicolor_capable,
                  required_nozzle_diameter_mm, required_nozzle_material
           FROM print_beds
-          WHERE company_id = $1 AND bed_id = $2
+          WHERE company_id = $1 AND bed_id = ANY($2::uuid[])
         `,
-        [companyId, bedId]
+        [companyId, bedIds]
       );
       for (const r of bedRes.rows) {
         if (r.required_print_technology) techFamilies.add(techFamily(r.required_print_technology));
@@ -1271,13 +1543,21 @@ export class SimpleJobsService {
         const mat = r.required_nozzle_material;
         if (dia == null && !mat) continue;
         const key = reqKey(dia, mat);
-        nozzleReq.set(key, {
-          key,
-          diameter_mm: dia,
-          material: mat,
-          label: [dia != null ? `${dia}mm` : null, mat].filter(Boolean).join(" ") || "Any nozzle",
-          piece_count: 1,
-        });
+        // Accumulates, exactly as the piece branch does. Overwriting was
+        // harmless while only one plate could be targeted; with a bulk
+        // selection it would report "1" for a spec a dozen plates need, and
+        // that count is what tells the operator how much of the batch hangs on
+        // each nozzle they are being asked to pick.
+        const existingBedReq = nozzleReq.get(key);
+        if (existingBedReq) existingBedReq.piece_count += 1;
+        else
+          nozzleReq.set(key, {
+            key,
+            diameter_mm: dia,
+            material: mat,
+            label: [dia != null ? `${dia}mm` : null, mat].filter(Boolean).join(" ") || "Any nozzle",
+            piece_count: 1,
+          });
       }
       // print_beds has no required_color of its own — unlike the nozzle spec,
       // colour was never duplicated onto the plate — so a resin plate's colour
@@ -1290,9 +1570,9 @@ export class SimpleJobsService {
         const bedColors = await this.db.query<{ required_color: string | null }>(
           `SELECT DISTINCT required_color
              FROM order_pieces
-            WHERE company_id = $1 AND bed_id = $2
+            WHERE company_id = $1 AND bed_id = ANY($2::uuid[])
               AND NULLIF(TRIM(required_color), '') IS NOT NULL`,
-          [companyId, bedId]
+          [companyId, bedIds]
         );
         for (const r of bedColors.rows) {
           const c = (r.required_color ?? "").trim();
@@ -1752,6 +2032,7 @@ export class SimpleJobsService {
         dry_run: input.dry_run === true,
         min_margin_minutes: input.min_margin_minutes ?? 5,
         nozzle_swaps: 0, span_minutes: 0, utilisation: [],
+        window_effect: null,
         printers,
       };
     }
@@ -2423,6 +2704,11 @@ export class SimpleJobsService {
       if (nozzlePolicy === "minimise_changes" && nozzleChoice.id) {
         pinnedNozzleBySpec.set(specKey, nozzleChoice.id);
       }
+      // Not const: scheduleCommit gets the final word. If the board moved under
+      // the plan between choosing and committing, it substitutes an identical
+      // free nozzle rather than failing the placement — and the busy maps below
+      // must then book the nozzle that was ACTUALLY taken, or the rest of the
+      // batch packs around hardware nobody is using.
       const chosenNozzle = nozzleChoice.id;
       const startMs = nozzleChoice.startMs;
       const nozzleMovedFrom = nozzleChoice.movedFromPrinterId;
@@ -2545,6 +2831,32 @@ export class SimpleJobsService {
       planTo = Math.max(planTo, Date.parse(p.end_at));
     }
     const spanMinutes = placed.length > 0 ? Math.round((planTo - planFrom) / 60_000) : 0;
+    // ── What the working-hours window did to this plan.
+    //
+    //    Without this the plan is silent about its own biggest shape. A shop on
+    //    08:00–18:00 that packs every staffed hour of three days still reports
+    //    ~40% utilisation, because the span it is divided by counts two closed
+    //    nights against it — and a pack started after closing opens with a
+    //    sixteen-hour hole that looks exactly like the packer refusing to work.
+    //    Both are the window behaving correctly (it gates the START instant, so
+    //    somebody is there to load the plate), and neither was stated anywhere.
+    //
+    //    `deferred` is the honest headline: the shop is shut NOW, so nothing
+    //    could have started for this long whatever the backlog. It is derived
+    //    from the window alone rather than from where the first job landed, so
+    //    it still reads correctly when the first job was pushed later by a
+    //    conflict instead.
+    const earliestAllowed = nextAllowedStart(now + LEAD_MS, workWindow);
+    const openMinutes = placed.length > 0
+      ? Math.round(openMsBetween(planFrom, planTo, workWindow) / 60_000)
+      : 0;
+    const windowEffect = workWindow
+      ? {
+          open_minutes: openMinutes,
+          closed_minutes: Math.max(0, spanMinutes - openMinutes),
+          first_start_deferred_minutes: Math.round((earliestAllowed - (now + LEAD_MS)) / 60_000),
+        }
+      : null;
     const perPrinter = new Map<string, { booked_minutes: number; jobs: number }>();
     for (const p of placed) {
       if (!p.printer_id) continue;
@@ -2590,6 +2902,19 @@ export class SimpleJobsService {
         // Share of the plan's wall-clock window this machine is actually running.
         // Null when the plan is a single instant (nothing to be a fraction of).
         utilisation_pct: spanMinutes > 0 ? Math.round((v.booked_minutes / spanMinutes) * 100) : null,
+        // The same booking measured against the hours a print could actually be
+        // STARTED in. Kept beside utilisation_pct rather than replacing it
+        // because they answer different questions and a shop needs both: the
+        // first is "was the machine running", the second is "did we fill the
+        // shift". Null without a window, where the two would be identical.
+        //
+        // It can exceed 100, and that is a real answer rather than a bug: a
+        // print started before closing runs on unattended, so a machine can be
+        // busy for more hours than the shop is open. Presenting it capped would
+        // hide exactly the overnight running the window is designed to allow.
+        utilisation_open_pct: windowEffect && windowEffect.open_minutes > 0
+          ? Math.round((v.booked_minutes / windowEffect.open_minutes) * 100)
+          : null,
         nozzle_changes: changesByPrinter.get(printer_id) ?? 0,
       }))
       .sort((a, b) => b.booked_minutes - a.booked_minutes);
@@ -2613,6 +2938,10 @@ export class SimpleJobsService {
       // Total physical swaps across the fleet — the number the operator feels.
       nozzle_changes: Array.from(changesByPrinter.values()).reduce((a, b) => a + b, 0),
       span_minutes: spanMinutes,
+      // What the working hours cost this plan, so the review step can say it
+      // instead of leaving the operator to read a hole in the board as a fault.
+      // Null when the shop runs round the clock and there is nothing to explain.
+      window_effect: windowEffect,
       utilisation,
     };
   }

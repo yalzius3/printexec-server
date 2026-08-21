@@ -1199,7 +1199,137 @@ export class JobsService {
       ORDER BY op.created_at DESC, op.piece_id ASC`,
       values
     );
-    return res.rows;
+    // Only PLATES carry `is_bed`; an absent flag reads as false at the one
+    // place that tests it. Stamping `is_bed: false` onto every piece meant
+    // copying the whole backlog — ten thousand row objects — to add a field
+    // whose absence already says the same thing.
+    const rows = res.rows as Array<Record<string, unknown>>;
+
+    // ── Packed plates awaiting a printer ────────────────────────────────────
+    //
+    // A bed belongs in this list for the same reason it belongs on the queue:
+    // it is a unit of work waiting for a machine. Leaving it out meant beds
+    // could only ever be assigned one modal at a time, so they never
+    // accumulated at 'ready' — and the fleet packer, which has handled beds all
+    // along, looked like it ignored them.
+    //
+    // Its own query rather than a UNION with the above: the piece filter is
+    // built from `op.`/`o.` predicates by buildQueueFilter and none of them
+    // have a bed counterpart (a plate has no single order, customer or filament
+    // reference). Forcing one shape over both would mean inventing bed columns
+    // that do not exist. The search term is honoured because that is the filter
+    // the picker actually exposes.
+    //
+    // Wrapped because a database still missing print_beds must degrade to the
+    // pieces alone — which are correct on their own — rather than emptying a
+    // list the operator is about to assign from.
+    try {
+      const q = (query.search ?? "").trim();
+      const bedValues: unknown[] = [companyId];
+      if (q) bedValues.push(`%${q.toLowerCase()}%`);
+      const beds = await this.databaseService.query(
+        `SELECT
+           b.bed_id            AS piece_id,
+           b.bed_name          AS piece_name,
+           b.effective_deadline::text AS order_deadline,
+           b.required_print_technology,
+           b.resin_tank_id,
+           -- Byte-identical to BedsService.bedSelectSql's expression (note the
+           -- ' · ' separator, which differs from the piece one above), so a
+           -- plate reads the same here as in the row the operator clicked from.
+           CASE WHEN fr.filament_ref_id IS NOT NULL
+                THEN fr.brand || ' ' || fr.material_type || ' · ' || fr.color
+                ELSE NULL END AS required_filament_label,
+           -- A plate can hold pieces from several orders, so there is no single
+           -- order number to show. Name the one when there IS one, and say how
+           -- many otherwise — a count is honest where a first-row guess is not.
+           CASE WHEN COUNT(DISTINCT o.order_id) = 1
+                THEN MIN(o.order_number)
+                ELSE COUNT(DISTINCT o.order_id)::text || ' orders'
+           END AS order_reference,
+           CASE WHEN COUNT(DISTINCT o.customer_id) = 1
+                THEN MIN(COALESCE(
+                       NULLIF(cu.business_name, ''),
+                       NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
+                     ))
+                ELSE NULL
+           END AS customer_name
+           -- Deliberately NOT shipping the constituent quotes.
+           --
+           -- A plate's assumed time and quantity are seeded SERVER-side at
+           -- assign time, from these same rows; the list only has to let the
+           -- operator choose. Sending them so the client could re-sum them was
+           -- a body computed and then discarded — nothing rendered it, and
+           -- piece rows show no assumed figures either — at roughly a dozen
+           -- quote objects per plate. Showing them would also have been a
+           -- half-truth, because the seed only applies when the plate has no
+           -- figures of its own.
+         FROM print_beds b
+         LEFT JOIN order_pieces op ON op.bed_id = b.bed_id AND op.company_id = b.company_id
+         LEFT JOIN orders o        ON o.order_id = op.order_id AND o.company_id = op.company_id
+         LEFT JOIN customers cu    ON cu.customer_id = o.customer_id
+         LEFT JOIN filament_reference fr ON fr.filament_ref_id = b.required_filament_ref_id
+        WHERE b.company_id = $1
+          AND b.status = 'pending'
+          AND b.assigned_printer_id IS NULL
+          -- Search matches the plate's own name OR anything identifying the work
+          -- packed on it. Name-only looked sufficient and was a trap: searching a
+          -- customer returned their loose pieces but hid the plate holding their
+          -- parts, so the operator would assign the pieces and leave the plate
+          -- behind — the exact omission this whole change exists to stop.
+          ${q ? `AND (
+            LOWER(b.bed_name) LIKE $2
+            OR EXISTS (
+              SELECT 1
+                FROM order_pieces sp
+                JOIN orders so      ON so.order_id = sp.order_id AND so.company_id = sp.company_id
+                LEFT JOIN customers scu ON scu.customer_id = so.customer_id
+               WHERE sp.company_id = b.company_id
+                 AND sp.bed_id = b.bed_id
+                 AND (
+                   LOWER(sp.piece_name) LIKE $2
+                   OR LOWER(so.order_number) LIKE $2
+                   OR LOWER(COALESCE(
+                        NULLIF(scu.business_name, ''),
+                        NULLIF(TRIM(CONCAT_WS(' ', scu.first_name, scu.last_name)), '')
+                      )) LIKE $2
+                 )
+            )
+          )` : ""}
+          -- Order scoping, matching the piece arm above.
+          --
+          -- Without this a plate whose work was cancelled or is still a draft
+          -- would sit in the same list as live pieces and could be given a
+          -- printer — and because assigning also SEEDS its print data, it would
+          -- reach 'ready' and go on to occupy a real slot in the fleet pack.
+          -- Machine time booked for work nobody ordered.
+          --
+          -- Spelled as EXISTS over the constituent pieces rather than a join
+          -- predicate because a plate can hold pieces from several orders:
+          -- the plate is live if ANY part of it is, which is the same rule
+          -- jobSelectSql's bed arm applies. The status list is the PIECE arm's,
+          -- deliberately — a plate and a loose piece from one order must appear
+          -- or vanish together, and they sit side by side in this one modal.
+          AND EXISTS (
+            SELECT 1
+              FROM order_pieces cp
+              JOIN orders co ON co.order_id = cp.order_id AND co.company_id = cp.company_id
+             WHERE cp.company_id = b.company_id
+               AND cp.bed_id = b.bed_id
+               AND co.status IN ${JobsService.QUEUE_ORDER_STATUSES}
+          )
+        GROUP BY b.bed_id, b.bed_name, b.effective_deadline,
+                 b.required_print_technology, b.resin_tank_id,
+                 fr.filament_ref_id, fr.brand, fr.material_type, fr.color,
+                 b.created_at
+        ORDER BY b.created_at DESC, b.bed_id ASC`,
+        bedValues
+      );
+      for (const b of beds.rows) rows.push({ ...b, is_bed: true });
+    } catch {
+      /* print_beds not migrated yet — the pieces alone are correct */
+    }
+    return rows;
   }
 
   async getJob(companyId: string, pieceId: string): Promise<JobRow> {

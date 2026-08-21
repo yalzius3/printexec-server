@@ -7,7 +7,16 @@ import { parseWithSchema } from "../common/zod";
 import { SimpleJobsService } from "./simple-jobs.service";
 
 const assignSchema = z.object({
-  piece_ids: z.array(z.string().uuid()).min(1).max(500),
+  // Loose pieces in the batch. Empty when the operator selected only beds,
+  // which is why the old `.min(1)` moved onto the pair below.
+  piece_ids: z.array(z.string().uuid()).max(500).default([]),
+  // Packed PLATES in the same batch. A bed occupies one printer, mounts one
+  // nozzle and pours from one material exactly as a piece does, so the picker
+  // treats the two alike and the service assigns them in one call — the
+  // alternative was a second modal for the one selection the operator made.
+  //
+  // Same 500 cap as pieces, for the same reason: it bounds one transaction.
+  bed_ids: z.array(z.string().uuid()).max(500).default([]),
   printer_id: z.string().uuid(),
   // Optional: the operator picked a specific nozzle. When omitted the service
   // resolves a sensible default for the printer.
@@ -20,7 +29,14 @@ const assignSchema = z.object({
   // tank. Omitted = the service resolves the emptiest tank that still covers
   // the job, which is the one-click default.
   resin_tank_id: z.string().uuid().optional(),
-});
+})
+  // One of the two must carry something. Spelled here rather than as `.min(1)`
+  // on either array so "assign nothing" is refused once, whichever kind the
+  // operator picked.
+  .refine((v) => v.piece_ids.length > 0 || v.bed_ids.length > 0, {
+    message: "Select at least one piece or bed to assign.",
+    path: ["piece_ids"],
+  });
 
 const availabilitySchema = z.object({
   horizon: z.enum(["day", "week", "month", "deadline"]).default("week"),
@@ -38,6 +54,10 @@ const availabilitySchema = z.object({
   piece_ids: z.array(z.string().uuid()).max(20_000).optional(),
   // Alternatively a bed id — requirements come from the bed row instead.
   bed: z.string().uuid().optional(),
+  // Plates in a BULK selection, alongside piece_ids. The picker must only offer
+  // printers compatible with every item the operator ticked, and a mixed
+  // selection has both kinds; `bed` above stays the single-bed window's spelling.
+  bed_ids: z.array(z.string().uuid()).max(20_000).optional(),
 });
 
 // Bulk-unassign below-printing work: individual pieces and/or whole printers
@@ -197,10 +217,10 @@ export class SimpleJobsController {
   @Post("assign")
   @RequirePermission("action_orders")
   assign(@CompanyId() companyId: string, @Body() body: unknown) {
-    const { piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids, resin_tank_id } =
+    const { piece_ids, bed_ids, printer_id, nozzle_asset_id, nozzle_asset_ids, resin_tank_id } =
       parseWithSchema(assignSchema, body);
     return this.simpleJobsService.assign(
-      companyId, piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids, resin_tank_id
+      companyId, piece_ids, printer_id, nozzle_asset_id, nozzle_asset_ids, resin_tank_id, bed_ids
     );
   }
 
@@ -209,9 +229,12 @@ export class SimpleJobsController {
   @Post("printer-availability")
   @RequirePermission("view_orders")
   availability(@CompanyId() companyId: string, @Body() body: unknown) {
-    const { horizon, deadline, piece_ids, bed } = parseWithSchema(availabilitySchema, body);
+    const { horizon, deadline, piece_ids, bed, bed_ids } = parseWithSchema(availabilitySchema, body);
     const pieceIds = piece_ids && piece_ids.length > 0 ? piece_ids : undefined;
-    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline, pieceIds, bed);
+    // `bed` (the single-bed window) and `bed_ids` (a bulk selection) fold into
+    // one list — the service asks the same compatibility question of both.
+    const beds = [...(bed ? [bed] : []), ...(bed_ids ?? [])];
+    return this.simpleJobsService.printerAvailability(companyId, horizon, deadline, pieceIds, beds);
   }
 
   @Post("attach-slicer")

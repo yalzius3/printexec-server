@@ -230,6 +230,62 @@ export function nextAllowedStart(ms: number, w: WorkWindow | null | undefined): 
 }
 
 /**
+ * How much of `[fromMs, toMs)` a print could legally be STARTED in.
+ *
+ * Exists because a plan's wall-clock span is a misleading denominator for a
+ * shop that isn't open round the clock. A fleet that saturates every hour it is
+ * staffed still reports ~40% "utilisation" once three closed nights are counted
+ * against it, which reads as idle machines and is the opposite of the truth.
+ * Reporting the open share alongside it is what lets the two be told apart.
+ *
+ * Deliberately measures START opportunity, not machine availability: that is
+ * the only thing the window actually constrains (a long print runs on past
+ * closing, unattended, and that is normal). So this is the denominator for
+ * "did we fill the hours we could start work in", never for "was the machine
+ * powered".
+ *
+ * Returns the full range when there is no window, which keeps every caller
+ * free of a null branch.
+ *
+ * Bounded by the number of local days spanned — 60 at the packer's horizon —
+ * so it costs nothing worth measuring next to the pack itself.
+ */
+export function openMsBetween(
+  fromMs: number,
+  toMs: number,
+  w: WorkWindow | null | undefined,
+): number {
+  if (toMs <= fromMs) return 0;
+  // No window, or one so wide it never blocks, means every instant is open.
+  if (!w || w.startHour === w.latestStartHour) return toMs - fromMs;
+
+  // Walk local days. Each contributes one open band when the window sits inside
+  // a day, or two when it wraps midnight (22:00 → 06:00 opens the tail of the
+  // day AND the head of it).
+  const wraps = w.startHour > w.latestStartHour;
+  let open = 0;
+  // Start from the local midnight of the day `fromMs` falls in, so a band that
+  // began yesterday and runs into the range is still counted.
+  const shifted = fromMs + w.tzOffsetMinutes * 60_000;
+  let dayStart =
+    Math.floor(shifted / DAY_MS_LOCAL) * DAY_MS_LOCAL - w.tzOffsetMinutes * 60_000;
+
+  const overlap = (s: number, e: number): number =>
+    Math.max(0, Math.min(e, toMs) - Math.max(s, fromMs));
+
+  for (; dayStart < toMs; dayStart += DAY_MS_LOCAL) {
+    const h = (hour: number) => dayStart + hour * HOUR_MS;
+    if (wraps) {
+      open += overlap(h(w.startHour), h(24));
+      open += overlap(h(0), h(w.latestStartHour));
+    } else {
+      open += overlap(h(w.startHour), h(w.latestStartHour));
+    }
+  }
+  return open;
+}
+
+/**
  * Earliest start that clears every busy interval AND falls inside the shop's
  * working hours.
  *
