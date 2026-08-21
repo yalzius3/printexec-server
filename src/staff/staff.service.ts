@@ -9,7 +9,12 @@ import { DatabaseService } from "../database/database.service";
 import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
 import { composeStaffInviteEmail } from "../email/email-templates";
-import { canonicalizeInviteToken, generateInviteToken } from "./invite-token";
+import {
+  canonicalizeInviteToken,
+  generateInviteToken,
+  inviteIsExpiredSql,
+  inviteIsLiveSql
+} from "./invite-token";
 
 // The code format lives in ONE module now — minting here and matching in
 // auth.controller's redemption path have to agree, and they did not before.
@@ -136,7 +141,7 @@ export class StaffService {
        JOIN users u ON u.id = ci.created_by
        WHERE ci.company_id = $1
          AND ci.used_at IS NULL
-         AND ci.expires_at > now()
+         AND ${inviteIsLiveSql("ci.expires_at")}
        ORDER BY ci.expires_at ASC`,
       [companyId]
     );
@@ -170,12 +175,20 @@ export class StaffService {
       );
     }
 
-    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
-
+    // Expiry is computed BY THE DATABASE, not by this process. It used to be
+    // `new Date(Date.now() + 48h).toISOString()` — a string ending in Z — and
+    // if company_invites.expires_at is a naive `timestamp` rather than
+    // `timestamptz`, Postgres silently drops that Z on the cast and stores a
+    // bare wall-clock time. The window then lands 48 hours off the API
+    // process's clock rather than off the database's, and every later
+    // comparison resolves it in whatever timezone the reading session happens
+    // to use. Writing `now() + interval` puts the write and all three reads on
+    // one clock, whatever the column type turns out to be.
+    // See scripts/inspect-invites.sql.
     await this.db.query(
       `INSERT INTO company_invites (token, company_id, created_by, expires_at)
-       VALUES ($1, $2, $3, $4)`,
-      [token, companyId, createdBy, expiresAt]
+       VALUES ($1, $2, $3, now() + interval '48 hours')`,
+      [token, companyId, createdBy]
     );
 
     const { rows } = await this.db.query<InviteRow>(
@@ -210,10 +223,17 @@ export class StaffService {
       token: string;
       expires_at: string;
       used_at: string | null;
+      is_expired: boolean;
       created_by_name: string | null;
       company_name: string;
     }>(
+      // is_expired is decided by the DATABASE, with the exact complement of
+      // the predicate listInvites filters on — see invite-token.ts. It used to
+      // be re-derived here in JS from the returned value, which only agrees
+      // with the list if expires_at is timestamptz. expires_at itself is still
+      // selected because the email body prints it.
       `SELECT ci.token, ci.expires_at, ci.used_at,
+              ${inviteIsExpiredSql("ci.expires_at")} AS is_expired,
               u.display_name AS created_by_name,
               c.name AS company_name
          FROM company_invites ci
@@ -227,7 +247,7 @@ export class StaffService {
     if (invite.used_at) {
       throw new BadRequestException("This invite code has already been used.");
     }
-    if (new Date(invite.expires_at).getTime() < Date.now()) {
+    if (invite.is_expired) {
       throw new BadRequestException("This invite code has expired — create a new one.");
     }
 

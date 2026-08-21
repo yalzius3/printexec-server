@@ -61,6 +61,38 @@ const GROUP_SIZE = 4;
 const SEPARATORS =
   /[\s_\-\u00a0\u200b-\u200f\u2010-\u2015\u2028\u2029\u2060\u2212\ufeff]/gu;
 
+// ────────────────────────────────────────────────────────────
+// Expiry, as SQL.
+//
+// Three places ask whether an invite is still good: the owner's list, the
+// redemption path, and the "email me this code" action. They used to disagree
+// about HOW to ask — the list compared in SQL, the other two re-derived it in
+// JavaScript from the returned timestamp. Those two answers are the same only
+// if company_invites.expires_at is `timestamptz`. If it is a naive
+// `timestamp`, SQL resolves the value in the DATABASE session's timezone while
+// node-postgres resolves it in the API PROCESS's, and a code sitting in the
+// owner's list looking perfectly live is refused at redemption as expired.
+//
+// So the predicate lives here, once, and every site interpolates it. One
+// clock (the database's), one expression, and a difference of opinion becomes
+// impossible rather than merely unlikely.
+//
+// COALESCE makes both fail CLOSED: a row with no expiry at all reads as
+// expired and absent from the list, never as an invite that lives forever.
+// The bare comparison yields SQL NULL there, which arrives in JS as falsy.
+//
+// The column argument is always a literal written by us — never user input —
+// so interpolating it is not an injection surface.
+// ────────────────────────────────────────────────────────────
+
+/** True when this invite is past its expiry, or has none. */
+export const inviteIsExpiredSql = (column = "expires_at"): string =>
+  `COALESCE(${column} <= now(), TRUE)`;
+
+/** Exact complement of the above: true when the invite is still usable. */
+export const inviteIsLiveSql = (column = "expires_at"): string =>
+  `COALESCE(${column} > now(), FALSE)`;
+
 /**
  * Mint a new invite code in canonical form: ABCD-EFGH.
  *

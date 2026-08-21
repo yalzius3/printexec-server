@@ -13,7 +13,7 @@ import { buildUploadCookieHeader, signUploadCookie } from "./upload-cookie";
 import { verifyToken } from "./verify-token";
 // Redemption has to fold a typed code onto the format staff.service mints.
 // Pure module (no DI) so this is a plain import, not a module dependency.
-import { canonicalizeInviteToken } from "../staff/invite-token";
+import { canonicalizeInviteToken, inviteIsExpiredSql } from "../staff/invite-token";
 import { z } from "zod";
 
 // Structural shape only — required-field, format, and conflict checks are run
@@ -1111,8 +1111,17 @@ export class AuthController {
       throw new NotFoundException("This invite code doesn't exist. Check the code and try again.");
     }
 
-    const inviteRow = await this.db.query<{ company_id: string; used_at: string | Date | null; expires_at: string | Date }>(
-      "SELECT company_id, used_at, expires_at FROM company_invites WHERE token = $1",
+    // is_expired is decided BY THE DATABASE, using the same expression
+    // StaffService.listInvites filters the owner's list on. This used to be
+    // re-derived in JS from the returned timestamp, which agrees with the list
+    // only if company_invites.expires_at is timestamptz — if it is a naive
+    // `timestamp`, the list resolves it in the database session's timezone
+    // while node-postgres resolves it in this process's, and a code sitting in
+    // the owner's list looking perfectly live is refused here as expired. One
+    // clock, one expression. See scripts/inspect-invites.sql.
+    const inviteRow = await this.db.query<{ company_id: string; used_at: string | Date | null; is_expired: boolean }>(
+      `SELECT company_id, used_at, ${inviteIsExpiredSql()} AS is_expired
+         FROM company_invites WHERE token = $1`,
       [inviteToken]
     );
 
@@ -1125,8 +1134,8 @@ export class AuthController {
     if (inv.used_at !== null) {
       throw new ConflictException("This invite code has already been used.");
     }
-    // (10) expired
-    if (new Date(inv.expires_at).getTime() < Date.now()) {
+    // (10) expired — the database's verdict, not this process's
+    if (inv.is_expired) {
       throw new GoneException("This invite code has expired. Ask the company owner to send a new one.");
     }
 
