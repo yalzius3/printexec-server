@@ -391,6 +391,20 @@ export function nozzleSpecKey(
 }
 
 /**
+ * How much physical handling running `printerId` on this nozzle implies —
+ * lower is cheaper:
+ *
+ *   1. idle, or already fitted to this very printer — nobody walks anywhere
+ *   2. currently fitted to a DIFFERENT printer — someone carries it over
+ *
+ * `installed_on` is operator-maintained inventory, so a null means "we don't
+ * know of it being on anything", which is the cheap case and is treated as such.
+ */
+export function nozzleHandlingRank(installedOn: string | null, printerId: string): number {
+  return !installedOn || installedOn === printerId ? 1 : 2;
+}
+
+/**
  * Pick the nozzle that opens the earliest slot.
  *
  * A nozzle is interchangeable with any other of the same diameter + material,
@@ -433,8 +447,7 @@ export function chooseNozzle(args: {
 
   const rankOf = (n: NozzleOption): number => {
     if (n.nozzle_asset_id === assignedId) return 0;
-    if (!n.installed_on || n.installed_on === printerId) return 1;
-    return 2;
+    return nozzleHandlingRank(n.installed_on, printerId);
   };
   const decisionFor = (n: NozzleOption): NozzleDecision => ({
     id: n.nozzle_asset_id,
@@ -487,6 +500,66 @@ export function chooseNozzle(args: {
     label: best.label,
     swapped: best.id !== assignedId,
   };
+}
+
+/**
+ * Stand-in for a nozzle that is double-booked in a window the operator has
+ * already chosen. Returns null when there isn't one.
+ *
+ * This is `chooseNozzle`'s rule under a fixed time rather than a free one. The
+ * packer gets to move the job; a human dropping a piece on the board has said
+ * WHEN, so the only remaining freedom is WHICH physical nozzle serves it — and
+ * a shop with ten 0.4mm brass nozzles should never be told a print can't happen
+ * at 14:00 because one specific one of them is elsewhere. Operators do not
+ * differentiate between them, so neither should the board.
+ *
+ * Deliberately stricter than `chooseNozzle`:
+ *
+ *   · The substitute must be the SAME SPEC as the nozzle already assigned
+ *     (`nozzleSpecOf` — diameter + material), not merely one the piece's
+ *     requirement tolerates. A piece that asks for "0.4mm, material unstated"
+ *     tolerates 0.4mm hardened, but silently moving an assigned brass job onto
+ *     hardened steel is a hardware decision nobody asked for. Same spec in,
+ *     same spec out: the print is physically identical.
+ *
+ *   · It must be FREE for the whole window (`isFree`), never merely "earlier".
+ *     There is no time to trade here.
+ *
+ * Ties break by handling cost, so the swap the operator has to act on — a
+ * nozzle currently fitted to another machine — is only ever the last resort,
+ * and the caller is told about it so it can be shown rather than assumed.
+ * Equal-rank ties break on the asset id purely so the answer is deterministic:
+ * the same board must not resolve differently on a retry.
+ */
+export function chooseInterchangeableNozzle(args: {
+  /** The nozzle a human picked, which is busy for this window. */
+  assignedId: string;
+  /** Its spec — the substitute has to match this exactly. */
+  assignedDiameterMm: number | null;
+  assignedMaterial: string | null;
+  /** The printer the job runs on — decides which swaps mean walking. */
+  printerId: string;
+  /** Nozzles this printer can mount (its compatibility roster). */
+  options: readonly NozzleOption[];
+  /** Is this nozzle uncommitted for the ENTIRE window? */
+  isFree: (nozzleAssetId: string) => boolean;
+}): NozzleOption | null {
+  const { assignedId, printerId, options, isFree } = args;
+  const wanted = nozzleSpecOf(args.assignedDiameterMm, args.assignedMaterial);
+  let best: NozzleOption | null = null;
+  let bestRank = Infinity;
+  for (const n of options) {
+    if (n.nozzle_asset_id === assignedId) continue;
+    if (n.status === UNUSABLE_NOZZLE_STATUS) continue;
+    if (nozzleSpecOf(n.nozzle_diameter_mm, n.nozzle_material) !== wanted) continue;
+    if (!isFree(n.nozzle_asset_id)) continue;
+    const rank = nozzleHandlingRank(n.installed_on, printerId);
+    if (rank < bestRank || (rank === bestRank && best !== null && n.nozzle_asset_id < best.nozzle_asset_id)) {
+      best = n;
+      bestRank = rank;
+    }
+  }
+  return best;
 }
 
 /**

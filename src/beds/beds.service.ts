@@ -12,7 +12,7 @@ import {
   recomputeOrderStatusTx,
   releasePrinterTx
 } from "../common/cascade";
-import { JobsService, isResinTech, materialFamily } from "../jobs/jobs.service";
+import { JobsService, isResinTech, materialFamily, type NozzleSwitch } from "../jobs/jobs.service";
 import { PIECE_POST_PROCESS_TRANSITIONS } from "../order-pieces/order-pieces.service";
 import type { FindCandidatesInput, ReserveSpoolsInput } from "../jobs/jobs.schemas";
 import type {
@@ -1113,7 +1113,7 @@ export class BedsService {
     companyId: string,
     bedId: string,
     input: { start_at: string }
-  ): Promise<BedRow> {
+  ): Promise<BedRow & { nozzle_switch?: NozzleSwitch }> {
     const bed = await this.loadBed(companyId, bedId);
     const bedIsResin = isResinTech(bed.required_print_technology);
     if (bed.status !== "ready" && bed.status !== "scheduled") {
@@ -1290,46 +1290,46 @@ export class BedsService {
       }
     }
 
-    // The nozzle is its own resource — reject if mounted elsewhere in-window.
-    if (bed.assigned_nozzle_asset_id) {
-      const nzPiece = await this.databaseService.query<{ piece_id: string }>(
-        `SELECT piece_id FROM order_pieces
-          WHERE company_id = $1 AND assigned_nozzle_asset_id = $2
-            AND status IN ('scheduled','printing')
-            AND scheduled_start_at < $4 AND scheduled_end_at > $3
-          LIMIT 1`,
-        [companyId, bed.assigned_nozzle_asset_id, start.toISOString(), end.toISOString()]
-      );
-      if (nzPiece.rowCount && nzPiece.rowCount > 0) {
-        throw new ConflictException("The assigned nozzle is already in use by a piece in this time slot.");
+    // The nozzle is its own resource — but WHICH of the printer's identical
+    // 0.4mm brass nozzles serves the plate is a preference, not physics. Same
+    // rule as a piece drop (JobsService.resolveNozzleForWindow, which is where
+    // it is explained): a busy nozzle is swapped for a free twin of exactly the
+    // same spec, and the placement is only refused when every twin is busy too.
+    // A bed and a piece must agree here — the board drops both onto one lane,
+    // and a bed that got rejected where a piece would have been placed is the
+    // same board giving two answers.
+    let nozzleSwitch: NozzleSwitch | null = null;
+    if (bed.assigned_nozzle_asset_id && bed.assigned_printer_id) {
+      const verdict = await this.jobsService.resolveNozzleForWindow(companyId, {
+        printerId: bed.assigned_printer_id,
+        nozzleAssetId: bed.assigned_nozzle_asset_id,
+        startIso: start.toISOString(),
+        endIso: end.toISOString(),
+        excludeBedId: bedId,
+      });
+      if (!verdict.ok) {
+        throw new ConflictException(`The assigned nozzle ${verdict.blockedBy}.`);
       }
-      const nzBed = await this.databaseService.query<{ bed_id: string }>(
-        `SELECT bed_id FROM print_beds
-          WHERE company_id = $1 AND assigned_nozzle_asset_id = $2
-            AND bed_id <> $3
-            AND status IN ('scheduled','printing')
-            AND scheduled_start_at < $5 AND scheduled_end_at > $4
-          LIMIT 1`,
-        [companyId, bed.assigned_nozzle_asset_id, bedId, start.toISOString(), end.toISOString()]
-      );
-      if (nzBed.rowCount && nzBed.rowCount > 0) {
-        throw new ConflictException("The assigned nozzle is already in use by another bed in this time slot.");
-      }
+      nozzleSwitch = verdict.switchTo;
     }
 
+    // One statement for the swap and the commitment — see the same note in
+    // JobsService.scheduleCommit.
     await this.databaseService.query(
       `UPDATE print_beds
           SET scheduled_start_at = $3,
               scheduled_end_at   = $4,
               scheduled_at       = now(),
-              status             = 'scheduled'
+              status             = 'scheduled',
+              assigned_nozzle_asset_id = COALESCE($5::uuid, assigned_nozzle_asset_id)
         WHERE company_id = $1 AND bed_id = $2`,
-      [companyId, bedId, start.toISOString(), end.toISOString()]
+      [companyId, bedId, start.toISOString(), end.toISOString(), nozzleSwitch?.to_nozzle_asset_id ?? null]
     );
     // Propagate scheduled status to child pieces so the order pages reflect
     // the bed's commitment.
     await this.propagatePieceStatus(companyId, bedId, "scheduled");
-    return this.loadBed(companyId, bedId);
+    const row = await this.loadBed(companyId, bedId);
+    return nozzleSwitch ? { ...row, nozzle_switch: nozzleSwitch } : row;
   }
 
   async unschedule(companyId: string, bedId: string): Promise<BedRow> {

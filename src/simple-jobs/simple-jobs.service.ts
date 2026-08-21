@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import type { PoolClient } from "pg";
 import { DatabaseService } from "../database/database.service";
-import { JobsService, colorCompatible, isResinTech, pickTank, techFamily } from "../jobs/jobs.service";
+import { JobsService, colorCompatible, isResinTech, pickTank, techFamily, type NozzleSwitch } from "../jobs/jobs.service";
 import { BedsService } from "../beds/beds.service";
 import { FinanceService } from "../finance/finance.service";
 import { RunsService } from "../runs/runs.service";
@@ -2709,11 +2709,11 @@ export class SimpleJobsService {
       // free nozzle rather than failing the placement — and the busy maps below
       // must then book the nozzle that was ACTUALLY taken, or the rest of the
       // batch packs around hardware nobody is using.
-      const chosenNozzle = nozzleChoice.id;
+      let chosenNozzle = nozzleChoice.id;
       const startMs = nozzleChoice.startMs;
-      const nozzleMovedFrom = nozzleChoice.movedFromPrinterId;
-      const chosenLabel = nozzleChoice.label;
-      const nozzleSwapped = nozzleChoice.swapped;
+      let nozzleMovedFrom = nozzleChoice.movedFromPrinterId;
+      let chosenLabel = nozzleChoice.label;
+      let nozzleSwapped = nozzleChoice.swapped;
 
       if (startMs + durMs > now + HORIZON_MS) {
         skipped.push({ id: c.id, is_bed: c.is_bed, name: c.name, reason: "no free slot within 60 days" });
@@ -2741,15 +2741,30 @@ export class SimpleJobsService {
             continue;
           }
         }
+        // Either commit may substitute an identical nozzle for one that turned
+        // out to be busy, and the busy maps below MUST book the nozzle actually
+        // taken — book the one we asked for and the rest of the batch packs
+        // around hardware nobody is using, and can double-book the substitute.
+        // Beds and pieces both, or a plate silently poisons the plan.
+        const adoptSwitch = (sw: NozzleSwitch | null | undefined) => {
+          if (!sw) return;
+          chosenNozzle = sw.to_nozzle_asset_id;
+          chosenLabel = sw.to_label;
+          nozzleMovedFrom = sw.moved_from_printer_id;
+          nozzleSwapped = true;
+        };
         try {
-          if (c.is_bed) await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
-          else {
+          if (c.is_bed) {
+            const bed = await this.bedsService.schedule(companyId, c.id, { start_at: startIso });
+            adoptSwitch(bed.nozzle_switch);
+          } else {
             // scheduleCommit, not schedule: same guards, same write, but it
             // leaves the parent order's status to us. Rolling an order up costs
             // an aggregate over EVERY piece in it, so doing it per piece makes
             // packing one big order O(N²) — the same shape the bulk piece
             // create fixed. Collected here, settled once each after the loop.
-            const { order_id } = await this.jobsService.scheduleCommit(companyId, c.id, { start_at: startIso });
+            const { order_id, nozzle_switch } = await this.jobsService.scheduleCommit(companyId, c.id, { start_at: startIso });
+            adoptSwitch(nozzle_switch);
             touchedOrders.add(order_id);
             committedSinceSync += 1;
             // Settle periodically as well as at the end. Deferring the rollup

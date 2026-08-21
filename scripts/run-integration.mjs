@@ -13,14 +13,75 @@
 */
 import EmbeddedPostgres from "embedded-postgres";
 import { execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
+import net from "node:net";
 
-const DATA_DIR = "./.pgtest";
-const PORT = 5433;
+/**
+ * A data directory unique to THIS run.
+ *
+ * A single fixed path collides in a way that reads like a broken install: a
+ * postmaster left behind by a killed run still holds the shared-memory segment
+ * keyed to that path, so `initdb` refuses the next run with "pre-existing
+ * shared memory block is still in use" even after the directory itself has been
+ * deleted. Unique per run means a leftover process can never block the next
+ * attempt — it only wastes memory until the machine is restarted.
+ */
+const DATA_DIR = `./.pgtest-${process.pid}`;
 
-// A leftover data directory from a killed run makes initialise() fail. It is
-// throwaway by construction, so clearing it is safe and saves a confusing error.
-rmSync(DATA_DIR, { recursive: true, force: true });
+/** Can anything listen here? */
+function bindable(port) {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once("error", () => resolve(false));
+    s.listen(port, "127.0.0.1", () => s.close(() => resolve(true)));
+  });
+}
+
+/**
+ * The first port this machine will actually give us.
+ *
+ * 5433 stays the default — deliberately not 5432, so this cannot collide with a
+ * development database someone happens to be running. But a single hard-coded
+ * port makes the whole suite unrunnable on a machine that refuses that one, and
+ * "refuses that one" is common on Windows: a firewall rule, a security product,
+ * or a reserved range (`netsh interface ipv4 show excludedportrange`) can take a
+ * port out of circulation with no way to ask for it back. Postgres reports that
+ * as a bare "could not bind ... Permission denied", which reads like a broken
+ * install rather than a busy port.
+ *
+ * So: probe, and say which port we settled on. Override with TEST_PG_PORT.
+ */
+async function choosePort() {
+  const preferred = Number(process.env.TEST_PG_PORT ?? 5433);
+  for (const port of [preferred, 5544, 6543, 15432, 25432]) {
+    if (await bindable(port)) {
+      if (port !== preferred) {
+        console.log(`Port ${preferred} is not available on this machine — using ${port} instead.`);
+      }
+      return port;
+    }
+  }
+  console.error(
+    `\nNo usable port for the throwaway Postgres (tried ${preferred}, 5544, 6543, 15432, 25432).\n` +
+    `Set TEST_PG_PORT to one this machine will allow.\n`,
+  );
+  process.exit(2);
+}
+
+const PORT = await choosePort();
+
+// Sweep directories left by earlier runs, including the old fixed `.pgtest`.
+// Every one of them is throwaway by construction. One that is still locked
+// (its postmaster survived a kill) is SKIPPED rather than fatal — this run does
+// not need it, which is the whole reason the path above carries the pid.
+for (const entry of readdirSync(".", { withFileTypes: true })) {
+  if (!entry.isDirectory() || !entry.name.startsWith(".pgtest")) continue;
+  try {
+    rmSync(entry.name, { recursive: true, force: true });
+  } catch {
+    /* still held by a stray postmaster — leave it, we are not using it */
+  }
+}
 
 const pg = new EmbeddedPostgres({
   databaseDir: DATA_DIR,
@@ -63,6 +124,7 @@ try {
       "test/batch-runs.integration.test.ts",
       "test/invite-expiry.integration.test.ts",
       "test/invite-revocation.integration.test.ts",
+      "test/nozzle-pool.integration.test.ts",
     ],
     {
       stdio: "inherit",

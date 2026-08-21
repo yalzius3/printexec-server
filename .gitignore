@@ -8,6 +8,7 @@ dist/
 uploads/*
 !uploads/.gitkeep
 
-# Throwaway Postgres data directory for npm run test:integration.
-# Deleted by the runner, but a killed run leaves it behind.
-.pgtest/
+# Throwaway Postgres data directories for npm run test:integration. One per run
+# (.pgtest-<pid>), so a killed run can never block the next one by holding the
+# shared-memory segment for a shared path. Swept on the next run.
+.pgtest*/

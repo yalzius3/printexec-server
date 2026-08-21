@@ -30,6 +30,24 @@ import type {
   UpdatePieceFilesInput,
 } from "./jobs.schemas";
 import { JOB_STATUSES } from "./jobs.schemas";
+// The scheduling kernel — pure, no Nest, no database. The rule for "are these
+// two nozzles the same thing as far as the machine is concerned?" lives there
+// because the auto-packer already needed it; a manual drop asking the same
+// question must get the same answer, so it asks the same function rather than
+// re-deriving one that could drift.
+import { chooseInterchangeableNozzle, nozzleSpecOf, type NozzleOption } from "../simple-jobs/packing";
+// SQL + folding for the nozzle pools, kept in a pure module so a test can
+// execute the statements. See the header there.
+import {
+  foldNozzlePools,
+  nozzleBusyProbeSql,
+  nozzleIdentityLabel,
+  nozzlePoolSql,
+  nozzleRosterSql,
+  type NozzlePoolRow,
+} from "./nozzle-pool";
+export type { NozzlePool, NozzlePoolMember, NozzleSwitch } from "./nozzle-pool";
+import type { NozzleSwitch } from "./nozzle-pool";
 
 // ────────────────────────────────────────────────────────────
 // Material-family compatibility.
@@ -2322,10 +2340,14 @@ export class JobsService {
     companyId: string,
     pieceId: string,
     input: ScheduleJobInput
-  ): Promise<JobRow> {
-    const { order_id } = await this.scheduleCommit(companyId, pieceId, input);
+  ): Promise<JobRow & { nozzle_switch?: NozzleSwitch }> {
+    const { order_id, nozzle_switch } = await this.scheduleCommit(companyId, pieceId, input);
     await this.syncOrderStatus(companyId, order_id);
-    return this.loadJob(companyId, pieceId);
+    const row = await this.loadJob(companyId, pieceId);
+    // Rides back on the row rather than in a separate call: the operator has to
+    // learn about a hardware change at the moment it happens, and this is the
+    // only response the drop produces.
+    return nozzle_switch ? { ...row, nozzle_switch } : row;
   }
 
   /**
@@ -2340,7 +2362,7 @@ export class JobsService {
     companyId: string,
     pieceId: string,
     input: ScheduleJobInput
-  ): Promise<{ order_id: string }> {
+  ): Promise<{ order_id: string; nozzle_switch: NozzleSwitch | null }> {
     const piece = await this.loadJob(companyId, pieceId);
     // 'assigned' is intentionally NOT allowed here — by design that status
     // means the slicer metadata is missing. The DB's chk_scheduled_requires_core_data
@@ -2558,62 +2580,56 @@ export class JobsService {
     }
 
     // The assigned nozzle is its own resource — it can't be mounted on two
-    // printers at once. Reject if it's already committed elsewhere in this
-    // window (across pieces and beds). This is the placement-time validation
-    // that the print's actual times are viable for the nozzle, not just the
-    // printer.
-    if (piece.assigned_nozzle_asset_id) {
-      const nozzlePieceOverlap = await this.databaseService.query<{ piece_id: string }>(
-        `SELECT piece_id FROM order_pieces
-          WHERE company_id = $1
-            AND assigned_nozzle_asset_id = $2
-            AND piece_id <> $3
-            AND status IN ('scheduled','printing')
-            AND scheduled_start_at < $5
-            AND scheduled_end_at   > $4
-          LIMIT 1`,
-        [companyId, piece.assigned_nozzle_asset_id, pieceId, start.toISOString(), end.toISOString()]
-      );
-      if (nozzlePieceOverlap.rowCount && nozzlePieceOverlap.rowCount > 0) {
-        throw new ConflictException(
-          "The assigned nozzle is already in use by another print in this time slot."
-        );
+    // printers at once. But WHICH 0.4mm brass nozzle runs the job is a
+    // preference, not physics: when the chosen one is committed elsewhere in
+    // this window, an identical free one takes over instead of the placement
+    // being refused. Only when every twin is busy too is the slot genuinely
+    // impossible. See resolveNozzleForWindow.
+    let nozzleSwitch: NozzleSwitch | null = null;
+    if (piece.assigned_nozzle_asset_id && piece.assigned_printer_id) {
+      const verdict = await this.resolveNozzleForWindow(companyId, {
+        printerId: piece.assigned_printer_id,
+        nozzleAssetId: piece.assigned_nozzle_asset_id,
+        startIso: start.toISOString(),
+        endIso: end.toISOString(),
+        excludePieceId: pieceId,
+      });
+      if (!verdict.ok) {
+        throw new ConflictException(`The assigned nozzle ${verdict.blockedBy}.`);
       }
-      if (await this.hasBedsTable()) {
-        const nozzleBedOverlap = await this.databaseService.query<{ bed_id: string }>(
-          `SELECT bed_id FROM print_beds
-            WHERE company_id = $1
-              AND assigned_nozzle_asset_id = $2
-              AND status IN ('scheduled','printing')
-              AND scheduled_start_at < $4
-              AND scheduled_end_at   > $3
-            LIMIT 1`,
-          [companyId, piece.assigned_nozzle_asset_id, start.toISOString(), end.toISOString()]
-        );
-        if (nozzleBedOverlap.rowCount && nozzleBedOverlap.rowCount > 0) {
-          throw new ConflictException(
-            "The assigned nozzle is already in use by a print bed in this time slot."
-          );
-        }
-      }
+      nozzleSwitch = verdict.switchTo;
     }
 
+    // The swap and the commitment land in ONE statement. Two would leave a
+    // window where a piece wears a nozzle it was never scheduled onto if the
+    // second failed — and this method has no transaction to roll that back.
     await this.databaseService.query(
       `
         UPDATE order_pieces
            SET scheduled_start_at = $3,
                scheduled_end_at   = $4,
                scheduled_at       = now(),
-               status             = 'scheduled'
+               status             = 'scheduled',
+               assigned_nozzle_asset_id = COALESCE($5::uuid, assigned_nozzle_asset_id)
          WHERE company_id = $1 AND piece_id = $2
       `,
-      [companyId, pieceId, start.toISOString(), end.toISOString()]
+      [companyId, pieceId, start.toISOString(), end.toISOString(), nozzleSwitch?.to_nozzle_asset_id ?? null]
     );
     await this.recordPieceEvent(
       companyId, piece, "scheduled",
       `Piece "${piece.piece_name}" scheduled on ${piece.assigned_printer_label ?? "a printer"} for ${start.toISOString()}.`
     );
-    return { order_id: piece.order_id };
+    if (nozzleSwitch) {
+      // Its own history line: the schedule note above would otherwise be the
+      // only record that a job changed hardware, and it doesn't say so.
+      await this.recordPieceEvent(
+        companyId, piece, "nozzle_switched",
+        `Nozzle for "${piece.piece_name}" switched to ${nozzleSwitch.to_label}` +
+        `${nozzleSwitch.displaced_by ? ` — ${nozzleSwitch.from_label ?? "the chosen nozzle"} is running "${nozzleSwitch.displaced_by}" in this slot` : ""}` +
+        `${nozzleSwitch.moved_from_printer_label ? ` (currently fitted to ${nozzleSwitch.moved_from_printer_label})` : ""}.`
+      );
+    }
+    return { order_id: piece.order_id, nozzle_switch: nozzleSwitch };
   }
 
   /** Re-derive one order's status. Public only so a batch caller that used
@@ -2728,6 +2744,140 @@ export class JobsService {
       }
     }
     return null;
+  }
+
+  /**
+   * Which nozzle should ACTUALLY serve a print committed to [start, end)?
+   *
+   * The nozzle a human picked is a preference, not a physical constraint. A
+   * shop that owns ten 0.4mm brass nozzles has ten identical ways to run a
+   * 0.4mm brass job; the operator does not know or care which one is fitted,
+   * and every one of them prints the part the same. Refusing the placement
+   * because one specific asset row is committed elsewhere is the board being
+   * precise about a distinction the workshop does not make.
+   *
+   * So: if the chosen nozzle is free, nothing happens. If it is busy, an
+   * IDENTICAL free one takes its place (same diameter + material — see
+   * `chooseInterchangeableNozzle`, which is the same interchangeability rule
+   * the auto-packer has always used, so a drop and the ⚡ packer now answer the
+   * same question the same way). Only when every twin is busy too is the
+   * placement genuinely impossible, and only then does this refuse.
+   *
+   * The substitute is REPORTED, never silent: on screen every 0.4mm brass reads
+   * identically, so an operator who is not told which one to fit has been given
+   * an instruction they cannot follow.
+   *
+   * Costs one indexed probe on the happy path (idx_order_pieces_nozzle_schedule_window),
+   * and one bounded roster read — the nozzles compatible with this ONE printer —
+   * only when there is a conflict to resolve.
+   *
+   * Read-then-write, like every other guard in scheduleCommit: two operators
+   * committing overlapping windows onto the last free twin in the same instant
+   * can both be told yes. That race is the one this method inherits rather than
+   * introduces — it is the same shape as the printer and spool checks above it,
+   * and the blast radius is the same too (a double-booked resource the board
+   * shows, not lost or corrupted work). Closing it properly means an exclusion
+   * constraint over (nozzle, window), which would close all three at once and
+   * is a migration, not a code change.
+   */
+  async resolveNozzleForWindow(
+    companyId: string,
+    opts: {
+      printerId: string;
+      nozzleAssetId: string;
+      startIso: string;
+      endIso: string;
+      /** The job's own committed block, which must not count against itself. */
+      excludePieceId?: string | null | undefined;
+      excludeBedId?: string | null | undefined;
+    }
+  ): Promise<
+    | { ok: true; switchTo: NozzleSwitch | null }
+    | { ok: false; blockedBy: string }
+  > {
+    const { printerId, nozzleAssetId, startIso, endIso } = opts;
+    const hasBeds = await this.hasBedsTable();
+    const excludePieceId = opts.excludePieceId ?? null;
+    const excludeBedId = opts.excludeBedId ?? null;
+
+    // ── Is the chosen nozzle double-booked at all? Named by the EARLIEST thing
+    //    holding it, so the refusal below can say what it is rather than "busy".
+    const busyParams: unknown[] = [companyId, nozzleAssetId, startIso, endIso, excludePieceId];
+    if (hasBeds) busyParams.push(excludeBedId);
+    const busyRes = await this.databaseService.query<{ label: string | null }>(
+      nozzleBusyProbeSql(hasBeds),
+      busyParams
+    );
+    const displacedBy = busyRes.rows[0]?.label ?? null;
+    // The overwhelmingly common case: the chosen nozzle is free, nothing to
+    // decide, and the roster below is never read.
+    if (!busyRes.rowCount) return { ok: true, switchTo: null };
+
+    // ── Busy. Look for an identical stand-in among the nozzles this printer can
+    //    mount. `busy` is computed per candidate in the same statement so the
+    //    roster arrives already answering the only question we have of it.
+    const rosterParams: unknown[] = [companyId, printerId, startIso, endIso, excludePieceId];
+    if (hasBeds) rosterParams.push(excludeBedId);
+    const roster = await this.databaseService.query<{
+      nozzle_asset_id: string;
+      nozzle_diameter_mm: string | number | null;
+      nozzle_material: string | null;
+      nozzle_name: string | null;
+      nozzle_brand: string | null;
+      location: string | null;
+      status: string;
+      installed_on: string | null;
+      installed_on_label: string | null;
+      busy: boolean;
+    }>(nozzleRosterSql(hasBeds), rosterParams);
+
+    const options: NozzleOption[] = roster.rows.map((r) => ({
+      nozzle_asset_id: r.nozzle_asset_id,
+      nozzle_diameter_mm: r.nozzle_diameter_mm != null ? Number(r.nozzle_diameter_mm) : null,
+      nozzle_material: r.nozzle_material,
+      status: r.status,
+      installed_on: r.installed_on,
+      label: nozzleIdentityLabel(r),
+    }));
+    const assigned = roster.rows.find((r) => r.nozzle_asset_id === nozzleAssetId);
+    const busyById = new Map(roster.rows.map((r) => [r.nozzle_asset_id, r.busy]));
+
+    const pick = assigned
+      ? chooseInterchangeableNozzle({
+          assignedId: nozzleAssetId,
+          assignedDiameterMm: assigned.nozzle_diameter_mm != null ? Number(assigned.nozzle_diameter_mm) : null,
+          assignedMaterial: assigned.nozzle_material,
+          printerId,
+          options,
+          isFree: (id) => busyById.get(id) === false,
+        })
+      : null;
+
+    if (!pick) {
+      // No identical nozzle is free either — the window really is impossible.
+      return {
+        ok: false,
+        blockedBy: displacedBy
+          ? `is already in use by "${displacedBy}" in this time slot, and every identical nozzle on this printer is busy too`
+          : "is already in use in this time slot",
+      };
+    }
+    const picked = roster.rows.find((r) => r.nozzle_asset_id === pick.nozzle_asset_id)!;
+    return {
+      ok: true,
+      switchTo: {
+        from_nozzle_asset_id: nozzleAssetId,
+        from_label: assigned ? nozzleIdentityLabel(assigned) : null,
+        to_nozzle_asset_id: pick.nozzle_asset_id,
+        to_label: pick.label,
+        to_location: picked.location,
+        moved_from_printer_id: picked.installed_on && picked.installed_on !== printerId ? picked.installed_on : null,
+        moved_from_printer_label: picked.installed_on && picked.installed_on !== printerId
+          ? picked.installed_on_label
+          : null,
+        displaced_by: displacedBy,
+      },
+    };
   }
 
   /** Readiness/scheduling is gated on slicer METADATA (print time + how much
@@ -3188,7 +3338,7 @@ export class JobsService {
   async printerTimeline(companyId: string, printerId: string, query: TimelineQuery) {
     const hasStl = await this.hasStlColumn();
     const hasBeds = await this.hasBedsTable();
-    const [printerRes, scheduledRes, floatingRes] = await Promise.all([
+    const [printerRes, scheduledRes, floatingRes, poolRes] = await Promise.all([
       this.databaseService.query<{
         printer_id: string;
         brand: string;
@@ -3239,6 +3389,21 @@ export class JobsService {
         ),
         [companyId, printerId]
       ),
+      // ── The printer's nozzles grouped by SPEC, each with what it is already
+      //    committed to. The board needs this to place a chip honestly: a piece
+      //    whose nozzle is busy is only actually blocked when every nozzle of
+      //    that same spec is busy, because scheduleCommit will substitute a free
+      //    twin (see resolveNozzleForWindow). Without it the board would keep
+      //    shoving drops forward past a conflict the server no longer has.
+      //
+      //    Bounded by ONE printer's compatibility roster — a handful of rows —
+      //    and the blocks are pre-filtered to those nozzles so the window scan
+      //    rides idx_order_pieces_nozzle_schedule_window rather than walking the
+      //    tenant's pieces.
+      this.databaseService.query<NozzlePoolRow>(
+        nozzlePoolSql(hasBeds),
+        [companyId, printerId, query.from, query.to]
+      ),
     ]);
 
     if (printerRes.rowCount === 0) {
@@ -3286,10 +3451,17 @@ export class JobsService {
     const withSpools = <T extends JobRow & { is_bed?: boolean }>(rows: T[]) =>
       rows.map((b) => ({ ...b, spool_asset_ids: spoolsByBlock.get(b.piece_id) ?? [] }));
 
+    // A resin machine has no nozzle at all, so it gets no pools even if a stale
+    // compatibility row survives from before that was enforced — exactly the row
+    // that once put a "0.40mm brass" lane on a Formlabs.
+    const printer = printerRes.rows[0]!;
     return {
-      printer: printerRes.rows[0]!,
+      printer,
       scheduled: [...withSpools(scheduledRes.rows), ...withSpools(bedScheduled)],
       floating: [...floatingRes.rows, ...bedFloating],
+      nozzle_pools: isResinTech(printer.print_technology)
+        ? []
+        : foldNozzlePools(poolRes.rows, nozzleSpecOf),
     };
   }
 

@@ -15,6 +15,7 @@ import {
   nextAllowedStart,
   openMsBetween,
   chooseNozzle,
+  chooseInterchangeableNozzle,
   nozzleFits,
   nozzleSpecKey,
   nozzleSpecOf,
@@ -883,6 +884,7 @@ test("compareBySlack: equal slack falls back to deadline, then to the given orde
   assert.ok(compareBySlack(a, b, T0, order) < 0);
   assert.ok(compareBySlack(b, a, T0, order) > 0);
 });
+
 // ── openMsBetween ─────────────────────────────────────────────────────────
 // The denominator behind "share of the hours you could start work in". A plan's
 // wall-clock span counts closed nights against the shop, so a fleet that fills
@@ -957,4 +959,140 @@ test("openMsBetween: agrees with a minute-by-minute count over random windows", 
     assert.equal(openMsBetween(from, to, w), brute(from, to, w),
       `window ${JSON.stringify(w)} over ${new Date(from).toISOString()}..${new Date(to).toISOString()}`);
   }
+});
+
+// ── chooseInterchangeableNozzle ────────────────────────────────────────────
+// The manual-drop counterpart of chooseNozzle: the operator has fixed WHEN, so
+// the only freedom left is WHICH physical nozzle. Same interchangeability rule
+// (diameter + material), no time trading.
+
+/** A nozzle of an arbitrary spec, for the "not identical" cases. */
+const nozzleSpec = (
+  id: string, installedOn: string | null,
+  dia: number | null, mat: string | null,
+  status = "available",
+): NozzleOption => ({
+  nozzle_asset_id: id,
+  nozzle_diameter_mm: dia,
+  nozzle_material: mat,
+  status,
+  installed_on: installedOn,
+  label: `${dia ?? "any"}mm ${mat ?? "any"} (${id})`,
+});
+
+/** The shop in the bug report: every nozzle on the printer is a 0.4mm brass. */
+const swapArgs = (options: NozzleOption[], free: string[]) => ({
+  assignedId: "A",
+  assignedDiameterMm: 0.4,
+  assignedMaterial: "brass",
+  printerId: "P1",
+  options,
+  isFree: (id: string) => free.includes(id),
+});
+
+test("chooseInterchangeableNozzle: takes an identical twin that is free", () => {
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1"), nozzle("B", "P1")], ["B"]),
+  );
+  assert.equal(got?.nozzle_asset_id, "B");
+});
+
+test("chooseInterchangeableNozzle: returns null when every twin is busy too", () => {
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1"), nozzle("B", "P1"), nozzle("C", "P1")], []),
+  );
+  assert.equal(got, null);
+});
+
+test("chooseInterchangeableNozzle: never returns the assigned nozzle itself", () => {
+  // Even if the caller wrongly reports it free, this only ever answers with a
+  // DIFFERENT nozzle — the caller's question was "what else can serve this?".
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1")], ["A"]),
+  );
+  assert.equal(got, null);
+});
+
+test("chooseInterchangeableNozzle: a different spec is NOT a substitute", () => {
+  // 0.4 hardened and 0.5 brass are both free; neither prints the same part.
+  const got = chooseInterchangeableNozzle(
+    swapArgs(
+      [nozzle("A", "P1"), nozzleSpec("H", "P1", 0.4, "hardened"), nozzleSpec("W", "P1", 0.5, "brass")],
+      ["H", "W"],
+    ),
+  );
+  assert.equal(got, null);
+});
+
+test("chooseInterchangeableNozzle: material match ignores case", () => {
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1"), nozzleSpec("B", "P1", 0.4, "Brass")], ["B"]),
+  );
+  assert.equal(got?.nozzle_asset_id, "B");
+});
+
+test("chooseInterchangeableNozzle: a damaged twin is never chosen", () => {
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1"), nozzleSpec("D", "P1", 0.4, "brass", "damaged")], ["D"]),
+  );
+  assert.equal(got, null);
+});
+
+test("chooseInterchangeableNozzle: 'installed' and 'in_use' twins are perfectly usable", () => {
+  // Only 'damaged' rules a nozzle out — a fitted nozzle is usually the one we
+  // most want, and 'in_use' is about stock bookkeeping, not this time window.
+  for (const status of ["installed", "in_use", "available"]) {
+    const got = chooseInterchangeableNozzle(
+      swapArgs([nozzle("A", "P1"), nozzleSpec("B", "P1", 0.4, "brass", status)], ["B"]),
+    );
+    assert.equal(got?.nozzle_asset_id, "B", `status ${status} should be usable`);
+  }
+});
+
+test("chooseInterchangeableNozzle: prefers a twin that needs no physical move", () => {
+  // B sits on another printer (someone must carry it); C is idle. C wins.
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1"), nozzle("B", "P2"), nozzle("C", null)], ["B", "C"]),
+  );
+  assert.equal(got?.nozzle_asset_id, "C");
+});
+
+test("chooseInterchangeableNozzle: falls back to one on another printer as a last resort", () => {
+  const got = chooseInterchangeableNozzle(
+    swapArgs([nozzle("A", "P1"), nozzle("B", "P2"), nozzle("C", null)], ["B"]),
+  );
+  assert.equal(got?.nozzle_asset_id, "B");
+  assert.equal(got?.installed_on, "P2"); // caller must surface the move
+});
+
+test("chooseInterchangeableNozzle: equal-rank ties resolve deterministically", () => {
+  // Two identical idle twins — a retry of the same drop must pick the same one,
+  // or two operators watching the same board see different answers.
+  const opts = [nozzle("A", "P1"), nozzle("Z", "P1"), nozzle("M", "P1")];
+  const first = chooseInterchangeableNozzle(swapArgs(opts, ["Z", "M"]));
+  const again = chooseInterchangeableNozzle(swapArgs([...opts].reverse(), ["Z", "M"]));
+  assert.equal(first?.nozzle_asset_id, "M");
+  assert.equal(again?.nozzle_asset_id, "M");
+});
+
+test("chooseInterchangeableNozzle: a spec-less nozzle only stands in for a spec-less one", () => {
+  // nozzleSpecOf buckets null as "any" rather than as a wildcard, so an
+  // unrecorded nozzle can't quietly stand in for a known 0.4mm brass.
+  const blank = nozzleSpec("N", "P1", null, null);
+  assert.equal(
+    chooseInterchangeableNozzle(swapArgs([nozzle("A", "P1"), blank], ["N"])),
+    null,
+  );
+  assert.equal(
+    chooseInterchangeableNozzle({
+      ...swapArgs([nozzleSpec("A", "P1", null, null), blank], ["N"]),
+      assignedDiameterMm: null,
+      assignedMaterial: null,
+    })?.nozzle_asset_id,
+    "N",
+  );
+});
+
+test("chooseInterchangeableNozzle: an empty roster yields no substitute", () => {
+  assert.equal(chooseInterchangeableNozzle(swapArgs([], ["B"])), null);
 });
