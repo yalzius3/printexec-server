@@ -13,7 +13,8 @@
     "db:inspect": "node --env-file=.env scripts/inspect-schema.mjs",
     "db:show-slicer-constraints": "node --env-file=.env scripts/show-slicer-constraints.mjs",
     "db:run-file": "node --env-file=.env scripts/run-sql-file.mjs",
-    "db:seed-refs": "node --env-file=.env scripts/seed-reference-catalog.mjs"
+    "db:seed-refs": "node --env-file=.env scripts/seed-reference-catalog.mjs",
+    "test:integration": "node scripts/run-integration.mjs"
   },
   "dependencies": {
     "@fastify/compress": "^8.3.1",
@@ -40,6 +41,7 @@
     "@nestjs/cli": "^11.0.10",
     "@nestjs/schematics": "^11.0.7",
     "@types/node": "^24.7.2",
+    "embedded-postgres": "^18.4.0-beta.17",
     "ts-loader": "^9.5.4",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",

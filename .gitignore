@@ -7,3 +7,7 @@ dist/
 *.log
 uploads/*
 !uploads/.gitkeep
+
+# Throwaway Postgres data directory for npm run test:integration.
+# Deleted by the runner, but a killed run leaves it behind.
+.pgtest/

@@ -11,15 +11,21 @@
    rearranges the whole shop floor should show a count that moves and offer a
    way to stop. Both are properties of a run, not of a request.
 
+   WHERE THE PIECES LIVE
+   Every statement is in run-store.ts, which has no Nest in it and can therefore
+   be imported by a test — this class cannot, because strip-only TypeScript
+   refuses parameter-property constructors. What stays here is the wiring: the
+   cached table probe, the detached execution, and the progress throttling.
+
    WHAT THIS IS NOT
    A job queue. No worker pool, no retry, no dispatch across processes. The row
    in batch_runs is a progress record for work running in THIS process. That is
    a deliberate ceiling, and the honest consequences are handled rather than
    hidden:
      · a run cannot outlive the process — so a restart sweeps its row to
-       'failed' with a message saying so (sweepStale below). A run that stopped
-       silently is worse than one that failed loudly: the placements it already
-       committed are real, and the operator has to know the rest are not coming.
+       'failed' with a message saying so. A run that stopped silently is worse
+       than one that failed loudly: the placements it already committed are
+       real, and the operator has to know the rest are not coming.
      · a run is not resumable — cancelling or crashing STOPS it, it never
        unwinds it. Everything committed stays committed, which is also what the
        counts have to keep saying afterwards.
@@ -30,24 +36,22 @@
 */
 import { Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import {
+  finishRun,
+  insertRun,
+  isCancelRequested,
+  readRun,
+  requestCancel,
+  runsTableExists,
+  sweepStaleRuns,
+  writeProgress,
+  writeTotal,
+  type RunKind,
+  type RunRow,
+  type TerminalRunStatus,
+} from "./run-store";
 
-export type RunKind = "auto_schedule";
-export type RunStatus = "running" | "done" | "failed" | "cancelled";
-
-export interface RunRow {
-  run_id: string;
-  kind: RunKind;
-  status: RunStatus;
-  total: number;
-  processed: number;
-  succeeded: number;
-  failed: number;
-  cancel_requested: boolean;
-  result: unknown;
-  error: string | null;
-  created_at: string;
-  finished_at: string | null;
-}
+export type { RunKind, RunRow, RunStatus } from "./run-store";
 
 /**
  * What an executor is handed. Deliberately tiny: an executor should be able to
@@ -61,8 +65,8 @@ export interface RunContext {
   setTotal(total: number): Promise<void>;
   /** One more item done. Cheap to call per item — writes are throttled. */
   advance(outcome: "succeeded" | "failed"): Promise<void>;
-  /** Has someone asked this run to stop? Cheap to call per item — reads are
-   *  throttled to the same cadence as the writes. */
+  /** Has someone asked this run to stop? Cheap to call per item — the answer
+   *  comes from the last progress write, which reads the flag back. */
   cancelled(): Promise<boolean>;
 }
 
@@ -86,15 +90,12 @@ export class RunsService {
   constructor(private readonly db: DatabaseService) {}
 
   /** Is the batch_runs migration applied? Cached after the first answer, so a
-   *  deployment that applies it mid-life needs a restart to notice — which is
-   *  the same rule every other schema probe in this codebase follows. */
+   *  deployment that applies it mid-life needs a restart to notice — the same
+   *  rule every other schema probe in this codebase follows. */
   async available(): Promise<boolean> {
     if (this.tableExists !== undefined) return this.tableExists;
     try {
-      const res = await this.db.query<{ ok: boolean }>(
-        `SELECT to_regclass('public.batch_runs') IS NOT NULL AS ok`,
-      );
-      this.tableExists = res.rows[0]?.ok === true;
+      this.tableExists = await runsTableExists(this.db);
     } catch {
       // The probe itself failed — a connection blip, not an answer about the
       // schema. Deliberately NOT cached: caching it would disable runs for the
@@ -127,13 +128,7 @@ export class RunsService {
     input: unknown,
     execute: (ctx: RunContext) => Promise<T>,
   ): Promise<string> {
-    const res = await this.db.query<{ run_id: string }>(
-      `INSERT INTO batch_runs (company_id, kind, input, created_by)
-       VALUES ($1, $2, $3::jsonb, $4)
-       RETURNING run_id`,
-      [companyId, kind, JSON.stringify(input ?? {}), userId],
-    );
-    const runId = res.rows[0]!.run_id;
+    const runId = await insertRun(this.db, { companyId, kind, input, userId });
     const { ctx, flushNow } = this.makeContext(runId);
 
     // Detached on purpose. `void` rather than a floating promise so the intent
@@ -146,14 +141,12 @@ export class RunsService {
         // this a run that finished would still show the count it had at its
         // last flush, which reads as "stopped short".
         await flushNow();
-        const stopped = await this.isCancelRequested(runId);
-        await this.finish(runId, stopped ? "cancelled" : "done", result, null);
+        const stopped = await isCancelRequested(this.db, runId);
+        await finishRun(this.db, runId, stopped ? "cancelled" : "done", result, null);
       } catch (e) {
         const message = e instanceof Error ? e.message : "The run failed.";
         this.logger.error(`Run ${runId} (${kind}) failed: ${message}`);
-        await this.finish(runId, "failed", null, message).catch(() => {
-          // Even the failure write failed — the sweep will catch this row.
-        });
+        await this.finishQuietly(runId, "failed", null, message);
       }
     })();
 
@@ -161,15 +154,7 @@ export class RunsService {
   }
 
   async get(companyId: string, runId: string): Promise<RunRow> {
-    const res = await this.db.query<RunRow>(
-      `SELECT run_id, kind, status, total, processed, succeeded, failed,
-              cancel_requested, result, error,
-              created_at::text AS created_at, finished_at::text AS finished_at
-         FROM batch_runs
-        WHERE company_id = $1 AND run_id = $2`,
-      [companyId, runId],
-    );
-    const row = res.rows[0];
+    const row = await readRun(this.db, companyId, runId);
     if (!row) throw new NotFoundException("Run not found.");
     return row;
   }
@@ -183,35 +168,17 @@ export class RunsService {
    * bigger batch operation — and one the operator did not ask for.
    */
   async cancel(companyId: string, runId: string): Promise<RunRow> {
-    await this.db.query(
-      `UPDATE batch_runs SET cancel_requested = true
-        WHERE company_id = $1 AND run_id = $2 AND status = 'running'`,
-      [companyId, runId],
-    );
+    await requestCancel(this.db, companyId, runId);
     return this.get(companyId, runId);
   }
 
   /**
    * Mark runs abandoned by a dead process as failed. Called at boot.
-   *
-   * A row still reading 'running' after a restart describes work that stopped
-   * without saying so. Its placements are committed and its remainder is never
-   * coming, so it must not sit on screen claiming to be in progress.
    */
   async sweepStale(): Promise<number> {
     if (!(await this.available())) return 0;
     try {
-      const res = await this.db.query(
-        `UPDATE batch_runs
-            SET status = 'failed',
-                finished_at = now(),
-                error = COALESCE(error,
-                  'The server restarted while this run was in progress. Anything it had already committed is saved; the rest was not run.')
-          WHERE status = 'running'
-            AND heartbeat_at < now() - ($1::int * interval '1 millisecond')`,
-        [STALE_AFTER_MS],
-      );
-      const n = res.rowCount ?? 0;
+      const n = await sweepStaleRuns(this.db, STALE_AFTER_MS);
       if (n > 0) this.logger.warn(`Swept ${n} batch run(s) abandoned by a previous process.`);
       return n;
     } catch (e) {
@@ -222,41 +189,34 @@ export class RunsService {
 
   // ── internals ────────────────────────────────────────────────────────────
 
+  /**
+   * The throttle. Counts in memory and writes rarely, because the run's whole
+   * problem is the number of statements it already issues — and because the
+   * progress write is also the cancel READ, one round trip does both.
+   */
   private makeContext(runId: string): { ctx: RunContext; flushNow: () => Promise<void> } {
     let sinceWrite = 0;
     let lastWriteAt = 0;
     let succeeded = 0;
     let failed = 0;
     let cancelKnown = false;
-    const self = this;
+    const db = this.db;
 
     const flush = async (): Promise<void> => {
       sinceWrite = 0;
       lastWriteAt = Date.now();
-      const res = await self.db.query<{ cancel_requested: boolean }>(
-        `UPDATE batch_runs
-            SET processed = $2, succeeded = $3, failed = $4, heartbeat_at = now()
-          WHERE run_id = $1
-        RETURNING cancel_requested`,
-        [runId, succeeded + failed, succeeded, failed],
-      );
-      cancelKnown = res.rows[0]?.cancel_requested === true;
+      cancelKnown = await writeProgress(db, runId, { succeeded, failed });
     };
 
     const ctx: RunContext = {
       runId,
       async setTotal(total: number) {
-        await self.db.query(
-          `UPDATE batch_runs SET total = $2, heartbeat_at = now() WHERE run_id = $1`,
-          [runId, total],
-        );
+        await writeTotal(db, runId, total);
       },
       async advance(outcome) {
         if (outcome === "succeeded") succeeded += 1;
         else failed += 1;
         sinceWrite += 1;
-        // The same write that reports progress reads the cancel flag back, so
-        // watching for a stop costs no extra round trip.
         if (sinceWrite >= PROGRESS_EVERY || Date.now() - lastWriteAt >= PROGRESS_EVERY_MS) {
           await flush();
         }
@@ -272,29 +232,19 @@ export class RunsService {
     return { ctx, flushNow: flush };
   }
 
-  private async isCancelRequested(runId: string): Promise<boolean> {
-    const res = await this.db.query<{ cancel_requested: boolean }>(
-      `SELECT cancel_requested FROM batch_runs WHERE run_id = $1`,
-      [runId],
-    );
-    return res.rows[0]?.cancel_requested === true;
-  }
-
-  private async finish(
+  /** Record a terminal state, swallowing a failure to do so. Used only on the
+   *  error path, where there is no caller left to tell: if even this write
+   *  fails the row stays 'running' and the boot sweep will catch it. */
+  private async finishQuietly(
     runId: string,
-    status: Exclude<RunStatus, "running">,
+    status: TerminalRunStatus,
     result: unknown,
     error: string | null,
   ): Promise<void> {
-    await this.db.query(
-      `UPDATE batch_runs
-          SET status = $2,
-              result = $3::jsonb,
-              error = $4,
-              finished_at = now(),
-              heartbeat_at = now()
-        WHERE run_id = $1`,
-      [runId, status, result === null || result === undefined ? null : JSON.stringify(result), error],
-    );
+    try {
+      await finishRun(this.db, runId, status, result, error);
+    } catch {
+      /* the sweep is the backstop */
+    }
   }
 }
