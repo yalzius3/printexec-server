@@ -1,19 +1,21 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from "@nestjs/common";
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+  BadRequestException,
+  ServiceUnavailableException
+} from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { emailAppUrl } from "../email/app-url";
 import { EmailService } from "../email/email.service";
 import { composeStaffInviteEmail } from "../email/email-templates";
+import { canonicalizeInviteToken, generateInviteToken } from "./invite-token";
 
-const CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-function generateToken(): string {
-  let t = "";
-  for (let i = 0; i < 8; i++) {
-    if (i === 4) t += "-";
-    t += CHARSET[Math.floor(Math.random() * CHARSET.length)];
-  }
-  return t;
-}
+// The code format lives in ONE module now — minting here and matching in
+// auth.controller's redemption path have to agree, and they did not before.
+// See invite-token.ts. Re-exported so any future import site can reach either
+// half through the service, as jobs.service.ts does for the matching kernel.
+export { canonicalizeInviteToken, generateInviteToken };
 
 export interface StaffMember {
   id: string;
@@ -142,16 +144,30 @@ export class StaffService {
   }
 
   async createInvite(companyId: string, createdBy: string): Promise<InviteRow> {
-    // Avoid collisions
-    let token = generateToken();
-    let tries = 0;
-    while (tries++ < 10) {
+    // Avoid collisions. The loop below used to check ten candidates, mint an
+    // ELEVENTH on the last failing pass, and then fall out and insert that one
+    // unchecked — so the one token guaranteed never to have been tested was the
+    // one that got written. Astronomically unlikely at 32^8, but the failure it
+    // produces is silent-wrong-answer rather than an error: with no unique
+    // constraint a duplicate row lands, and redemption reads rows[0] with no
+    // ORDER BY, so a live code can come back "already used". Claim a token only
+    // once it has actually passed a check.
+    let token = "";
+    for (let tries = 0; tries < 10; tries++) {
+      const candidate = generateInviteToken();
       const { rows } = await this.db.query(
         "SELECT 1 FROM company_invites WHERE token = $1",
-        [token]
+        [candidate]
       );
-      if (!rows.length) break;
-      token = generateToken();
+      if (!rows.length) {
+        token = candidate;
+        break;
+      }
+    }
+    if (!token) {
+      throw new ServiceUnavailableException(
+        "Could not allocate an invite code just now. Please try again."
+      );
     }
 
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();

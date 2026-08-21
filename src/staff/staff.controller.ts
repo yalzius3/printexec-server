@@ -105,7 +105,17 @@ export class StaffController {
     return this.staffService.removeStaffMember(companyId, req.userId, targetId);
   }
 
+  // Live invite codes ARE the credential — reading them is equivalent to being
+  // able to issue them, so this needs the same gate as create/revoke/email.
+  // It had none, which let any authenticated member of the company (including
+  // one with entirely empty permissions) read every outstanding code and hand
+  // out workspace access. StaffWindow already hides the column without the
+  // permission, but that was presentation only; the endpoint answered anyone.
   @Get("invites/list")
+  @RequirePermission(
+    "can_send_invites",
+    "You do not have permission to view invite codes."
+  )
   listInvites(@CompanyId() companyId: string) {
     return this.staffService.listInvites(companyId);
   }

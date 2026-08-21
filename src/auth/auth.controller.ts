@@ -11,6 +11,9 @@ import { UserRole } from "../common/user-role.decorator";
 import { Public } from "./public.decorator";
 import { buildUploadCookieHeader, signUploadCookie } from "./upload-cookie";
 import { verifyToken } from "./verify-token";
+// Redemption has to fold a typed code onto the format staff.service mints.
+// Pure module (no DI) so this is a plain import, not a module dependency.
+import { canonicalizeInviteToken } from "../staff/invite-token";
 import { z } from "zod";
 
 // Structural shape only — required-field, format, and conflict checks are run
@@ -821,6 +824,57 @@ export class AuthController {
       [userId]
     );
     if (existing.rows.length) {
+      // This branch used to return the profile unconditionally, which meant a
+      // staff submission carrying a perfectly valid invite code had that code
+      // DISCARDED in silence — never validated, never consumed, no error — and
+      // the person was dropped back into the workspace they already had. Anyone
+      // who has ever held a PrintExec account (their own trial, an abandoned
+      // signup) lands here, and from their side it is indistinguishable from
+      // "the invite code doesn't work".
+      //
+      // Retry-safe by construction: if the code was consumed BY THIS USER then
+      // the join already landed and this is a duplicate submit (a lost
+      // response, a double click, a 30s client abort), so handing back the
+      // profile is the correct idempotent answer. Any OTHER real code cannot be
+      // used by this account, and saying so is strictly better than swallowing
+      // it. A code that doesn't resolve at all falls through unchanged — an
+      // already-set-up account gains nothing from a 404 about a typo.
+      if (parsed.data.role === "staff") {
+        const token = canonicalizeInviteToken(parsed.data.invite_token ?? "");
+        if (token) {
+          // Fails OPEN. This lookup only improves an error message — it is not
+          // a gate — so a schema surprise must degrade to the old behaviour
+          // (hand back the profile) rather than turn a working request into a
+          // 500. used_by is write-only everywhere else in the codebase, and
+          // the only writer is the redemption UPDATE below, which could not
+          // have run while the byte-exact match was rejecting every code. So
+          // this is the first read of that column, and it must not be the
+          // thing that breaks setup if the column is not there.
+          let invite: { used_by: string | null } | undefined;
+          try {
+            const claimed = await this.db.query<{ used_by: string | null }>(
+              "SELECT used_by FROM company_invites WHERE token = $1",
+              [token]
+            );
+            invite = claimed.rows[0];
+          } catch (err) {
+            this.logger.warn(
+              `Could not check invite ownership for an already-set-up account: ${err instanceof Error ? err.message : err}`
+            );
+          }
+          if (invite && invite.used_by !== userId) {
+            // NOTE: AuthPage.tsx (client) matches this string EXACTLY to route
+            // the error onto the invite-code field. Change both repos in
+            // lockstep. Deliberately one message for both "code is live" and
+            // "code was spent by someone else" — this account can't use either,
+            // and distinguishing them would leak invite state to any signed-in
+            // caller willing to guess.
+            throw new ConflictException(
+              "This account already belongs to a workspace, so it can't accept an invite code. Ask the owner to invite a different email address."
+            );
+          }
+        }
+      }
       // Already set up — hand back the same full profile /auth/me would.
       return this.composeProfile(userId);
     }
@@ -1033,9 +1087,28 @@ export class AuthController {
     }
 
     // staff — validate invite with precise, split checks for exact status codes
-    const inviteToken = (parsed.data.invite_token ?? "").trim();
-    if (!inviteToken) {
+    const rawInviteToken = (parsed.data.invite_token ?? "").trim();
+    if (!rawInviteToken) {
       throw new BadRequestException("Invite code is required.");
+    }
+
+    // Fold what they typed onto the stored format BEFORE the lookup. The query
+    // below is byte-exact and codes are minted as ABCD-EFGH, so without this a
+    // correct code entered without the dash — or pasted with an en-dash, a
+    // non-breaking hyphen or a zero-width space out of the invite email — was
+    // answered "This invite code doesn't exist", which is both false and the
+    // one message guaranteed to make someone retype the identical thing.
+    // canonicalizeInviteToken only strips separators and normalizes case; it
+    // never folds one code glyph into another, so it cannot widen the match
+    // onto a different company's live code. See staff/invite-token.ts.
+    const inviteToken = canonicalizeInviteToken(rawInviteToken);
+    if (!inviteToken) {
+      // Malformed → deliberately the SAME 404 as a genuine miss. A distinct
+      // "that isn't a code" message would read better, but it would also tell a
+      // caller which guesses are shaped correctly, and AuthPage matches these
+      // strings exactly to route the error onto the invite field — reusing this
+      // one keeps the two repos in step with no client change.
+      throw new NotFoundException("This invite code doesn't exist. Check the code and try again.");
     }
 
     const inviteRow = await this.db.query<{ company_id: string; used_at: string | Date | null; expires_at: string | Date }>(
