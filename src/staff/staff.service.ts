@@ -128,17 +128,77 @@ export class StaffService {
     if (target.role === "owner") {
       throw new ForbiddenException("Cannot remove the owner.");
     }
-    await this.db.query(
-      "DELETE FROM users WHERE id = $1 AND company_id = $2",
-      [targetId, companyId]
-    );
+    // Removing someone has to take back the access they were handing out.
+    // Their outstanding invite codes stayed redeemable for the rest of their
+    // 48-hour window, so a member you had just removed could still walk a
+    // stranger into the workspace.
+    //
+    // Only UNUSED codes go. A used row is the audit record of who joined and
+    // on whose invite; destroying that would lose history, and used_by still
+    // points at a real account.
+    //
+    // One transaction, invites FIRST. If company_invites.created_by restricts
+    // deletes, clearing these rows is what lets the users row go at all — and
+    // if the users delete then fails, the revocation rolls back with it rather
+    // than destroying codes belonging to someone who is still on the team.
+    await this.db.transaction(async (client) => {
+      await this.db.query(
+        `DELETE FROM company_invites
+          WHERE company_id = $1 AND created_by = $2 AND used_at IS NULL`,
+        [companyId, targetId],
+        client
+      );
+      // The USED rows stay — they are the record of who joined. But if
+      // company_invites.created_by RESTRICTs deletes, they are also what stops
+      // the users row going at all, and removing anyone who had ever issued a
+      // redeemed code fails with a foreign-key violation. (That is pre-existing:
+      // the plain delete below has always hit it. The schema is not in this
+      // repo, so which variant production runs is unknown — see
+      // scripts/inspect-invites.sql.) Retry once with the reference released.
+      //
+      // A SAVEPOINT rather than a bare try/catch: in Postgres the first error
+      // aborts the entire transaction, so without one the retry would run
+      // inside a failed transaction and die too. Rolling back to the savepoint
+      // does NOT undo the invite revocation above — that happened before it.
+      //
+      // Nulling created_by loses nothing still readable: the creator's users
+      // row is being deleted in the same breath, so every caller already
+      // resolves that name to null through a LEFT JOIN.
+      await this.db.query("SAVEPOINT before_member_delete", [], client);
+      try {
+        await this.db.query(
+          "DELETE FROM users WHERE id = $1 AND company_id = $2",
+          [targetId, companyId],
+          client
+        );
+      } catch {
+        await this.db.query("ROLLBACK TO SAVEPOINT before_member_delete", [], client);
+        await this.db.query(
+          `UPDATE company_invites SET created_by = NULL
+            WHERE company_id = $1 AND created_by = $2 AND used_at IS NOT NULL`,
+          [companyId, targetId],
+          client
+        );
+        await this.db.query(
+          "DELETE FROM users WHERE id = $1 AND company_id = $2",
+          [targetId, companyId],
+          client
+        );
+      }
+    });
   }
 
   async listInvites(companyId: string): Promise<InviteRow[]> {
     const { rows } = await this.db.query<InviteRow>(
+      // LEFT JOIN, not JOIN. An inner join silently DROPPED every invite whose
+      // creator had since been removed from the company — so codes that were
+      // still live and still redeemable disappeared from this list, and the
+      // owner had no way to see or revoke them. The creator's name is a label;
+      // losing it must not lose the row. created_by_name is already typed
+      // `string | null` on both sides and is not rendered, so a null is inert.
       `SELECT ci.token, u.display_name AS created_by_name, ci.expires_at
        FROM company_invites ci
-       JOIN users u ON u.id = ci.created_by
+       LEFT JOIN users u ON u.id = ci.created_by
        WHERE ci.company_id = $1
          AND ci.used_at IS NULL
          AND ${inviteIsLiveSql("ci.expires_at")}
@@ -192,9 +252,13 @@ export class StaffService {
     );
 
     const { rows } = await this.db.query<InviteRow>(
+      // LEFT JOIN for the same reason as listInvites — and here it also makes
+      // the non-null assertion below honest. With an inner join this SELECT
+      // could return nothing for an invite that had just been written
+      // successfully, handing the client `undefined` as its new code.
       `SELECT ci.token, u.display_name AS created_by_name, ci.expires_at
        FROM company_invites ci
-       JOIN users u ON u.id = ci.created_by
+       LEFT JOIN users u ON u.id = ci.created_by
        WHERE ci.token = $1`,
       [token]
     );

@@ -62,6 +62,7 @@ try {
       "test/order-numbering.integration.test.ts",
       "test/batch-runs.integration.test.ts",
       "test/invite-expiry.integration.test.ts",
+      "test/invite-revocation.integration.test.ts",
     ],
     {
       stdio: "inherit",
