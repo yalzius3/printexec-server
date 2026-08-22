@@ -12,6 +12,7 @@ import { CompanyId } from "../common/company-id.decorator";
 import { RequirePermission } from "../auth/permission.decorator";
 import { parseWithSchema } from "../common/zod";
 import { BedsService } from "./beds.service";
+import { MAX_PLATE_TRIAGE } from "./outcome";
 import {
   createBedSchema,
   updateBedFilesSchema,
@@ -56,6 +57,38 @@ const completeBedSchema = z.object({
   actual_print_time_minutes: z.number().int().positive().max(100_000).optional(),
 }).strict();
 
+// Per-piece triage of a finished plate (BedsService.recordOutcome). The plate
+// verdict above stays for the all-good and all-bad cases; this one carries a
+// verdict per piece plus the material measured against each failure.
+const bedOutcomeSchema = z.object({
+  pieces: z
+    .array(
+      z.object({
+        piece_id: uuid,
+        outcome: z.enum(["done", "failed", "not_started"]),
+        // Grams on an FDM plate, millilitres on a resin one — the plate's own
+        // unit, because the piece is being measured against the plate's draw.
+        // Omitted on a failed piece means "its whole share was lost", which is
+        // the usual outcome and the same default MarkFailedModal pre-fills.
+        waste: z.number().nonnegative().max(10_000_000).optional(),
+      })
+    )
+    // Shared with the plan endpoint that FEEDS this one, which refuses to open a
+    // plate above the same number. Spelled as the constant rather than a literal
+    // so the read and the write cannot drift into disagreeing — see the note on
+    // MAX_PLATE_TRIAGE for what that drift costs an operator.
+    .max(MAX_PLATE_TRIAGE),
+  // Where each group of re-queued pieces lands. Separate because they are
+  // different situations: a failure usually goes back to the same machine to be
+  // re-run, while work that never started is often re-planned from scratch.
+  failed_requeue_to: z.enum(["assigned", "pending"]).default("pending"),
+  not_started_requeue_to: z.enum(["assigned", "pending"]).default("pending"),
+  // Why the plate failed, in the operator's words — recorded once against every
+  // failed piece, the same way markFailed records it against one.
+  failure_reason: z.string().trim().max(500).optional(),
+  actual_print_time_minutes: z.number().int().positive().max(100_000).optional(),
+}).strict();
+
 @Controller("beds")
 export class BedsController {
   constructor(private readonly beds: BedsService) {}
@@ -76,6 +109,14 @@ export class BedsController {
   @RequirePermission("view_orders")
   pieces(@CompanyId() companyId: string, @Param("bedId") bedId: string) {
     return this.beds.pieces(companyId, bedId);
+  }
+
+  // Everything the triage console opens with, including each piece's share of
+  // the plate's material — computed here so the client never re-derives it.
+  @Get(":bedId/outcome-plan")
+  @RequirePermission("view_orders")
+  outcomePlan(@CompanyId() companyId: string, @Param("bedId") bedId: string) {
+    return this.beds.outcomePlan(companyId, bedId);
   }
 
   @Get(":bedId/filament-plan")
@@ -209,6 +250,25 @@ export class BedsController {
     @Body() body: unknown
   ) {
     return this.beds.complete(companyId, bedId, parseWithSchema(completeBedSchema, body));
+  }
+
+  // Triage a finished plate piece by piece: which parts came off good, which
+  // failed and cost material, and which were never printed at all. Settles the
+  // plate's material three ways, then dismantles it.
+  @Post(":bedId/outcome")
+  @RequirePermission("action_orders")
+  outcome(
+    @CompanyId() companyId: string,
+    @Param("bedId") bedId: string,
+    @Body() body: unknown,
+    @Req() req: AuthRequest
+  ) {
+    return this.beds.recordOutcome(
+      companyId,
+      req.userId,
+      bedId,
+      parseWithSchema(bedOutcomeSchema, body)
+    );
   }
 
   @Post(":bedId/cancel")

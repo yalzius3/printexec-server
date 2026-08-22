@@ -5,14 +5,20 @@ import {
   NotFoundException,
 } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
-import { recordOrderHistory } from "../common/order-history";
+import {
+  recordOrderHistory,
+  recordOrderHistoryBatch,
+  type OrderHistoryEvent
+} from "../common/order-history";
 import {
   quoteAssumedMeta,
   releasePieceSpoolsTx,
   recomputeOrderStatusTx,
   releasePrinterTx
 } from "../common/cascade";
+import { FinanceService } from "../finance/finance.service";
 import { JobsService, isResinTech, materialFamily, type NozzleSwitch } from "../jobs/jobs.service";
+import { MAX_PLATE_TRIAGE, pieceShares, requeueStatus, settlePlate, splitAcrossSpools } from "./outcome";
 import { PIECE_POST_PROCESS_TRANSITIONS } from "../order-pieces/order-pieces.service";
 import type { FindCandidatesInput, ReserveSpoolsInput } from "../jobs/jobs.schemas";
 import type {
@@ -80,6 +86,64 @@ export interface BedRow {
   customer_names: string | null;
 }
 
+/** Payload of POST /beds/:bedId/outcome — see BedsService.recordOutcome. */
+export interface BedOutcomeInput {
+  pieces: {
+    piece_id: string;
+    outcome: "done" | "failed" | "not_started";
+    waste?: number | undefined;
+  }[];
+  failed_requeue_to: "assigned" | "pending";
+  not_started_requeue_to: "assigned" | "pending";
+  failure_reason?: string | undefined;
+  actual_print_time_minutes?: number | undefined;
+}
+
+/** One row of the triage console. `share` is the server's answer to "how much
+ *  of the plate is this piece" — the client never derives it. */
+export interface BedOutcomePlanPiece {
+  piece_id: string;
+  piece_name: string;
+  order_id: string;
+  order_number: string;
+  customer_name: string | null;
+  order_deadline: string | null;
+  share: number;
+}
+
+/** Response of GET /beds/:bedId/outcome-plan. */
+export interface BedOutcomePlan {
+  bed_id: string;
+  bed_name: string;
+  status: string;
+  unit: "g" | "ml";
+  is_resin: boolean;
+  plate_quantity: number;
+  has_printer: boolean;
+  printer_label: string | null;
+  printer_technology: string | null;
+  printer_marker: string | null;
+  pieces: BedOutcomePlanPiece[];
+}
+
+/** What the console shows the operator once the plate has been settled. */
+export interface BedOutcomeResult {
+  bed_id: string;
+  bed_status: "done" | "failed";
+  done: number;
+  failed: number;
+  not_started: number;
+  failed_requeued_to: "assigned" | "pending";
+  not_started_requeued_to: "assigned" | "pending";
+  /** The plate's own unit — 'g' on filament, 'ml' on resin. */
+  unit: "g" | "ml";
+  plate_quantity: number;
+  consumed: number;
+  wasted: number;
+  returned_to_stock: number;
+  waste_cost: number;
+}
+
 interface PieceForBed {
   piece_id: string;
   piece_name: string;
@@ -116,7 +180,11 @@ const BED_FULFILMENT_LABELS: Record<string, string> = {
 export class BedsService {
   constructor(
     private readonly databaseService: DatabaseService,
-    private readonly jobsService: JobsService
+    private readonly jobsService: JobsService,
+    // Books measured plate waste to the ledger (recordOutcome), the same way
+    // SimpleJobsService books a single failed piece. One-way: FinanceModule
+    // reaches Orders and Email and neither reaches back here, so no cycle.
+    private readonly finance: FinanceService
   ) {}
 
   // ──────────────────────────────────────────────────────────
@@ -1427,6 +1495,574 @@ export class BedsService {
       }
     }
     return this.loadBed(companyId, bedId);
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // GET /api/beds/:bedId/outcome-plan — everything the triage console needs to
+  // open, in one round trip.
+  //
+  // The only field here that is not already on the plate is `share`, and it is
+  // the reason this endpoint exists rather than the console deriving what it
+  // needs from GET /pieces. A piece's share of the plate's material is a MONEY
+  // rule: it decides how much stock a good part consumes and what a failure is
+  // pre-filled with. Deriving it a second time in the client — in another
+  // language, with another rounding behaviour, in another repository that
+  // cannot import this one — is exactly how two answers to one question start
+  // disagreeing. So the server computes it with the same kernel the settle uses,
+  // and the console only ever ADDS UP numbers it was handed.
+  // ──────────────────────────────────────────────────────────
+  async outcomePlan(companyId: string, bedId: string): Promise<BedOutcomePlan> {
+    const bed = await this.loadBed(companyId, bedId);
+    const bedIsResin = isResinTech(bed.required_print_technology);
+    const plateQuantity = bedIsResin
+      ? Number(bed.slicer_resin_used_ml ?? 0)
+      : Number(bed.slicer_filament_used_grams ?? 0);
+
+    const res = await this.databaseService.query<{
+      piece_id: string;
+      piece_name: string;
+      order_id: string;
+      order_number: string;
+      customer_name: string | null;
+      order_deadline: string | null;
+      cost_inputs: { grams?: string[]; time?: string } | null;
+    }>(
+      `SELECT op.piece_id, op.piece_name, op.order_id, o.order_number,
+              COALESCE(
+                NULLIF(cu.business_name, ''),
+                NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
+              ) AS customer_name,
+              o.deadline::text AS order_deadline,
+              op.cost_inputs
+         FROM order_pieces op
+         JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
+         LEFT JOIN customers cu ON cu.customer_id = o.customer_id
+        WHERE op.company_id = $1 AND op.bed_id = $2
+        ORDER BY o.order_number, op.piece_name, op.piece_id`,
+      [companyId, bedId]
+    );
+
+    // Refuse to OPEN what cannot be committed. The settle caps the batch at the
+    // same constant, and discovering that after triaging every row is the one
+    // outcome worth spending a round trip to prevent.
+    if (res.rows.length > MAX_PLATE_TRIAGE) {
+      throw new BadRequestException(
+        `This plate holds ${res.rows.length.toLocaleString()} pieces, more than the ` +
+          `${MAX_PLATE_TRIAGE.toLocaleString()} that can be settled in one pass. ` +
+          `Split the plate, or settle it with Mark done / Mark failed.`
+      );
+    }
+
+    const shares = pieceShares(
+      res.rows.map((p) => ({
+        piece_id: p.piece_id,
+        quoteQuantity: quoteAssumedMeta(p.cost_inputs).grams
+      })),
+      plateQuantity
+    );
+
+    return {
+      bed_id: bed.bed_id,
+      bed_name: bed.bed_name,
+      status: bed.status,
+      unit: bedIsResin ? "ml" : "g",
+      is_resin: bedIsResin,
+      plate_quantity: Math.round(plateQuantity * 100) / 100,
+      // Whether 'assigned' is even offerable: without a printer to inherit, a
+      // detached piece cannot hold that status (chk_assigned_requires_printer),
+      // and the console must not present a choice the write will silently
+      // downgrade.
+      has_printer: bed.assigned_printer_id != null,
+      printer_label: bed.assigned_printer_label,
+      printer_technology: bed.assigned_printer_technology,
+      printer_marker: bed.assigned_printer_marker,
+      pieces: res.rows.map((p) => ({
+        piece_id: p.piece_id,
+        piece_name: p.piece_name,
+        order_id: p.order_id,
+        order_number: p.order_number,
+        customer_name: p.customer_name,
+        order_deadline: p.order_deadline,
+        share: Math.round((shares.get(p.piece_id) ?? 0) * 100) / 100
+      }))
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // POST /api/beds/:bedId/outcome — triage a finished plate PIECE BY PIECE.
+  //
+  // `complete()` above settles a plate as one thing: everything succeeded, or
+  // everything failed. That is the truth for a small plate and a lie for a big
+  // one. A plate of 300 parts routinely comes off with most of them good, a
+  // handful warped or detached, and — when the run was stopped part-way — a
+  // whole region that was never laid down at all. Forcing that into one verdict
+  // meant either scrapping 288 good parts or quietly booking 12 failures as
+  // successes, and then re-printing the whole plate to recover the difference.
+  //
+  // So this takes a verdict per piece and settles the three groups differently:
+  //
+  //   done        → the part is finished; its share of the plate's material is
+  //                 deducted as ordinary consumption.
+  //   failed      → the operator's MEASURED loss is deducted and booked to the
+  //                 ledger as spoilage, and the piece goes back in the queue.
+  //   not started → nothing is deducted, because nothing was ever extruded for
+  //                 it, and the piece goes back in the queue.
+  //
+  // The arithmetic lives in ./outcome.ts, where it is proven on its own against
+  // every shape of plate (see test/bed-outcome.test.ts) — this method is the
+  // I/O around it: read the plate, settle the material, dismantle, re-queue.
+  //
+  // THE PLATE IS FULLY DISMANTLED. Every piece detaches, the good ones included:
+  // the arrangement described one run, and that run is over. The good parts
+  // continue as ordinary standalone pieces (they walk their own shipping
+  // lifecycle through the order-pieces endpoints), and the rest go back to the
+  // queue to be re-packed onto a new plate. The bed row itself survives as the
+  // record of what the run achieved — status, timings, and the waste it caused —
+  // and drops out of the working queue on its own, because every queue read
+  // gates a plate on it still having pieces.
+  //
+  // Deliberately additive: `complete()` is untouched and still serves the
+  // all-good and all-bad cases in one click.
+  // ──────────────────────────────────────────────────────────
+  async recordOutcome(
+    companyId: string,
+    userId: string | null,
+    bedId: string,
+    input: BedOutcomeInput
+  ): Promise<BedOutcomeResult> {
+    const bed = await this.loadBed(companyId, bedId);
+    // Same gate as complete(): only a plate that is on (or committed to) a
+    // machine has a run to report on.
+    if (bed.status !== "printing" && bed.status !== "scheduled") {
+      throw new ConflictException(
+        `Only a printing or scheduled plate can be triaged (current: '${bed.status}').`
+      );
+    }
+
+    const pieceRes = await this.databaseService.query<{
+      piece_id: string;
+      piece_name: string;
+      order_id: string;
+      order_number: string;
+      cost_inputs: { grams?: string[]; time?: string } | null;
+    }>(
+      `SELECT op.piece_id, op.piece_name, op.order_id, o.order_number, op.cost_inputs
+         FROM order_pieces op
+         JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
+        WHERE op.company_id = $1 AND op.bed_id = $2
+        ORDER BY op.piece_id`,
+      [companyId, bedId]
+    );
+    const platePieces = pieceRes.rows;
+    if (platePieces.length === 0) {
+      throw new BadRequestException("This plate has no pieces left to triage.");
+    }
+
+    // Every id in the payload must be ON this plate. Fails CLOSED: a stray id is
+    // refused outright rather than ignored, because the two ways it can arise —
+    // a stale console whose plate changed underneath it, and a piece id from a
+    // different plate — both mean the operator is looking at something other
+    // than what they are about to settle.
+    const onPlate = new Set(platePieces.map((p) => p.piece_id));
+    const stray = input.pieces.filter((p) => !onPlate.has(p.piece_id));
+    if (stray.length > 0) {
+      throw new BadRequestException(
+        `${stray.length} of the pieces submitted are not on this plate — reopen it and try again.`
+      );
+    }
+
+    const bedIsResin = isResinTech(bed.required_print_technology);
+    // The plate's planned draw, in ITS OWN unit. Both columns are exclusive by
+    // construction (a plate is one technology), so reading the wrong one yields
+    // a permanent null and would settle every plate as if it had cost nothing.
+    const plateQuantity = bedIsResin
+      ? Number(bed.slicer_resin_used_ml ?? 0)
+      : Number(bed.slicer_filament_used_grams ?? 0);
+
+    const settlement = settlePlate(
+      platePieces.map((p) => ({
+        piece_id: p.piece_id,
+        // The piece's quote quantity is read in the plate's unit — the quote's
+        // quantity box holds millilitres on a resin piece — which is exactly
+        // why the same accessor serves both (see BedsService.assign's seeding).
+        quoteQuantity: quoteAssumedMeta(p.cost_inputs).grams
+      })),
+      input.pieces,
+      plateQuantity,
+      // Resin waste is capped at what the job drew; filament waste is not.
+      bedIsResin
+    );
+
+    // A plate that produced ANY good part is a plate that ran. Only a run that
+    // yielded nothing at all is a failure of the plate as a whole.
+    const bedOutcome: "done" | "failed" = settlement.doneCount > 0 ? "done" : "failed";
+
+    const byOutcome = new Map(settlement.pieces.map((p) => [p.piece_id, p]));
+    // Indexed rather than scanned: the failure loops below run once per failed
+    // piece, and a linear `find` inside them turns a 300-piece plate into 90,000
+    // comparisons for no reason.
+    const pieceById = new Map(platePieces.map((p) => [p.piece_id, p]));
+    const doneIds: string[] = [];
+    const failedIds: string[] = [];
+    const notStartedIds: string[] = [];
+    for (const p of settlement.pieces) {
+      if (p.outcome === "done") doneIds.push(p.piece_id);
+      else if (p.outcome === "failed") failedIds.push(p.piece_id);
+      else notStartedIds.push(p.piece_id);
+    }
+
+    // Where each re-queued group lands. `requeueStatus` downgrades 'assigned' to
+    // 'pending' when there is no printer to inherit — detaching the piece
+    // revokes the bed_id escape that let it sit statusless, and 'assigned'
+    // without a printer is a CHECK violation, not a validation message.
+    const failedTo = requeueStatus(input.failed_requeue_to, bed.assigned_printer_id);
+    const notStartedTo = requeueStatus(input.not_started_requeue_to, bed.assigned_printer_id);
+
+    const reason = (input.failure_reason ?? "").trim();
+    const unitLabel = bedIsResin ? "ml" : "g";
+    let bookedWaste = { quantity: 0, cost: 0 };
+
+    await this.databaseService.transaction(async (client) => {
+      const pieceIds = platePieces.map((p) => p.piece_id);
+
+      // ── 0. Claim the plate ──────────────────────────────────────────────
+      // Re-read the status under a row lock and re-assert it. The check at the
+      // top of this method ran OUTSIDE any transaction, so two operators
+      // triaging the same plate — or one double-clicking through a slow
+      // response — can both pass it and both proceed to settle. That is not a
+      // duplicated no-op: it deducts the material twice and posts the spoilage
+      // to the ledger twice, and neither is visible afterwards without
+      // reconciling the spool against the shelf.
+      //
+      // FOR UPDATE makes the second caller wait for the first to commit, at
+      // which point the plate is no longer 'printing' and this throws instead.
+      const claim = await client.query<{ status: string }>(
+        `SELECT status FROM print_beds
+          WHERE company_id = $1 AND bed_id = $2
+          FOR UPDATE`,
+        [companyId, bedId]
+      );
+      const claimed = claim.rows[0];
+      if (!claimed) throw new NotFoundException("Bed not found.");
+      if (claimed.status !== "printing" && claimed.status !== "scheduled") {
+        throw new ConflictException(
+          `This plate was already settled (it is now '${claimed.status}') — reopen it to see the outcome.`
+        );
+      }
+
+      // ── 1. Settle the material ──────────────────────────────────────────
+      // Order matters here and is not interchangeable: the reservation rows are
+      // read before anything is written, the stock is moved while the pieces are
+      // still attached, and the rows are deleted before any status changes. The
+      // reservation is anchored on ONE child piece and `asset_stock.reserved_grams`
+      // is recomputed by a trigger over those rows — detaching or re-statusing a
+      // piece first would strand the reservation against stock that is no longer
+      // going anywhere.
+      if (bedIsResin) {
+        if (bed.resin_tank_id && settlement.deduct > 0) {
+          await client.query(
+            `UPDATE asset_stock
+                SET remaining_volume_ml = GREATEST(0, COALESCE(remaining_volume_ml, 0) - $2),
+                    status = CASE
+                               WHEN GREATEST(0, COALESCE(remaining_volume_ml, 0) - $2) <= 0
+                                 THEN 'empty' ELSE status
+                             END
+              WHERE asset_id = $1`,
+            [bed.resin_tank_id, settlement.deduct]
+          );
+        }
+        if (bed.resin_tank_id && settlement.wasteTotal > 0) {
+          const tankId = bed.resin_tank_id;
+          bookedWaste = await this.finance.recordPlateWaste(client, companyId, userId, {
+            unit: "ml",
+            bedName: bed.bed_name,
+            entries: failedIds.map((id) => ({
+              pieceId: id,
+              orderId: pieceById.get(id)!.order_id,
+              assetId: tankId,
+              quantity: byOutcome.get(id)?.waste ?? 0
+            }))
+          });
+        }
+      } else {
+        const reserved = await client.query<{ spool_asset_id: string; planned_grams: string }>(
+          `SELECT spool_asset_id, planned_grams
+             FROM order_piece_spools
+            WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          [companyId, pieceIds]
+        );
+        const spools = reserved.rows.map((r) => ({
+          spoolAssetId: r.spool_asset_id,
+          plannedGrams: Number(r.planned_grams)
+        }));
+
+        // What physically left the spools: the good parts' share plus every
+        // measured loss. The remainder is simply never deducted — it is not a
+        // second write, which is what makes it impossible for "consumed" and
+        // "returned" to drift apart.
+        for (const alloc of splitAcrossSpools(spools, settlement.deduct)) {
+          await client.query(
+            `UPDATE asset_stock
+                SET remaining_grams = GREATEST(0, COALESCE(remaining_grams, 0) - $2),
+                    status = CASE
+                               WHEN GREATEST(0, COALESCE(remaining_grams, 0) - $2) <= 0
+                                 THEN 'empty' ELSE status
+                             END
+              WHERE asset_id = $1`,
+            [alloc.spoolAssetId, alloc.grams]
+          );
+        }
+
+        if (settlement.wasteTotal > 0 && spools.length > 0) {
+          // Each failed piece's loss, split across the plate's spools by the
+          // same proportional rule the deduction used — so the ledger can never
+          // charge a spool the stock update did not.
+          const entries: {
+            pieceId: string;
+            orderId: string;
+            assetId: string;
+            quantity: number;
+          }[] = [];
+          for (const id of failedIds) {
+            const waste = byOutcome.get(id)?.waste ?? 0;
+            if (!(waste > 0)) continue;
+            const orderId = pieceById.get(id)!.order_id;
+            for (const alloc of splitAcrossSpools(spools, waste)) {
+              entries.push({
+                pieceId: id,
+                orderId,
+                assetId: alloc.spoolAssetId,
+                quantity: alloc.grams
+              });
+            }
+          }
+          bookedWaste = await this.finance.recordPlateWaste(client, companyId, userId, {
+            unit: "g",
+            bedName: bed.bed_name,
+            entries
+          });
+        }
+
+        // Release what is left of the reservation. The plate is finished either
+        // way: any material it did not consume goes back to being free stock,
+        // not stock held against a run that has already happened.
+        await client.query(
+          `DELETE FROM order_piece_spools WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          [companyId, pieceIds]
+        );
+      }
+
+      // ── 2. Close the plate ──────────────────────────────────────────────
+      // Identical to complete()'s stamp, so a triaged plate and a completed one
+      // carry the same evidence of when it ran and for how long.
+      await client.query(
+        `UPDATE print_beds
+            SET status                    = $3,
+                print_started_at          = COALESCE(print_started_at, scheduled_start_at, now()),
+                print_completed_at        = now(),
+                actual_print_time_minutes = COALESCE($4, actual_print_time_minutes)
+          WHERE company_id = $1 AND bed_id = $2`,
+        [companyId, bedId, bedOutcome, input.actual_print_time_minutes ?? null]
+      );
+
+      // ── 3. Dismantle ────────────────────────────────────────────────────
+      // Three set-based writes, one per destination — not a loop over pieces.
+      // Each clears bed_id in the SAME statement that sets the status, so the
+      // row is never momentarily a detached piece holding a status it cannot
+      // satisfy.
+      if (doneIds.length > 0) {
+        // The good parts keep every field they already had. Their printer and
+        // slicer columns have been null the whole time the bed owned them, and
+        // filling them in now would be inventing a record the all-or-nothing
+        // path never wrote — the plate's own row is where this run is recorded.
+        await client.query(
+          `UPDATE order_pieces
+              SET status = 'done', bed_id = NULL
+            WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          [companyId, doneIds]
+        );
+      }
+
+      // Re-queued pieces, grouped by where they land rather than by why they
+      // got there: 'assigned' inherits the plate's machine and tooling so it can
+      // be re-dropped straight onto it, 'pending' is a clean slate.
+      const toAssigned = [
+        ...(failedTo === "assigned" ? failedIds : []),
+        ...(notStartedTo === "assigned" ? notStartedIds : [])
+      ];
+      const toPending = [
+        ...(failedTo === "pending" ? failedIds : []),
+        ...(notStartedTo === "pending" ? notStartedIds : [])
+      ];
+
+      if (toAssigned.length > 0) {
+        await client.query(
+          `UPDATE order_pieces
+              SET bed_id                     = NULL,
+                  status                     = 'assigned',
+                  assigned_printer_id        = $3,
+                  -- The plate's tooling, in the piece's own technology. A resin
+                  -- piece must not inherit a nozzle (it has no hotend) and an
+                  -- FDM piece must not inherit a tank; both columns are cleared
+                  -- on the wrong side rather than left to a COALESCE, which is
+                  -- what once kept a ghost nozzle on resin work forever.
+                  assigned_nozzle_asset_id   = $4,
+                  resin_tank_id              = $5,
+                  scheduled_start_at         = NULL,
+                  scheduled_end_at           = NULL,
+                  scheduled_at               = NULL,
+                  slicer_file_url            = NULL,
+                  slicer_file_uploaded_at    = NULL,
+                  slicer_print_time_minutes  = NULL,
+                  slicer_filament_used_grams = NULL,
+                  slicer_resin_used_ml       = NULL
+            WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          [
+            companyId,
+            toAssigned,
+            bed.assigned_printer_id,
+            bedIsResin ? null : bed.assigned_nozzle_asset_id,
+            bedIsResin ? bed.resin_tank_id : null
+          ]
+        );
+      }
+
+      if (toPending.length > 0) {
+        // Byte-for-byte the clearing bulkUnassign performs, so a piece pulled
+        // back from a plate is indistinguishable from one pulled back from a
+        // printer — there is one definition of "back in the pending pool".
+        await client.query(
+          `UPDATE order_pieces
+              SET bed_id                     = NULL,
+                  status                     = 'pending',
+                  assigned_printer_id        = NULL,
+                  assigned_nozzle_asset_id   = NULL,
+                  resin_tank_id              = NULL,
+                  scheduled_start_at         = NULL,
+                  scheduled_end_at           = NULL,
+                  scheduled_at               = NULL,
+                  slicer_file_url            = NULL,
+                  slicer_file_uploaded_at    = NULL,
+                  slicer_print_time_minutes  = NULL,
+                  slicer_filament_used_grams = NULL,
+                  slicer_resin_used_ml       = NULL
+            WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
+          [companyId, toPending]
+        );
+      }
+
+      // A finished resin print is not a finished PART — it comes off the plate
+      // coated in uncured resin and still has to be washed and cured. Same stamp
+      // complete() applies, and the same tolerance for the column not existing
+      // yet: the parts are correctly 'done' either way.
+      if (bedIsResin && doneIds.length > 0) {
+        try {
+          await client.query(
+            `UPDATE order_pieces
+                SET post_process_state = 'print_done',
+                    post_process_state_entered_at = now()
+              WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+                AND status = 'done'
+                AND post_process_state IS NULL`,
+            [companyId, doneIds]
+          );
+        } catch (e) {
+          if ((e as { code?: string } | null)?.code !== "42703") throw e;
+        }
+      }
+
+      // ── 4. Record what happened ─────────────────────────────────────────
+      // Per-piece detail for the FAILURES only, because that is where a number
+      // was recorded that nobody can reconstruct later — what was lost, and why.
+      // A done or never-started piece is fully described by the plate's own
+      // summary line, and writing three hundred of those per triage would bury
+      // the entries that matter under the ones that do not.
+      const events: OrderHistoryEvent[] = [];
+      for (const id of failedIds) {
+        const p = pieceById.get(id)!;
+        const waste = byOutcome.get(id)?.waste ?? 0;
+        events.push({
+          entityType: "piece",
+          eventType: "piece_failed",
+          orderId: p.order_id,
+          orderNumber: p.order_number,
+          pieceId: p.piece_id,
+          pieceName: p.piece_name,
+          description:
+            `Piece "${p.piece_name}" failed on plate "${bed.bed_name}" — ` +
+            `${Math.round(waste)}${unitLabel} wasted, returned to ${failedTo}.` +
+            (reason ? ` Reason: ${reason}` : "")
+        });
+      }
+
+      // One summary per affected order. A plate can span several, and each
+      // order's history should be able to explain its own pieces without the
+      // reader having to find the plate.
+      // Tallied in ONE pass over the plate rather than re-filtering it per
+      // order: a plate spanning fifty orders would otherwise walk all three
+      // hundred pieces fifty times over to produce fifty short sentences.
+      type OrderTally = {
+        orderNumber: string;
+        done: number;
+        failed: number;
+        notStarted: number;
+        lost: number;
+      };
+      const affectedOrders = new Map<string, OrderTally>();
+      for (const p of platePieces) {
+        let tally = affectedOrders.get(p.order_id);
+        if (!tally) {
+          tally = { orderNumber: p.order_number, done: 0, failed: 0, notStarted: 0, lost: 0 };
+          affectedOrders.set(p.order_id, tally);
+        }
+        const settled = byOutcome.get(p.piece_id);
+        if (settled?.outcome === "done") tally.done += 1;
+        else if (settled?.outcome === "failed") {
+          tally.failed += 1;
+          tally.lost += settled.waste;
+        } else tally.notStarted += 1;
+      }
+      for (const [orderId, t] of affectedOrders) {
+        events.push({
+          entityType: "order",
+          eventType: "bed_outcome_recorded",
+          orderId,
+          orderNumber: t.orderNumber,
+          description:
+            `Plate "${bed.bed_name}" triaged — ${t.done} done, ${t.failed} failed, ` +
+            `${t.notStarted} not started` +
+            (t.lost > 0 ? ` (${Math.round(t.lost)}${unitLabel} wasted)` : "") +
+            `. The plate was dismantled.`
+        });
+      }
+      await recordOrderHistoryBatch(client, companyId, events);
+
+      // Every touched order re-derives its own status: pieces moved in both
+      // directions here, so an order can equally have just been completed or
+      // just been pushed back into preparation.
+      for (const orderId of affectedOrders.keys()) {
+        await recomputeOrderStatusTx(client, companyId, orderId);
+      }
+    });
+
+    return {
+      bed_id: bedId,
+      bed_status: bedOutcome,
+      done: settlement.doneCount,
+      failed: settlement.failedCount,
+      not_started: settlement.notStartedCount,
+      failed_requeued_to: failedTo,
+      not_started_requeued_to: notStartedTo,
+      unit: unitLabel,
+      // What the plate planned, what left stock, what was booked as spoilage,
+      // and what stayed on the spool. Reported together so the console can show
+      // the operator the whole settlement rather than just the part they typed.
+      plate_quantity: Math.round(plateQuantity * 100) / 100,
+      consumed: Math.round(settlement.deduct * 100) / 100,
+      wasted: Math.round(settlement.wasteTotal * 100) / 100,
+      returned_to_stock: Math.round(settlement.untouched * 100) / 100,
+      waste_cost: Math.round(bookedWaste.cost * 100) / 100
+    };
   }
 
   async cancel(companyId: string, bedId: string): Promise<BedRow> {

@@ -270,8 +270,44 @@ export class FinanceService {
     const spools = params.wasteBySpool.filter((w) => w.grams > 0);
     if (spools.length === 0) return { grams: 0, cost: 0 };
 
-    const spoolIds = spools.map((s) => s.spoolAssetId);
+    const priced = await this.priceSpools(client, companyId, spools.map((s) => s.spoolAssetId));
 
+    type WasteRow = {
+      spoolAssetId: string;
+      materialType: string | null;
+      grams: number;
+      unit: number;
+      costCents: number;
+    };
+    const rows: WasteRow[] = spools.map((w) => {
+      const { material, unit } = priced(w.spoolAssetId);
+      return {
+        spoolAssetId: w.spoolAssetId,
+        materialType: material,
+        grams: w.grams,
+        unit,
+        costCents: Math.round(w.grams * unit * 100)
+      };
+    });
+
+    return this.bookMaterialWaste(client, companyId, userId, params, rows, "g", "Filament");
+  }
+
+  /**
+   * Price a set of spools per gram: the spool's own cost basis
+   * (purchase_price / initial_grams), falling back to the company's average for
+   * that material — the same two-tier rule order costing uses.
+   *
+   * Extracted so the single-piece recorder above and the whole-plate one below
+   * cannot drift into pricing the same spool differently. Two queries no matter
+   * how many spools are asked about, which is what lets a plate settle 300
+   * failed pieces without 300 round trips.
+   */
+  private async priceSpools(
+    client: PoolClient,
+    companyId: string,
+    spoolIds: readonly string[]
+  ): Promise<(spoolAssetId: string) => { material: string | null; unit: number }> {
     // Each spool's material + its own price/g (NULL when unpriced).
     const spoolMeta = await this.databaseService.query<{
       asset_id: string;
@@ -285,7 +321,7 @@ export class FinanceService {
          FROM asset_instances ai
          LEFT JOIN filament_reference fr ON fr.filament_ref_id = ai.filament_ref_id
         WHERE ai.company_id = $1 AND ai.asset_id = ANY($2::uuid[])`,
-      [companyId, spoolIds],
+      [companyId, [...spoolIds]],
       client
     );
     const metaById = new Map(spoolMeta.rows.map((r) => [r.asset_id, r]));
@@ -312,54 +348,26 @@ export class FinanceService {
       if (r.p != null && Number.isFinite(Number(r.p))) matAvg.set(r.material_type, Number(r.p));
     }
 
-    type WasteRow = {
-      spoolAssetId: string;
-      materialType: string | null;
-      grams: number;
-      unit: number;
-      costCents: number;
-    };
-    const rows: WasteRow[] = spools.map((w) => {
-      const meta = metaById.get(w.spoolAssetId);
+    return (spoolAssetId: string) => {
+      const meta = metaById.get(spoolAssetId);
       const material = meta?.material_type ?? null;
       const spoolPpg = meta?.spool_ppg != null ? Number(meta.spool_ppg) : NaN;
       const unit = Number.isFinite(spoolPpg) && spoolPpg > 0
         ? spoolPpg
         : (material != null ? matAvg.get(material) ?? 0 : 0);
-      return {
-        spoolAssetId: w.spoolAssetId,
-        materialType: material,
-        grams: w.grams,
-        unit,
-        costCents: Math.round(w.grams * unit * 100)
-      };
-    });
-
-    return this.bookMaterialWaste(client, companyId, userId, params, rows, "g", "Filament");
+      return { material, unit };
+    };
   }
 
   /**
-   * Resin wasted on a failed print — the resin counterpart of
-   * recordFilamentWaste. A resin job draws from exactly ONE tank, so this takes
-   * a single quantity rather than a per-asset list.
-   *
-   * Priced from the tank's own cost per ml (purchase_price / initial volume),
-   * falling back to the company's average price per ml for that resin type —
-   * exactly the two-tier rule filament uses, in millilitres.
+   * Price one resin tank per millilitre — the resin counterpart of priceSpools,
+   * and the same two-tier rule in the tank's own unit.
    */
-  async recordResinWaste(
+  private async priceTank(
     client: PoolClient,
     companyId: string,
-    userId: string | null,
-    params: {
-      pieceId: string;
-      orderId: string;
-      tankAssetId: string;
-      ml: number;
-    }
-  ): Promise<{ grams: number; cost: number }> {
-    if (!(params.ml > 0)) return { grams: 0, cost: 0 };
-
+    tankAssetId: string
+  ): Promise<{ material: string | null; unit: number }> {
     const tankRes = await this.databaseService.query<{
       resin_type: string | null;
       tank_ppml: string | null;
@@ -369,7 +377,7 @@ export class FinanceService {
                    THEN ai.purchase_price / ai.resin_initial_volume_ml END AS tank_ppml
          FROM asset_instances ai
         WHERE ai.company_id = $1 AND ai.asset_id = $2 AND ai.asset_type = 'resin_tank'`,
-      [companyId, params.tankAssetId],
+      [companyId, tankAssetId],
       client
     );
     const tank = tankRes.rows[0];
@@ -395,6 +403,32 @@ export class FinanceService {
       const p = avgRes.rows[0]?.p;
       if (p != null && Number.isFinite(Number(p))) unit = Number(p);
     }
+    return { material: resinType, unit };
+  }
+
+  /**
+   * Resin wasted on a failed print — the resin counterpart of
+   * recordFilamentWaste. A resin job draws from exactly ONE tank, so this takes
+   * a single quantity rather than a per-asset list.
+   *
+   * Priced from the tank's own cost per ml (purchase_price / initial volume),
+   * falling back to the company's average price per ml for that resin type —
+   * exactly the two-tier rule filament uses, in millilitres.
+   */
+  async recordResinWaste(
+    client: PoolClient,
+    companyId: string,
+    userId: string | null,
+    params: {
+      pieceId: string;
+      orderId: string;
+      tankAssetId: string;
+      ml: number;
+    }
+  ): Promise<{ grams: number; cost: number }> {
+    if (!(params.ml > 0)) return { grams: 0, cost: 0 };
+
+    const { material: resinType, unit } = await this.priceTank(client, companyId, params.tankAssetId);
 
     return this.bookMaterialWaste(
       client,
@@ -411,6 +445,137 @@ export class FinanceService {
       "ml",
       "Resin"
     );
+  }
+
+  // ── Whole-plate waste ─────────────────────────────────────────────────────
+  /**
+   * Record the material lost across MANY pieces of one failed/partly-failed
+   * plate, and book it to the ledger as a single entry.
+   *
+   * This is the batched sibling of the two recorders above, and the batching is
+   * the entire point rather than a refinement. A plate can hold several hundred
+   * pieces; calling `recordFilamentWaste` once per failed piece would issue four
+   * queries each, so triaging a 300-piece plate would be over a thousand round
+   * trips inside ONE transaction — tens of seconds against a cross-region
+   * database, all of it holding locks on `asset_stock` while the shop floor is
+   * trying to work. Here the pricing is two queries regardless of piece count,
+   * the ledger is one entry, and the event rows go in with one INSERT.
+   *
+   * Attribution stays per PIECE, because a plate routinely spans several orders
+   * and each order's waste line has to show only its own loss. One journal entry
+   * covering rows from several orders is correct and deliberate: the ledger
+   * records a single physical event (this plate, this run), while the events
+   * table keeps the per-order detail every rollup reads.
+   *
+   * `entries` is already flattened to one row per (piece × asset) by the caller,
+   * which owns the rule for splitting a plate's loss across its spools.
+   */
+  async recordPlateWaste(
+    client: PoolClient,
+    companyId: string,
+    userId: string | null,
+    params: {
+      unit: "g" | "ml";
+      entries: { pieceId: string; orderId: string; assetId: string; quantity: number }[];
+      /** Names the plate in the ledger memo, so the entry is traceable to the
+       *  run that caused it without joining through the event rows. */
+      bedName: string;
+    }
+  ): Promise<{ quantity: number; cost: number }> {
+    const entries = params.entries.filter((e) => e.quantity > 0);
+    if (entries.length === 0) return { quantity: 0, cost: 0 };
+
+    const isResin = params.unit === "ml";
+    const noun = isResin ? "Resin" : "Filament";
+
+    // Price every distinct asset ONCE. A resin plate pours from a single tank,
+    // so that path stays a single lookup; filament may span a multicolour set.
+    const assetIds = [...new Set(entries.map((e) => e.assetId))];
+    let priceOf: (assetId: string) => { material: string | null; unit: number };
+    if (isResin) {
+      const tanks = new Map<string, { material: string | null; unit: number }>();
+      for (const id of assetIds) tanks.set(id, await this.priceTank(client, companyId, id));
+      priceOf = (id) => tanks.get(id) ?? { material: null, unit: 0 };
+    } else {
+      priceOf = await this.priceSpools(client, companyId, assetIds);
+    }
+
+    const rows = entries.map((e) => {
+      const { material, unit } = priceOf(e.assetId);
+      return {
+        ...e,
+        materialType: material,
+        unitCost: unit,
+        costCents: Math.round(e.quantity * unit * 100)
+      };
+    });
+
+    const totalCents = rows.reduce((s, r) => s + r.costCents, 0);
+
+    // One DR Material Waste / CR Inventory entry for the whole run. Skipped
+    // entirely when nothing could be priced — postEntry requires a positive,
+    // balanced entry, and an unpriced spool must never block recording the loss.
+    let entryId: string | null = null;
+    if (totalCents > 0) {
+      const wasteAccount = await this.systemAccount(client, companyId, "filament_waste");
+      const inventoryAccount = await this.systemAccount(client, companyId, "inventory");
+      const today = new Date().toISOString().slice(0, 10);
+      const entry = await this.postEntry(client, companyId, userId, {
+        entryDate: today,
+        memo: `${noun} wasted on plate "${params.bedName}"`,
+        sourceType: "waste",
+        // The plate is the event; its own id would not resolve against the
+        // pieces every other waste entry points at, so the first affected piece
+        // anchors it exactly as the single-piece path does.
+        sourceId: rows[0]!.pieceId,
+        lines: [
+          { accountId: wasteAccount, debit: totalCents, credit: 0, description: `${noun} waste (spoilage)` },
+          { accountId: inventoryAccount, debit: 0, credit: totalCents, description: "Inventory / production consumed" }
+        ]
+      });
+      entryId = entry.entry_id;
+    }
+
+    // Every event row in ONE statement. `source` stays 'simple_failed' — the
+    // column's CHECK admits nothing else, and widening it would make this
+    // feature depend on a migration reaching production before the API does.
+    await this.databaseService.query(
+      `
+        INSERT INTO filament_waste_events
+          (company_id, order_id, piece_id, spool_asset_id, material_type,
+           grams, unit_cost_per_gram, cost, source, journal_entry_id, created_by, unit)
+        SELECT $1, o.order_id, o.piece_id, o.asset_id, o.material_type,
+               o.quantity, o.unit_cost, o.cost, 'simple_failed',
+               -- Only priced rows are covered by the entry; unpriced rows book
+               -- nothing, matching bookMaterialWaste row for row.
+               CASE WHEN o.cost > 0 THEN $9::uuid END,
+               $10, $11
+          FROM UNNEST(
+                 $2::uuid[], $3::uuid[], $4::uuid[], $5::text[],
+                 $6::numeric[], $7::numeric[], $8::numeric[]
+               ) AS o(order_id, piece_id, asset_id, material_type,
+                      quantity, unit_cost, cost)
+      `,
+      [
+        companyId,
+        rows.map((r) => r.orderId),
+        rows.map((r) => r.pieceId),
+        rows.map((r) => r.assetId),
+        rows.map((r) => r.materialType),
+        rows.map((r) => r.quantity),
+        rows.map((r) => r.unitCost),
+        rows.map((r) => r.costCents / 100),
+        entryId,
+        userId,
+        params.unit
+      ],
+      client
+    );
+
+    return {
+      quantity: rows.reduce((s, r) => s + r.quantity, 0),
+      cost: totalCents / 100
+    };
   }
 
   /**

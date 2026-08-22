@@ -113,6 +113,29 @@ try {
   process.exit(2);
 }
 
+/**
+ * Every integration test in test/, discovered rather than listed.
+ *
+ * This used to be a hand-maintained array, and the failure mode was silent in
+ * the worst direction: a new *.integration.test.ts file that nobody remembered
+ * to add here simply never ran, while the suite reported green. A test that does
+ * not run is worse than no test, because it is counted as evidence. Sorted so
+ * the run order is stable across machines.
+ */
+const INTEGRATION_TESTS = readdirSync("test")
+  .filter((f) => f.endsWith(".integration.test.ts"))
+  .sort()
+  .map((f) => `test/${f}`);
+
+if (INTEGRATION_TESTS.length === 0) {
+  console.error("No *.integration.test.ts files found in test/ — nothing to run.");
+  await pg.stop();
+  rmSync(DATA_DIR, { recursive: true, force: true });
+  process.exit(2);
+}
+console.log(`Running ${INTEGRATION_TESTS.length} integration test files:`);
+for (const t of INTEGRATION_TESTS) console.log(`  · ${t}`);
+
 let failed = false;
 try {
   execFileSync(
@@ -120,11 +143,7 @@ try {
     [
       "--disable-warning=MODULE_TYPELESS_PACKAGE_JSON",
       "--test",
-      "test/order-numbering.integration.test.ts",
-      "test/batch-runs.integration.test.ts",
-      "test/invite-expiry.integration.test.ts",
-      "test/invite-revocation.integration.test.ts",
-      "test/nozzle-pool.integration.test.ts",
+      ...INTEGRATION_TESTS,
     ],
     {
       stdio: "inherit",
