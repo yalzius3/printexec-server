@@ -152,6 +152,48 @@ export const scheduleJobSchema = z.object({
 export type ScheduleJobInput = z.infer<typeof scheduleJobSchema>;
 
 // ────────────────────────────────────────────────────────────
+// POST /api/jobs/schedule-batch
+// Re-time MANY pieces in one request.
+//
+// Why this exists rather than the client looping the single-piece route:
+// moving a selection of 200 blocks along the timeline is one operator gesture,
+// and as 200 requests it is 200 round trips through the Cloudflare Pages proxy,
+// 200 order rollups (an aggregate over every piece in the order — the O(N²)
+// shape auto-schedule already had to fix), and no way to report which ones
+// landed. One request, one rollup per touched order, one per-item report.
+//
+// Capped at 500 to match ASSIGN_CHUNK on the client and to keep the handler's
+// wall-clock bounded — each item still goes through the full guarded
+// scheduleCommit, which is ~10 queries. The client chunks above that.
+//
+// ORDER IS SIGNIFICANT and the caller owns it: a set shifted later must be
+// written last-block-first or it collides with itself (see the client's
+// bulkMove.commitOrder). The handler defends against a caller that got this
+// wrong by retrying conflicts once at the end, but it does not re-sort — it
+// cannot know which conflicts were transient without the caller's intent.
+// ────────────────────────────────────────────────────────────
+export const scheduleBatchSchema = z.object({
+  items: z.array(
+    z.object({
+      piece_id: z.string().uuid(),
+      start_at: z.string().datetime({ offset: true }),
+    }).strict()
+  ).min(1).max(500),
+}).strict();
+export type ScheduleBatchInput = z.infer<typeof scheduleBatchSchema>;
+
+// ────────────────────────────────────────────────────────────
+// POST /api/jobs/unschedule-batch
+// Pull many pieces off the board at once. Capped higher than the schedule
+// batch because the write is genuinely set-based (two UPDATEs, not one guarded
+// commit per piece) — the cost here is the per-order rollup, not the rows.
+// ────────────────────────────────────────────────────────────
+export const unscheduleBatchSchema = z.object({
+  piece_ids: z.array(z.string().uuid()).min(1).max(1000),
+}).strict();
+export type UnscheduleBatchInput = z.infer<typeof unscheduleBatchSchema>;
+
+// ────────────────────────────────────────────────────────────
 // POST /api/jobs/:pieceId/restore
 // Brings a cancelled piece back to life.
 //   - to: "pending"  → cleared of all assignment fields (start fresh)

@@ -24,6 +24,7 @@ import type {
   QueueSortKey,
   ReserveSpoolsInput,
   RestoreJobInput,
+  ScheduleBatchInput,
   ScheduleJobInput,
   TimeHorizon,
   TimelineQuery,
@@ -2638,6 +2639,93 @@ export class JobsService {
     await this.syncOrderStatus(companyId, orderId);
   }
 
+  /**
+   * Re-time many pieces in one request — the write behind a bulk timeline move.
+   *
+   * Every item goes through the SAME `scheduleCommit` a single drop uses, with
+   * every precondition and every resource-conflict check intact. There is no
+   * fast path around the guard, because the guard is the only thing standing
+   * between a bulk gesture and two prints on one machine.
+   *
+   * ── Partial success is deliberate ──────────────────────────────────────────
+   * `scheduleCommit` owns no transaction (it says so where it writes), so an
+   * all-or-nothing batch would mean hand-rolling compensating writes for
+   * placements that already succeeded — undo logic on the most safety-critical
+   * path in the app, exercised only when something has already gone wrong. The
+   * honest alternative is what this does: commit what can be committed, name
+   * every item that could not and why, and let the caller refetch the board so
+   * the screen shows the truth rather than the intent. The client pre-checks the
+   * whole set against its own copy of the board before sending, so a failure
+   * here is a race, not the normal case.
+   *
+   * ── The retry pass ─────────────────────────────────────────────────────────
+   * A set shifted later must be written last-block-first or it collides with
+   * itself — the caller owns that ordering (see the client's
+   * `bulkMove.commitOrder`). When a caller gets it wrong, the symptom is a
+   * ConflictException against a piece that is itself about to move. One retry
+   * pass at the end resolves exactly that case and nothing else: a conflict
+   * with work that is NOT moving fails again, identically, and is reported.
+   */
+  async scheduleBatch(
+    companyId: string,
+    input: ScheduleBatchInput
+  ): Promise<{
+    placed: Array<{ piece_id: string; start_at: string; nozzle_switch: NozzleSwitch | null }>;
+    failed: Array<{ piece_id: string; reason: string }>;
+  }> {
+    const placed: Array<{ piece_id: string; start_at: string; nozzle_switch: NozzleSwitch | null }> = [];
+    const failed: Array<{ piece_id: string; reason: string }> = [];
+    const touchedOrders = new Set<string>();
+    // Retry candidates: only conflicts, only once. Anything else — a piece that
+    // is not 'ready', a spool that is not reserved — is settled the first time
+    // and a second attempt would just cost ten more queries to say so again.
+    const retry: ScheduleBatchInput["items"] = [];
+    // An order rollup is an aggregate over every piece in it, so it is drained
+    // periodically rather than per item. Bounded the same way autoSchedule
+    // bounds it, and for the same reason: a request cut off part-way must not
+    // leave orders showing a status their pieces have already moved past.
+    const SYNC_EVERY = 100;
+    let sinceSync = 0;
+
+    const drain = async () => {
+      for (const orderId of touchedOrders) {
+        await this.syncOrderStatusOnce(companyId, orderId);
+      }
+      touchedOrders.clear();
+      sinceSync = 0;
+    };
+
+    const commitOne = async (
+      item: ScheduleBatchInput["items"][number],
+      allowRetry: boolean
+    ): Promise<void> => {
+      try {
+        const { order_id, nozzle_switch } = await this.scheduleCommit(
+          companyId,
+          item.piece_id,
+          { start_at: item.start_at }
+        );
+        touchedOrders.add(order_id);
+        placed.push({ piece_id: item.piece_id, start_at: item.start_at, nozzle_switch });
+        if (++sinceSync >= SYNC_EVERY) await drain();
+      } catch (e) {
+        if (allowRetry && e instanceof ConflictException) {
+          retry.push(item);
+          return;
+        }
+        failed.push({
+          piece_id: item.piece_id,
+          reason: e instanceof Error ? e.message : "The schedule was rejected.",
+        });
+      }
+    };
+
+    for (const item of input.items) await commitOne(item, true);
+    for (const item of retry) await commitOne(item, false);
+    await drain();
+    return { placed, failed };
+  }
+
   /** First physical-resource conflict for a window, or null when everything is
    *  free. Checks the printer, the nozzle, and every spool reserved by the
    *  piece — against BOTH standalone pieces and print beds (bed spool
@@ -2950,6 +3038,79 @@ export class JobsService {
     );
     await this.syncOrderStatus(companyId, piece.order_id);
     return this.loadJob(companyId, pieceId);
+  }
+
+  /**
+   * Pull many pieces off the board in one request — the write behind a bulk
+   * unschedule, and behind "clear this printer's schedule".
+   *
+   * Three statements instead of three per piece: one read of the affected rows,
+   * then one UPDATE per target status (there are only ever two — 'ready' and
+   * 'assigned'), then one rollup per touched order. The per-piece route does the
+   * same work N times, which is fine for one block and is minutes of round trips
+   * for an order of two hundred.
+   *
+   * The 'ready' vs 'assigned' decision is made HERE, in TypeScript, by the same
+   * `hasSlicerCoreData` the single-piece path calls — deliberately not
+   * re-expressed as a SQL CASE. Two spellings of one rule in two languages is
+   * how they drift, and this one decides whether an operator is sent back
+   * through a print-data step for a piece that already has its numbers.
+   *
+   * Pieces that are not 'scheduled' are skipped rather than failed: unscheduling
+   * something already off the board is the outcome the caller asked for, and a
+   * bulk action should not report an error for reaching the state it wanted.
+   * Anything genuinely un-releasable — a print that has STARTED — is 'printing',
+   * never 'scheduled', so it is excluded by the same filter.
+   */
+  async unscheduleBatch(
+    companyId: string,
+    pieceIds: readonly string[]
+  ): Promise<{ unscheduled: string[]; skipped: string[] }> {
+    if (pieceIds.length === 0) return { unscheduled: [], skipped: [] };
+    const ids = [...new Set(pieceIds)];
+    const rows = await this.databaseService.query<{
+      piece_id: string;
+      order_id: string;
+      slicer_print_time_minutes: number | null;
+      slicer_filament_used_grams: number | null;
+      slicer_resin_used_ml: string | null;
+      required_print_technology: string | null;
+    }>(
+      `SELECT piece_id, order_id, slicer_print_time_minutes, slicer_filament_used_grams,
+              slicer_resin_used_ml, required_print_technology
+         FROM order_pieces
+        WHERE company_id = $1 AND piece_id = ANY($2::uuid[]) AND status = 'scheduled'`,
+      [companyId, ids]
+    );
+    const found = new Set(rows.rows.map((r) => r.piece_id));
+    const skipped = ids.filter((id) => !found.has(id));
+    if (rows.rowCount === 0) return { unscheduled: [], skipped };
+
+    const toReady: string[] = [];
+    const toAssigned: string[] = [];
+    const touchedOrders = new Set<string>();
+    for (const r of rows.rows) {
+      (this.hasSlicerCoreData(r) ? toReady : toAssigned).push(r.piece_id);
+      touchedOrders.add(r.order_id);
+    }
+    for (const [target, group] of [["ready", toReady], ["assigned", toAssigned]] as const) {
+      if (group.length === 0) continue;
+      await this.databaseService.query(
+        `UPDATE order_pieces
+            SET scheduled_start_at = NULL,
+                scheduled_end_at   = NULL,
+                scheduled_at       = NULL,
+                status             = $3
+          WHERE company_id = $1 AND piece_id = ANY($2::uuid[]) AND status = 'scheduled'`,
+        [companyId, group, target]
+      );
+    }
+    // Once per order, after every write — an order's status is a function of its
+    // final piece set, so the intermediate answers nobody reads are pure cost.
+    for (const orderId of touchedOrders) {
+      await this.syncOrderStatusOnce(companyId, orderId);
+    }
+    return { unscheduled: [...toReady, ...toAssigned], skipped };
   }
 
   // ──────────────────────────────────────────────────────────

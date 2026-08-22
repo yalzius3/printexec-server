@@ -18,8 +18,10 @@ import {
   listJobsQuerySchema,
   reserveSpoolsSchema,
   restoreJobSchema,
+  scheduleBatchSchema,
   scheduleJobSchema,
   timelineQuerySchema,
+  unscheduleBatchSchema,
   updatePieceFilesSchema,
   queueIdsQuerySchema,
   queueSortQuerySchema,
@@ -272,6 +274,29 @@ export class JobsController {
   }
 
   // ── Scheduling ──────────────────────────────────────────────
+  // Re-time many pieces in one request — the write behind a bulk timeline move.
+  // A single path segment, so it can never be shadowed by the `:pieceId/…`
+  // routes below (those are all two segments). Answers with a per-item report:
+  // what landed, and what did not and why. See JobsService.scheduleBatch for
+  // why partial success is the right failure mode here.
+  @Post("schedule-batch")
+  @RequirePermission("action_orders")
+  scheduleBatch(@CompanyId() companyId: string, @Body() body: unknown) {
+    return this.jobsService.scheduleBatch(
+      companyId,
+      parseWithSchema(scheduleBatchSchema, body)
+    );
+  }
+
+  // The mirror of schedule-batch: pull many pieces off the board at once.
+  // Also a single path segment, for the same non-collision reason.
+  @Post("unschedule-batch")
+  @RequirePermission("action_orders")
+  unscheduleBatch(@CompanyId() companyId: string, @Body() body: unknown) {
+    const { piece_ids } = parseWithSchema(unscheduleBatchSchema, body);
+    return this.jobsService.unscheduleBatch(companyId, piece_ids);
+  }
+
   @Post(":pieceId/schedule")
   @RequirePermission("action_orders")
   schedule(
