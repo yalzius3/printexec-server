@@ -2037,55 +2037,52 @@ export class SimpleJobsService {
       };
     }
 
-    // ── Big packs run as a BACKGROUND RUN, not as this request ──────────────
-    //
-    // Committing a placement goes through the guarded schedule(): ten-odd
-    // queries of preconditions and conflict checks per item, and that guard is
-    // exactly what must not be skipped to make it quicker. Thousands of items
-    // is therefore minutes of work, and production reaches this API through an
-    // edge proxy that will not hold a request open for it. It also should not:
-    // an action that rearranges the whole shop floor deserves a count that
-    // moves and a way to stop, and neither is a property a request has.
-    //
-    // Below the threshold nothing changes — the plan comes back inline, as it
-    // always has, which keeps the ordinary handful-of-jobs case a single round
-    // trip. And if the batch_runs migration has not been applied, `available()`
-    // says so and this falls through to running inline whatever the size: a
-    // missing table costs the progress bar, never the feature.
-    const wantsRun = input.as_run === true || items.length >= RUN_THRESHOLD_ITEMS;
-    if (wantsRun && (await this.runs.available())) {
-      const runId = await this.runs.start(
-        companyId,
-        input.user_id ?? null,
-        "auto_schedule",
-        { items: items.length, dry_run: input.dry_run === true, printers: printers.length },
-        async (ctx) => {
-          const planned = await this.autoSchedule(
-            companyId,
-            {
-              items: items.map((i) => ({ id: i.id, is_bed: i.is_bed })),
-              ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
-              ...(input.min_margin_minutes !== undefined ? { min_margin_minutes: input.min_margin_minutes } : {}),
-              ...(input.nozzle_policy !== undefined ? { nozzle_policy: input.nozzle_policy } : {}),
-              ...(input.work_start_hour !== undefined ? { work_start_hour: input.work_start_hour } : {}),
-              ...(input.work_latest_start_hour !== undefined ? { work_latest_start_hour: input.work_latest_start_hour } : {}),
-              ...(input.tz_offset_minutes !== undefined ? { tz_offset_minutes: input.tz_offset_minutes } : {}),
-              ...(input.allow_nozzle_swap !== undefined ? { allow_nozzle_swap: input.allow_nozzle_swap } : {}),
-            },
-            {
-              onTotal: (total) => ctx.setTotal(total),
-              onItem: (outcome) => ctx.advance(outcome),
-              shouldStop: () => ctx.cancelled(),
-            },
-          );
-          return { ...planned, printers };
-        },
-      );
-      return { run_id: runId, async_run: true as const, total: items.length, printers };
-    }
+    // Carry the printer roster through so the review step can label lanes
+    // without a second round trip.
+    return this.packOrRun(companyId, input, items.map((i) => ({ id: i.id, is_bed: i.is_bed })), { printers });
+  }
 
-    const result = await this.autoSchedule(companyId, {
-      items: items.map((i) => ({ id: i.id, is_bed: i.is_bed })),
+  /**
+   * Pack a given set of items — as this request when it is small, as a
+   * background run when it is not.
+   *
+   * ── Why the size decides, and why the caller does not ────────────────────
+   * Committing a placement goes through the guarded schedule(): ten-odd queries
+   * of preconditions and conflict checks per item, and that guard is exactly
+   * what must not be skipped to make it quicker. Thousands of items is
+   * therefore minutes of work, and production reaches this API through an edge
+   * proxy that will not hold a request open for it. It also should not: an
+   * action that rearranges the shop floor deserves a count that moves and a way
+   * to stop, and neither is a property a request has.
+   *
+   * Below the threshold nothing changes — the plan comes back inline, which
+   * keeps the ordinary handful-of-jobs case a single round trip. If the
+   * batch_runs migration has not been applied, `available()` says so and this
+   * falls through to inline whatever the size: a missing table costs the
+   * progress bar, never the feature.
+   *
+   * Shared by the fleet pack and the single-printer pack because the rule is
+   * the same in both. It used to live only in autoScheduleAll, which is why
+   * packing one printer's queue was capped at what a single request could
+   * survive — and then failed outright above it.
+   */
+  private async packOrRun<E extends object>(
+    companyId: string,
+    input: {
+      dry_run?: boolean | undefined;
+      min_margin_minutes?: number | undefined;
+      nozzle_policy?: NozzlePolicy | undefined;
+      work_start_hour?: number | null | undefined;
+      work_latest_start_hour?: number | null | undefined;
+      tz_offset_minutes?: number | undefined;
+      allow_nozzle_swap?: boolean | undefined;
+      as_run?: boolean | undefined;
+      user_id?: string | undefined;
+    },
+    items: Array<{ id: string; is_bed: boolean }>,
+    extra: E,
+  ) {
+    const knobs = {
       ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
       ...(input.min_margin_minutes !== undefined ? { min_margin_minutes: input.min_margin_minutes } : {}),
       ...(input.nozzle_policy !== undefined ? { nozzle_policy: input.nozzle_policy } : {}),
@@ -2093,10 +2090,60 @@ export class SimpleJobsService {
       ...(input.work_latest_start_hour !== undefined ? { work_latest_start_hour: input.work_latest_start_hour } : {}),
       ...(input.tz_offset_minutes !== undefined ? { tz_offset_minutes: input.tz_offset_minutes } : {}),
       ...(input.allow_nozzle_swap !== undefined ? { allow_nozzle_swap: input.allow_nozzle_swap } : {}),
-    });
-    // Carry the printer roster through so the review step can label lanes
-    // without a second round trip.
-    return { ...result, printers };
+    };
+    const wantsRun = input.as_run === true || items.length >= RUN_THRESHOLD_ITEMS;
+    if (wantsRun && (await this.runs.available())) {
+      const runId = await this.runs.start(
+        companyId,
+        input.user_id ?? null,
+        "auto_schedule",
+        { items: items.length, dry_run: input.dry_run === true },
+        async (ctx) => {
+          const planned = await this.autoSchedule(
+            companyId,
+            { items, ...knobs },
+            {
+              onTotal: (total) => ctx.setTotal(total),
+              onItem: (outcome) => ctx.advance(outcome),
+              shouldStop: () => ctx.cancelled(),
+            },
+          );
+          return { ...planned, ...extra };
+        },
+      );
+      return { run_id: runId, async_run: true as const, total: items.length, ...extra };
+    }
+    return { ...(await this.autoSchedule(companyId, { items, ...knobs })), ...extra };
+  }
+
+  /**
+   * Pack an EXPLICIT set of items — one printer's queue, or whatever the
+   * operator ticked — rather than the whole schedulable backlog.
+   *
+   * Same engine, same run-vs-inline rule as the fleet pack. The difference is
+   * only which items go in, and that is the caller's to decide.
+   */
+  async autoScheduleSelection(
+    companyId: string,
+    input: {
+      items: Array<{ id: string; is_bed?: boolean | undefined }>;
+      dry_run?: boolean | undefined;
+      min_margin_minutes?: number | undefined;
+      nozzle_policy?: NozzlePolicy | undefined;
+      work_start_hour?: number | null | undefined;
+      work_latest_start_hour?: number | null | undefined;
+      tz_offset_minutes?: number | undefined;
+      allow_nozzle_swap?: boolean | undefined;
+      as_run?: boolean | undefined;
+      user_id?: string | undefined;
+    },
+  ) {
+    return this.packOrRun(
+      companyId,
+      input,
+      input.items.map((i) => ({ id: i.id, is_bed: i.is_bed === true })),
+      {},
+    );
   }
 
   async autoSchedule(

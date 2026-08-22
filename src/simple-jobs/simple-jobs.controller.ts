@@ -131,7 +131,12 @@ const autoScheduleSchema = z.object({
   items: z
     .array(z.object({ id: z.string().uuid(), is_bed: z.boolean().optional() }))
     .min(1)
-    .max(200),
+    // Ten thousand, matching the fleet pack. The old cap of 200 was a limit on
+    // what ONE REQUEST could survive — but above RUN_THRESHOLD_ITEMS this no
+    // longer runs as one request, so the ceiling was guarding a path the packer
+    // had already stopped taking. What it actually did was refuse a 500-piece
+    // queue outright, with a 400 the operator only ever saw as "Request failed".
+    .max(10_000),
   // Simulate the pack and return the plan WITHOUT committing anything: no
   // schedule() calls, no spool reservations, no nozzle swaps. Lets the operator
   // review "12 placed, 2 late, 1 skipped" before agreeing to it — a heuristic
@@ -277,11 +282,18 @@ export class SimpleJobsController {
   // Pass dry_run to get the same plan back without committing it.
   @Post("auto-schedule")
   @RequirePermission("action_orders")
-  autoSchedule(@CompanyId() companyId: string, @Body() body: unknown) {
-    return this.simpleJobsService.autoSchedule(
-      companyId,
-      parseWithSchema(autoScheduleSchema, body)
-    );
+  autoSchedule(
+    @CompanyId() companyId: string,
+    @UserId() userId: string,
+    @Body() body: unknown
+  ) {
+    // Answers with the plan for an ordinary pack, or with { run_id, async_run }
+    // for one big enough to have become a background run — the same contract
+    // auto-schedule-all has answered with since the fleet pack was written.
+    return this.simpleJobsService.autoScheduleSelection(companyId, {
+      ...parseWithSchema(autoScheduleSchema, body),
+      user_id: userId,
+    });
   }
 
   // Fleet-wide pack. Same engine, but the item list is the whole schedulable
