@@ -8,6 +8,13 @@ import {
   releasePrinterForPieceTx
 } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
+// The edit-lock rules are a pure module so they can be tested directly — a Nest
+// service cannot be imported by `node --test`, its constructor parameter
+// properties are not erasable syntax. See piece-edit-lock.ts.
+import {
+  PIECE_CHANGE_LOCKED_ORDER_STATUSES,
+  pieceSpecEditRefusal
+} from "./piece-edit-lock";
 import { isResinTech, materialFamily, sameColor, techCompatible } from "../jobs/jobs.service";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import {
@@ -111,63 +118,37 @@ type PieceSpoolRow = {
   currently_used_in_piece_id: string | null;
 };
 
-const TECH_FIELDS = [
-  "required_print_technology",
-  "requires_multicolor",
-  "required_filament_material",
-  "required_color",
-  "required_nozzle_diameter_mm",
-  "required_nozzle_material",
-  "required_multicolor_capable",
-  "stl_file_url",
-  "stl_file_uploaded_at"
-] as const;
+/**
+ * Do two colour-slot lists describe the same filament requirement?
+ *
+ * Compared IN ORDER, because `sequence_order` is what binds a slot to the spool
+ * reserved for it — slot 2 becoming red is a different requirement from slot 1
+ * becoming red, even though the set of colours is identical. Colours go through
+ * `sameColor` so a case or whitespace difference is not read as a change; the
+ * spool matcher compares them the same way.
+ */
+function sameColorSlots(
+  next: readonly { slot_material: string; slot_color: string }[],
+  current: readonly { sequence_order: number; slot_material: string; slot_color: string }[]
+): boolean {
+  const ordered = [...current].sort((a, b) => a.sequence_order - b.sequence_order);
+  if (next.length !== ordered.length) return false;
+  return next.every((slot, i) => {
+    const was = ordered[i];
+    return (
+      !!was &&
+      materialFamily(slot.slot_material) === materialFamily(was.slot_material) &&
+      sameColor(slot.slot_color, was.slot_color)
+    );
+  });
+}
 
-const SLICER_FIELDS = [
-  "slicer_file_url",
-  "slicer_file_uploaded_at",
-  "slicer_print_time_minutes",
-  "slicer_filament_used_grams",
-  "slicer_filament_used_mm",
-  "slicer_support_grams",
-  "slicer_layer_height_mm",
-  "slicer_infill_percent",
-  "slicer_wall_loops",
-  "slicer_supports_enabled",
-  "slicer_support_type",
-  "slicer_part_weight_grams",
-  "color_slots",
-  "color_slot_grams",
-  // Resin's counterpart of slicer_filament_used_grams — same lock, same reason:
-  // once a piece is scheduled, the quantity it reserved must not move under it.
-  "slicer_resin_used_ml"
-] as const;
-
-const TECH_LOCKED_STATUSES = new Set(["ready", "scheduled", "printing", "done", "failed", "cancelled"]);
-const SLICER_LOCKED_STATUSES = new Set(["scheduled", "printing", "done", "failed", "cancelled"]);
-
-// Post-production order statuses (added 2026-06-26). The order has left
-// production: like completed/cancelled they are closed to structural piece
-// changes (add / delete / duplicate), and they additionally forbid tech &
-// slicer edits regardless of the individual piece's status — "no tech edits".
-const POST_PRODUCTION_ORDER_STATUSES = [
-  "ready_for_shipping",
-  "out_for_shipping",
-  "returned",
-  "fulfilled"
-] as const;
-
-// Orders closed to structural piece changes (add / delete / duplicate).
-const PIECE_CHANGE_LOCKED_ORDER_STATUSES = new Set<string>([
-  "completed",
-  "cancelled",
-  ...POST_PRODUCTION_ORDER_STATUSES
-]);
-
-// Orders that lock tech/slicer edits at the order level. completed/cancelled
-// are intentionally excluded: their pieces are already done/cancelled, so the
-// existing per-piece lock covers them and their behaviour is unchanged.
-const PIECE_SPEC_LOCKED_ORDER_STATUSES = new Set<string>(POST_PRODUCTION_ORDER_STATUSES);
+// Every edit-lock rule — which order statuses close a piece to structural
+// change, and which piece statuses freeze which parts of its specification —
+// now lives in ./piece-edit-lock and is imported at the top of this file. They
+// were duplicated here; a rule with two homes is a rule that eventually
+// disagrees with itself, and this one decides whether a part gets printed in
+// the wrong filament.
 
 /**
  * Every edge of a lifecycle graph, forward AND back: the given table plus its
@@ -500,6 +481,25 @@ export class OrderPiecesService {
 
     const nextMulticolor = input.requires_multicolor ?? currentPiece.requires_multicolor;
 
+    /**
+     * Did the piece's material specification actually MOVE?
+     *
+     * Not "was it sent" — a PATCH that re-sends the same colour must not
+     * disturb anything. Compared through `sameColor`, the same normaliser the
+     * spool matcher uses, so " Black" and "black" are not a change here when
+     * they are not a change there.
+     */
+    const materialSpecMoved =
+      (input.required_filament_material !== undefined &&
+        (input.required_filament_material ?? null) !== (currentPiece.required_filament_material ?? null)) ||
+      (input.required_color !== undefined &&
+        !sameColor(input.required_color ?? null, currentPiece.required_color ?? null)) ||
+      // Multicolour reserves one spool PER SLOT, matched to that slot's own
+      // material and colour, so a slot edit invalidates a reservation exactly
+      // as the single-colour fields do.
+      (Array.isArray(nextColorSlots) &&
+        !sameColorSlots(nextColorSlots, currentPiece.color_slots ?? []));
+
     // When the per-color slots change, keep the mirrored single-material/color
     // fields in sync with slot[0] so legacy displays and fallbacks stay correct.
     if (Array.isArray(nextColorSlots) && nextColorSlots.length > 0 && nextMulticolor) {
@@ -514,6 +514,35 @@ export class OrderPiecesService {
     // status sync must all commit together or not at all — a mid-sequence
     // failure must never leave the piece half-updated.
     return this.databaseService.transaction(async (client) => {
+      /**
+       * A reservation that no longer matches the piece is worse than no
+       * reservation.
+       *
+       * Spools are reserved against the piece's material family and colour, and
+       * that match is checked when the reservation is MADE — never again. So a
+       * piece whose colour moves from black to red while a black spool is
+       * reserved would keep holding that spool: the grams stay locked away from
+       * every other job, and the piece is still pointed at filament that cannot
+       * produce it. Nobody finds out until someone is standing at the printer.
+       *
+       * Releasing is the reversible direction. Nothing is consumed until the
+       * print runs, so this only returns the grams to stock and drops the link;
+       * re-reserving against the new colour is one click. Recorded in the
+       * piece's history, because inventory moved and the operator did not ask
+       * for that part.
+       */
+      let releasedSpools = 0;
+      if (materialSpecMoved) {
+        const held = await client.query<{ n: string }>(
+          `SELECT COUNT(*)::int AS n FROM order_piece_spools WHERE company_id = $1 AND piece_id = $2`,
+          [companyId, pieceId]
+        );
+        releasedSpools = Number(held.rows[0]?.n ?? 0);
+        if (releasedSpools > 0) {
+          await releasePieceSpoolsTx(client, companyId, pieceId);
+        }
+      }
+
       if (clause) {
         await this.databaseService.query(
           `
@@ -585,8 +614,17 @@ export class OrderPiecesService {
         await this.logPieceHistory(client, companyId, pieceId, currentPiece.order_id, currentPiece.piece_name, "status_changed",
           `Piece "${currentPiece.piece_name}" moved from ${currentPiece.status} to ${nextStatus}.`);
       }
+      if (releasedSpools > 0) {
+        await this.logPieceHistory(client, companyId, pieceId, currentPiece.order_id, currentPiece.piece_name, "updated",
+          `Material or colour changed, so ${releasedSpools} reserved spool${releasedSpools === 1 ? "" : "s"} ` +
+          `no longer matched piece "${currentPiece.piece_name}" and ${releasedSpools === 1 ? "was" : "were"} released back to stock.`);
+      }
 
-      return this.getPieceById(companyId, pieceId, client);
+      const piece = await this.getPieceById(companyId, pieceId, client);
+      // Told, not hidden: the caller raises this to the operator, since it is a
+      // consequence of their edit that they did not ask for. Only present when
+      // something actually happened, so existing readers are untouched.
+      return releasedSpools > 0 ? { ...piece, released_spools: releasedSpools } : piece;
     });
   }
 
@@ -1800,26 +1838,18 @@ export class OrderPiecesService {
     currentPiece: PieceRow,
     input: UpdateOrderPieceInput
   ) {
-    const hasPatchedField = (fields: readonly (keyof UpdateOrderPieceInput)[]) =>
-      fields.some((field) => input[field] !== undefined);
+    // Which fields this PATCH actually carries. Built the same way the old
+    // inline check read them — `undefined` means "not sent", and an explicit
+    // null (clearing a value) IS an edit.
+    const patchedFields = Object.keys(input).filter(
+      (k) => input[k as keyof UpdateOrderPieceInput] !== undefined
+    );
 
-    // Once the order has left production (shipping/fulfilment statuses), tech and
-    // slicer specs are frozen regardless of the piece's own status — no tech edits.
-    if (
-      PIECE_SPEC_LOCKED_ORDER_STATUSES.has(currentPiece.order_status) &&
-      hasPatchedField([...TECH_FIELDS, ...SLICER_FIELDS])
-    ) {
-      throw new ForbiddenException(
-        "Tech and slicer details cannot be edited once the order has left production."
-      );
-    }
-
-    if (hasPatchedField(TECH_FIELDS) && TECH_LOCKED_STATUSES.has(currentPiece.status)) {
-      throw new ForbiddenException("Tech details cannot be edited once a piece is ready for production.");
-    }
-
-    if (hasPatchedField(SLICER_FIELDS) && SLICER_LOCKED_STATUSES.has(currentPiece.status)) {
-      throw new ForbiddenException("Slicer details cannot be edited once a piece is scheduled.");
+    // Every FIELD-vs-STATUS rule lives in ./piece-edit-lock, which is pure and
+    // has tests. What stays here is the part that needs the request object.
+    const refusal = pieceSpecEditRefusal(currentPiece, patchedFields);
+    if (refusal) {
+      throw new ForbiddenException(refusal.message);
     }
 
     if (input.status && ["scheduled", "printing", "done", "failed"].includes(input.status)) {
