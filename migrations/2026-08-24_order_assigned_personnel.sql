@@ -36,7 +36,15 @@
 -- If the composite form is ever wanted, it needs `UNIQUE (id, company_id)` on
 -- users first.
 --
--- Additive only; idempotent / safe to re-run.
+-- Additive only; idempotent / safe to re-run. ONE transaction, so a failure
+-- anywhere leaves the schema exactly as it was.
+--
+-- ⚠ LOCKING: scripts/run-sql-file.mjs sends this file as a single query, so
+-- CREATE INDEX CONCURRENTLY is illegal inside it. A plain CREATE INDEX takes a
+-- SHARE lock — SELECTs keep working, writes to `orders` block until the build
+-- finishes. `orders` holds one row per order (not per piece, like order_pieces),
+-- so this is sub-second on any realistic tenant. If it is somehow large, run the
+-- statement by hand outside a transaction with CONCURRENTLY.
 -- ================================================================
 
 BEGIN;
@@ -48,8 +56,6 @@ ALTER TABLE public.orders
 COMMENT ON COLUMN public.orders.assigned_personnel_id IS
   'The company employee (users.id) responsible for this order. NULL = unassigned, which is both the initial and a permanent legal state. ON DELETE SET NULL so removing a staff member does not block on their orders; same-company membership is asserted by OrdersService.assertPersonnelExists, not by the FK.';
 
-COMMIT;
-
 -- ── INDEX ───────────────────────────────────────────────────────────────────
 -- Two access paths need it:
 --   1. "Show me what <person> is on" — a company-scoped filter on the column.
@@ -59,48 +65,68 @@ COMMIT;
 -- Partial (WHERE NOT NULL) because unassigned orders are the overwhelming
 -- majority at rollout and none of them are ever the answer to either query.
 --
--- DUPLICATE GUARD, matching the house style in
--- 2026-08-17_jobs_queue_read_indexes.sql: check pg_index for an index whose
--- LEADING columns already cover this path rather than trusting the NAME, since
--- this schema carries base indexes that are not defined in this repo.
+-- DUPLICATE GUARD, following 2026-08-17_jobs_queue_read_indexes.sql: check
+-- pg_index for an index whose LEADING columns already cover this path rather
+-- than trusting the NAME, since this schema carries base indexes that are not
+-- defined in this repo (2026-07-09_index_dedupe.sql exists because of exactly
+-- that).
 --
--- LOCKING: this file is sent as ONE implicit transaction by
--- scripts/run-sql-file.mjs, so CONCURRENTLY is illegal inside it. A plain
--- CREATE INDEX takes a SHARE lock — SELECTs keep working, writes to `orders`
--- block until the build finishes. `orders` is orders of magnitude smaller than
--- `order_pieces` (one row per order, not per piece), so this is sub-second on
--- any realistic tenant. If it is somehow large, run it by hand outside a
--- transaction with CONCURRENTLY:
---   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_assigned_personnel
---     ON public.orders (company_id, assigned_personnel_id)
---     WHERE assigned_personnel_id IS NOT NULL;
+-- Two details copied from that file for the same reasons it gives:
+--   · indkey is read via string_to_array(indkey::text, ' ') rather than
+--     subscripted directly. indkey is an int2vector whose subscripts are
+--     0-based, unlike every normal Postgres array. Splitting the text rendering
+--     gives a plain text[] with the standard lower bound of 1, so the ordinals
+--     below are unambiguous on any server.
+--   · The comparison is on ATTNUM, not attname. attname is type `name`, and
+--     `array_agg(attname) = ARRAY['company_id', ...]` is name[] = text[], for
+--     which there is no operator — that is a 42883 at run time, not a typo the
+--     eye catches.
+--   · indnkeyatts (PG 11+) excludes INCLUDE columns, so (company_id) INCLUDE
+--     (assigned_personnel_id) is correctly NOT treated as a match.
+--
+-- Only a NON-PARTIAL match counts as covering. An existing partial index could
+-- have any predicate, and deciding whether it covers this one means comparing
+-- predicate expressions — which would mean guessing how Postgres renders mine.
+-- Creating one redundant small partial index is the cheaper mistake than
+-- skipping a needed one, so the guard stays conservative and says so.
 DO $$
+DECLARE
+  col_company   int2;
+  col_personnel int2;
+  already       boolean;
 BEGIN
   IF to_regclass('public.orders') IS NULL THEN
-    RAISE NOTICE 'public.orders missing - skipping index.';
+    RAISE NOTICE 'public.orders missing -- skipping index.';
     RETURN;
   END IF;
 
-  IF EXISTS (
+  SELECT a.attnum INTO col_company FROM pg_attribute a
+   WHERE a.attrelid = 'public.orders'::regclass AND a.attname = 'company_id';
+  SELECT a.attnum INTO col_personnel FROM pg_attribute a
+   WHERE a.attrelid = 'public.orders'::regclass AND a.attname = 'assigned_personnel_id';
+
+  IF col_company IS NULL OR col_personnel IS NULL THEN
+    RAISE NOTICE 'orders.company_id/assigned_personnel_id missing -- skipping index.';
+    RETURN;
+  END IF;
+
+  SELECT EXISTS (
     SELECT 1
       FROM pg_index i
-      JOIN pg_class t ON t.oid = i.indrelid
-     WHERE t.relname = 'orders'
-       AND t.relnamespace = 'public'::regnamespace
-       -- Leading two columns are (company_id, assigned_personnel_id), in that
-       -- order, whatever the index is called.
-       AND (
-         SELECT array_agg(a.attname ORDER BY k.ord)
-           FROM unnest(i.indkey[0:1]) WITH ORDINALITY AS k(attnum, ord)
-           JOIN pg_attribute a
-             ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-       ) = ARRAY['company_id', 'assigned_personnel_id']
-  ) THEN
-    RAISE NOTICE 'An index already leads with (company_id, assigned_personnel_id) - skipping.';
+     WHERE i.indrelid = 'public.orders'::regclass
+       AND i.indnkeyatts >= 2
+       AND i.indpred IS NULL
+       AND (string_to_array(i.indkey::text, ' '))[1]::int = col_company
+       AND (string_to_array(i.indkey::text, ' '))[2]::int = col_personnel
+  ) INTO already;
+
+  IF already THEN
+    RAISE NOTICE 'orders already has an index leading (company_id, assigned_personnel_id) -- skipping.';
   ELSE
     EXECUTE 'CREATE INDEX IF NOT EXISTS idx_orders_assigned_personnel
                ON public.orders (company_id, assigned_personnel_id)
                WHERE assigned_personnel_id IS NOT NULL';
   END IF;
-END
-$$;
+END $$;
+
+COMMIT;
