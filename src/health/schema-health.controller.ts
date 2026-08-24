@@ -45,13 +45,18 @@ export class SchemaHealthController {
       // The definition TEXT is the only way to tell these apart — every version
       // of this rule has shipped under the same constraint NAME, so presence
       // proves nothing about which rule is actually live.
+      // EVERY check constraint on the two tables, not just the readiness pair.
+      // Several of these are older than any migration in the repository, so the
+      // only place their text exists is the database — and the one that governs
+      // 'done' had to be discovered from a 500 on a shop floor, because nothing
+      // here would show it. A constraint you cannot read is one you write code
+      // against by guessing.
       this.db.query<{ conname: string; definition: string }>(
         `SELECT conname, pg_get_constraintdef(oid) AS definition
            FROM pg_constraint
           WHERE contype = 'c'
             AND conrelid IN ('public.order_pieces'::regclass, 'public.print_beds'::regclass)
-            AND (conname LIKE 'chk_ready%' OR conname LIKE 'chk_scheduled%')
-          ORDER BY conname`
+          ORDER BY conrelid::regclass::text, conname`
       ),
     ]);
 

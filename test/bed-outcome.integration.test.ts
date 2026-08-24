@@ -93,6 +93,10 @@ describe(
           slicer_print_time_minutes int,
           slicer_filament_used_grams numeric,
           slicer_resin_used_ml numeric,
+          print_started_at timestamptz,
+          print_completed_at timestamptz,
+          actual_print_time_minutes int,
+          actual_filament_used_grams numeric,
           fulfilment_status text NOT NULL DEFAULT 'none',
           post_process_state text,
           post_process_state_entered_at timestamptz,
@@ -101,6 +105,19 @@ describe(
             status <> 'assigned'
             OR bed_id IS NOT NULL
             OR assigned_printer_id IS NOT NULL
+          ),
+          -- The one this file used to be missing, and the reason a settled plate
+          -- 500'd on a shop floor: a finished piece has to say WHEN it finished.
+          -- Written here from the production error rather than copied from a
+          -- migration, because no migration in this repository owns it — it
+          -- predates them (see the note above the 'done' tests below). The shape
+          -- is the one every sibling constraint has, escape hatch included, and
+          -- the escape is the whole trap: it holds for as long as the piece is
+          -- on the plate and is revoked by the very statement that detaches it.
+          CONSTRAINT chk_done_requires_completed_at CHECK (
+            status <> 'done'
+            OR bed_id IS NOT NULL
+            OR print_completed_at IS NOT NULL
           ),
           CONSTRAINT chk_ready_requires_core_data CHECK (
             status <> 'ready'
@@ -329,16 +346,105 @@ describe(
       assert.equal(row.rows[0].status, "pending");
     });
 
-    it("detaching to 'done' needs nothing either — a finished part is unconstrained", async () => {
+    // ── The 'done' side of the same trap ────────────────────────────────────
+    //
+    // This file originally asserted the opposite: "detaching to 'done' needs
+    // nothing either — a finished part is unconstrained". That sentence was
+    // true of THIS schema and false of the production one, because the schema
+    // here was assembled from the migrations in this repository and the
+    // constraint that governs 'done' is not in any of them. The test passed,
+    // the endpoint shipped, and the first plate anyone triaged came back a 500.
+    // So the constraint is now declared above and asserted in both directions,
+    // exactly like its 'assigned' sibling.
+    it("detaching a piece to 'done' WITHOUT a completion stamp is rejected", async () => {
       const { pieceIds } = await makePlate({ n: 1, grams: 10 });
+      await assert.rejects(
+        () =>
+          pool.query(
+            `UPDATE order_pieces SET status = 'done', bed_id = NULL WHERE piece_id = $1`,
+            [pieceIds[0]],
+          ),
+        /chk_done_requires_completed_at/,
+      );
+    });
+
+    it("detaching to 'done' WITH the plate's window is accepted", async () => {
+      const { bedId, pieceIds } = await makePlate({ n: 1, grams: 10 });
+      // The service reads the window back off the plate it just closed and
+      // stamps the pieces from it, so the part and the plate that made it agree
+      // to the microsecond. Replayed here in the same order.
+      const closed = await pool.query(
+        `UPDATE print_beds
+            SET status = 'done',
+                print_started_at   = COALESCE(print_started_at, scheduled_start_at, now()),
+                print_completed_at = now()
+          WHERE bed_id = $1
+        RETURNING print_started_at, print_completed_at`,
+        [bedId],
+      );
       await pool.query(
-        `UPDATE order_pieces SET status = 'done', bed_id = NULL WHERE piece_id = $1`,
+        `UPDATE order_pieces
+            SET status = 'done', bed_id = NULL,
+                print_started_at   = COALESCE($2::timestamptz, now()),
+                print_completed_at = COALESCE($3::timestamptz, now())
+          WHERE piece_id = $1`,
+        [pieceIds[0], closed.rows[0].print_started_at, closed.rows[0].print_completed_at],
+      );
+      const row = await pool.query(
+        `SELECT status, bed_id, print_started_at, print_completed_at
+           FROM order_pieces WHERE piece_id = $1`,
         [pieceIds[0]],
       );
-      const row = await pool.query(`SELECT status, bed_id FROM order_pieces WHERE piece_id = $1`, [
-        pieceIds[0],
-      ]);
       assert.deepEqual([row.rows[0].status, row.rows[0].bed_id], ["done", null]);
+      assert.deepEqual(
+        [row.rows[0].print_started_at.getTime(), row.rows[0].print_completed_at.getTime()],
+        [
+          closed.rows[0].print_started_at.getTime(),
+          closed.rows[0].print_completed_at.getTime(),
+        ],
+        "the part's window must be the plate's window, not a second now()",
+      );
+    });
+
+    it("a re-queued piece comes back with no run on it", async () => {
+      // A piece can be triaged off a SECOND plate, so it can arrive carrying the
+      // stamps of the first. Leaving them makes a piece that is sitting in the
+      // pending pool count as finished work in every report that reads
+      // print_completed_at — including the month's consumed-filament cost.
+      const { pieceIds } = await makePlate({ n: 1, grams: 10 });
+      await pool.query(
+        `UPDATE order_pieces
+            SET print_started_at = now() - interval '2 hours',
+                print_completed_at = now() - interval '1 hour',
+                actual_print_time_minutes = 60,
+                actual_filament_used_grams = 9
+          WHERE piece_id = $1`,
+        [pieceIds[0]],
+      );
+      await pool.query(
+        `UPDATE order_pieces
+            SET bed_id = NULL, status = 'pending', assigned_printer_id = NULL,
+                print_started_at = NULL, print_completed_at = NULL,
+                actual_print_time_minutes = NULL, actual_filament_used_grams = NULL
+          WHERE piece_id = $1`,
+        [pieceIds[0]],
+      );
+      const row = await pool.query(
+        `SELECT status, print_started_at, print_completed_at,
+                actual_print_time_minutes, actual_filament_used_grams
+           FROM order_pieces WHERE piece_id = $1`,
+        [pieceIds[0]],
+      );
+      assert.deepEqual(
+        [
+          row.rows[0].status,
+          row.rows[0].print_started_at,
+          row.rows[0].print_completed_at,
+          row.rows[0].actual_print_time_minutes,
+          row.rows[0].actual_filament_used_grams,
+        ],
+        ["pending", null, null, null, null],
+      );
     });
 
     it("requeueStatus keeps the service on the accepted side of that constraint", async () => {
@@ -726,7 +832,9 @@ describe(
       // own because every queue read gates a plate on it still having pieces.
       const { bedId, pieceIds } = await makePlate({ n: 3, grams: 10 });
       await pool.query(
-        `UPDATE order_pieces SET status = 'done', bed_id = NULL WHERE piece_id = ANY($1::uuid[])`,
+        `UPDATE order_pieces
+            SET status = 'done', bed_id = NULL, print_completed_at = now()
+          WHERE piece_id = ANY($1::uuid[])`,
         [pieceIds],
       );
       const bed = await pool.query(`SELECT bed_id FROM print_beds WHERE bed_id = $1`, [bedId]);

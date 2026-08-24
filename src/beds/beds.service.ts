@@ -176,6 +176,33 @@ const BED_FULFILMENT_LABELS: Record<string, string> = {
   fulfilled: "fulfilled"
 };
 
+/**
+ * Turn a database-level refusal from the plate settle into something an
+ * operator can act on.
+ *
+ * A 23514 (CHECK violation) at this point is always the same story: detaching a
+ * piece from its plate revokes the `OR bed_id IS NOT NULL` escape that every
+ * status constraint on order_pieces carries, and the row landed without one of
+ * the columns that escape was covering for. The transaction has already rolled
+ * back by the time this runs, so the plate is untouched and re-opening it is a
+ * safe instruction rather than a hopeful one.
+ *
+ * The constraint name is kept in the message on purpose: it is the one token
+ * that turns a support conversation into a one-line answer, and it means
+ * nothing to an attacker. Anything that is not a CHECK violation is rethrown
+ * exactly as it came — this is a translator, never a swallower.
+ */
+function asSettleFailure(e: unknown): unknown {
+  const err = e as { code?: string; constraint?: string } | null;
+  if (err?.code !== "23514") return e;
+  const named = err.constraint ? ` (${err.constraint})` : "";
+  return new ConflictException(
+    "This plate couldn't be settled: one of its pieces can't hold the state it " +
+      `was given once it leaves the plate${named}. Nothing was changed — reopen ` +
+      "the plate and try again, and if it keeps happening send this message to support."
+  );
+}
+
 @Injectable()
 export class BedsService {
   constructor(
@@ -1468,6 +1495,13 @@ export class BedsService {
     } else {
       await this.releaseSpools(companyId, bedId);
     }
+    // The plate's run is over, so the machine is free. Without this a plate
+    // settled by hand leaves printer_stock.is_in_use TRUE against a finished
+    // run — the clock only ever releases plates it completes itself. Same call
+    // TimeStateService.completeDueBeds makes at this point in the lifecycle.
+    if (bed.assigned_printer_id) {
+      await releasePrinterTx(this.databaseService, companyId, bed.assigned_printer_id);
+    }
     // Propagate to child pieces — operator can override individual pieces
     // separately via the order-pieces endpoints if some succeeded and
     // some failed in the same bed.
@@ -1590,6 +1624,14 @@ export class BedsService {
 
   // ──────────────────────────────────────────────────────────
   // POST /api/beds/:bedId/outcome — triage a finished plate PIECE BY PIECE.
+  //
+  // NOTE ON FAILURE. Everything below happens in ONE transaction, so a plate
+  // either settles completely or not at all — there is no half-triaged plate to
+  // clean up. What the operator sees when it does not settle is handled by
+  // asSettleFailure: a CHECK violation here means a piece was asked to hold a
+  // state the database will not let it hold, and `new row for relation
+  // "order_pieces" violates check constraint "chk_…"` on a shop floor is a
+  // 500 with no next step in it.
   //
   // `complete()` above settles a plate as one thing: everything succeeded, or
   // everything failed. That is the truth for a small plate and a lie for a big
@@ -1855,15 +1897,36 @@ export class BedsService {
       // ── 2. Close the plate ──────────────────────────────────────────────
       // Identical to complete()'s stamp, so a triaged plate and a completed one
       // carry the same evidence of when it ran and for how long.
-      await client.query(
+      //
+      // RETURNING, because the window this computes is not the plate's alone:
+      // step 3 stamps the very same two instants onto every good part it
+      // detaches. Reading them back is what makes the plate and its parts agree
+      // to the microsecond — recomputing `now()` in the next statement would
+      // put the parts a few milliseconds after the plate that made them, which
+      // is the kind of difference that only ever shows up in a report.
+      const closed = await client.query<{
+        print_started_at: Date;
+        print_completed_at: Date;
+      }>(
         `UPDATE print_beds
             SET status                    = $3,
-                print_started_at          = COALESCE(print_started_at, scheduled_start_at, now()),
+                -- LEAST(…, now()) because a plate can be settled from
+                -- 'scheduled', and a scheduled window can still be in the
+                -- future: without the clamp a plate triaged early records a run
+                -- that finished before it started, and step 3 copies that onto
+                -- every piece.
+                print_started_at          = LEAST(
+                                              COALESCE(print_started_at, scheduled_start_at, now()),
+                                              now()
+                                            ),
                 print_completed_at        = now(),
                 actual_print_time_minutes = COALESCE($4, actual_print_time_minutes)
-          WHERE company_id = $1 AND bed_id = $2`,
+          WHERE company_id = $1 AND bed_id = $2
+        RETURNING print_started_at, print_completed_at`,
         [companyId, bedId, bedOutcome, input.actual_print_time_minutes ?? null]
       );
+      const ranFrom = closed.rows[0]?.print_started_at ?? null;
+      const ranTo = closed.rows[0]?.print_completed_at ?? null;
 
       // ── 3. Dismantle ────────────────────────────────────────────────────
       // Three set-based writes, one per destination — not a loop over pieces.
@@ -1871,15 +1934,38 @@ export class BedsService {
       // row is never momentarily a detached piece holding a status it cannot
       // satisfy.
       if (doneIds.length > 0) {
-        // The good parts keep every field they already had. Their printer and
-        // slicer columns have been null the whole time the bed owned them, and
-        // filling them in now would be inventing a record the all-or-nothing
-        // path never wrote — the plate's own row is where this run is recorded.
+        // A good part carries out the WINDOW it was printed in, and nothing
+        // else. Those two columns are what makes a finished piece exist:
+        //
+        //   · The database requires them. Every status constraint on
+        //     order_pieces carries an `OR bed_id IS NOT NULL` escape, and this
+        //     statement REVOKES that escape on the same line that sets the
+        //     status — the exact shape of trap that already bit the resin work.
+        //     A 'done' piece that leaves the plate without its completion stamp
+        //     is a CHECK violation, and it surfaces as a bare 500 in the middle
+        //     of settling a plate.
+        //
+        //   · Every report that counts finished work counts it by
+        //     print_completed_at — the month's consumed-filament cost
+        //     (FinanceReportsService.consumedFilamentThisMonth), throughput,
+        //     material mix, the resin post-processing queue. A part with a NULL
+        //     there is finished on screen and invisible in the accounts.
+        //
+        // What it deliberately does NOT carry out is the MACHINE: no printer,
+        // no nozzle, no actual_print_time_minutes. The fleet's hours are summed
+        // over standalone pieces (`bed_id IS NULL AND assigned_printer_id IS NOT
+        // NULL`) UNION plates, so a plate whose parts came out holding its
+        // printer and its six-hour run time would count those six hours once per
+        // part. The plate's own row is where this run's machine time is recorded,
+        // and it stays the only place.
         await client.query(
           `UPDATE order_pieces
-              SET status = 'done', bed_id = NULL
+              SET status             = 'done',
+                  bed_id             = NULL,
+                  print_started_at   = COALESCE($3::timestamptz, now()),
+                  print_completed_at = COALESCE($4::timestamptz, now())
             WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
-          [companyId, doneIds]
+          [companyId, doneIds, ranFrom, ranTo]
         );
       }
 
@@ -1915,7 +2001,22 @@ export class BedsService {
                   slicer_file_uploaded_at    = NULL,
                   slicer_print_time_minutes  = NULL,
                   slicer_filament_used_grams = NULL,
-                  slicer_resin_used_ml       = NULL
+                  slicer_resin_used_ml       = NULL,
+                  -- A piece going back in the queue has NOT been printed, and
+                  -- has certainly not been shipped. These are the columns
+                  -- JobsService.requeue, BedsService.reprint and bulkUnassign
+                  -- all clear, and for the same reason: a stale
+                  -- print_completed_at makes a piece sitting in the pending pool
+                  -- count as finished work in every report that reads that
+                  -- column, and a stale fulfilment_status lets the shipping
+                  -- rollup carry on advancing a part that does not exist yet.
+                  -- Cleared here rather than assumed absent, because a re-queued
+                  -- piece can be triaged off a second plate.
+                  print_started_at           = NULL,
+                  print_completed_at         = NULL,
+                  actual_print_time_minutes  = NULL,
+                  actual_filament_used_grams = NULL,
+                  fulfilment_status          = 'none'
             WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
           [
             companyId,
@@ -1945,7 +2046,13 @@ export class BedsService {
                   slicer_file_uploaded_at    = NULL,
                   slicer_print_time_minutes  = NULL,
                   slicer_filament_used_grams = NULL,
-                  slicer_resin_used_ml       = NULL
+                  slicer_resin_used_ml       = NULL,
+                  -- Same run-stamp clearing as the 'assigned' branch above.
+                  print_started_at           = NULL,
+                  print_completed_at         = NULL,
+                  actual_print_time_minutes  = NULL,
+                  actual_filament_used_grams = NULL,
+                  fulfilment_status          = 'none'
             WHERE company_id = $1 AND piece_id = ANY($2::uuid[])`,
           [companyId, toPending]
         );
@@ -1955,20 +2062,62 @@ export class BedsService {
       // coated in uncured resin and still has to be washed and cured. Same stamp
       // complete() applies, and the same tolerance for the column not existing
       // yet: the parts are correctly 'done' either way.
-      if (bedIsResin && doneIds.length > 0) {
+      //
+      // The re-queued parts move the OTHER way. A piece that failed or was never
+      // laid down has nothing to wash, so if it is carrying a post-processing
+      // state from an earlier run it has to give it up here — otherwise it sits
+      // in the wash queue forever for a print that does not exist. Mirrors
+      // JobsService.requeue, which clears the same pair.
+      //
+      // The CLEARING runs for ANY technology while the stamping is resin-only: a
+      // re-queued piece can have arrived from a resin plate earlier in its life,
+      // and gating the clear on THIS plate's technology would leave it in the
+      // wash queue forever. Both statements sit inside one savepoint so a
+      // pre-migration column is tolerated in exactly one place — and it has to
+      // be a savepoint, because a failed statement poisons the whole
+      // transaction and catching the error without one would take the next
+      // query down with it.
+      const requeuedIds = [...toAssigned, ...toPending];
+      if ((bedIsResin && doneIds.length > 0) || requeuedIds.length > 0) {
+        await client.query("SAVEPOINT bed_outcome_post_process");
         try {
-          await client.query(
-            `UPDATE order_pieces
-                SET post_process_state = 'print_done',
-                    post_process_state_entered_at = now()
-              WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
-                AND status = 'done'
-                AND post_process_state IS NULL`,
-            [companyId, doneIds]
-          );
+          if (bedIsResin && doneIds.length > 0) {
+            await client.query(
+              `UPDATE order_pieces
+                  SET post_process_state = 'print_done',
+                      post_process_state_entered_at = now()
+                WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+                  AND status = 'done'
+                  AND post_process_state IS NULL`,
+              [companyId, doneIds]
+            );
+          }
+          if (requeuedIds.length > 0) {
+            await client.query(
+              `UPDATE order_pieces
+                  SET post_process_state = NULL,
+                      post_process_state_entered_at = NULL
+                WHERE company_id = $1 AND piece_id = ANY($2::uuid[])
+                  AND post_process_state IS NOT NULL`,
+              [companyId, requeuedIds]
+            );
+          }
+          await client.query("RELEASE SAVEPOINT bed_outcome_post_process");
         } catch (e) {
           if ((e as { code?: string } | null)?.code !== "42703") throw e;
+          await client.query("ROLLBACK TO SAVEPOINT bed_outcome_post_process");
         }
+      }
+
+      // ── 3b. Give the machine back ───────────────────────────────────────
+      // A plate that is printing holds its printer's lock — by printer id, with
+      // a NULL currently_printing_piece_id, because the lock belongs to the
+      // plate and not to any one part of it. The clock releases that lock when a
+      // plate's scheduled window elapses (TimeStateService.completeDueBeds); a
+      // plate settled BY HAND before that moment never reaches the clock, and
+      // the machine stays flagged in-use against a run that is over.
+      if (bed.assigned_printer_id) {
+        await releasePrinterTx(client, companyId, bed.assigned_printer_id);
       }
 
       // ── 4. Record what happened ─────────────────────────────────────────
@@ -2043,6 +2192,8 @@ export class BedsService {
       for (const orderId of affectedOrders.keys()) {
         await recomputeOrderStatusTx(client, companyId, orderId);
       }
+    }).catch((e: unknown) => {
+      throw asSettleFailure(e);
     });
 
     return {
