@@ -143,7 +143,9 @@ export const createOrderSchema = z
     deadline: dateSchema,
     established_at: dateSchema.optional(),
     status: orderStatusSchema.optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    // Optional at creation: an order may be raised before anyone is put on it.
+    assigned_personnel_id: uuidSchema.optional()
   })
   .superRefine((value, ctx) => {
     if (value.established_at && value.established_at > value.deadline) {
@@ -223,7 +225,12 @@ export const updateOrderSchema = z
     // Which pricing preset prices this order (null clears → legacy pricing).
     costing_preset_id: uuidSchema.nullable().optional(),
     // Per-order costing tweak: selected variables + custom charges (null clears).
-    costing_config: costingConfigSchema.nullable().optional()
+    costing_config: costingConfigSchema.nullable().optional(),
+    // Which company employee owns this order (users.id). Nullable so an order
+    // can be handed back to nobody; the same-company check is in
+    // OrdersService.assertPersonnelExists, which this schema cannot do because
+    // it never sees the caller's company.
+    assigned_personnel_id: uuidSchema.nullable().optional()
   })
   .superRefine((value, ctx) => {
     if (value.established_at && value.deadline && value.established_at > value.deadline) {

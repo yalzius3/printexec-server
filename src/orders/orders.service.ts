@@ -60,6 +60,13 @@ type OrderRow = {
   costing_config: Record<string, unknown> | null;
   order_cost: string | null;
   order_total: string | null;
+  // Assigned personnel: the id lives on orders, the label comes from the LEFT
+  // JOIN on users and is already coalesced to the email when the member has no
+  // display name (see the SELECT). Both are null when nobody is assigned — and
+  // also when the assignee's account was deleted, because the FK nulls the id,
+  // so "no name" and "no owner" are always the same state.
+  assigned_personnel_id: string | null;
+  assigned_personnel_name: string | null;
 };
 
 @Injectable()
@@ -101,7 +108,11 @@ export class OrdersService {
         WHERE ${filters.join(" AND ")}
         GROUP BY
           o.order_id,
-          c.customer_id
+          c.customer_id,
+          -- u.id is the users PK, so grouping on it makes every u.* column above
+          -- functionally dependent and legal to select. Without it the two
+          -- personnel display columns are a grouping error, not a silent null.
+          u.id
         ORDER BY o.created_at DESC
       `,
       values
@@ -151,7 +162,9 @@ export class OrdersService {
           AND o.order_id = $2
         GROUP BY
           o.order_id,
-          c.customer_id
+          c.customer_id,
+          -- u.id: see the note on the list query's GROUP BY above.
+          u.id
       `,
       [companyId, orderId],
       executor
@@ -219,6 +232,10 @@ export class OrdersService {
       if (input.customer_id) {
         await this.assertCustomerExists(companyId, input.customer_id, client);
       }
+      // Same for personnel: optional, but if named they must be on this team.
+      if (input.assigned_personnel_id) {
+        await this.assertPersonnelExists(companyId, input.assigned_personnel_id, client);
+      }
       const establishedAt = input.established_at ?? new Date().toISOString().slice(0, 10);
       const orderNumber = input.order_number ?? await this.generateOrderNumber(companyId, establishedAt, client);
       await this.assertUniqueOrderNumber(companyId, orderNumber, undefined, client);
@@ -242,9 +259,10 @@ export class OrdersService {
             deadline,
             established_at,
             status,
-            notes
+            notes,
+            assigned_personnel_id
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
           RETURNING order_id
         `,
         [
@@ -260,7 +278,8 @@ export class OrdersService {
           input.deadline,
           establishedAt,
           input.status ?? "draft",
-          input.notes ?? null
+          input.notes ?? null,
+          input.assigned_personnel_id ?? null
         ],
         client
       );
@@ -357,6 +376,21 @@ export class OrdersService {
       await this.assertCustomerExists(companyId, input.customer_id as string);
     }
     const isFirstCustomerAssignment = assignsCustomer && !currentOrder.customer_id;
+
+    // Reassigning the order's owner. `undefined` = the PATCH said nothing about
+    // personnel and the current value stands; `null` = explicitly unassign.
+    // Only a real id needs checking, and the check returns the name so the
+    // history line can say WHO rather than print a uuid at the operator.
+    const reassignsPersonnel =
+      input.assigned_personnel_id !== undefined &&
+      input.assigned_personnel_id !== currentOrder.assigned_personnel_id;
+    let nextPersonnelName: string | null = null;
+    if (reassignsPersonnel && input.assigned_personnel_id) {
+      nextPersonnelName = await this.assertPersonnelExists(
+        companyId,
+        input.assigned_personnel_id
+      );
+    }
 
     const nextDeadline = input.deadline ?? currentOrder.deadline;
     const nextEstablishedAt = input.established_at ?? currentOrder.established_at;
@@ -501,6 +535,20 @@ export class OrdersService {
           description: `Order #${currentOrder.order_number} moved from ${currentOrder.status} to ${nextStatus}.`
         });
       }
+
+      // A handover is a real event in the life of an order — who is answerable
+      // for it changed — so it lands in the same history the status moves do.
+      if (reassignsPersonnel) {
+        const from = currentOrder.assigned_personnel_name ?? "nobody";
+        const to = nextPersonnelName ?? "nobody";
+        await recordOrderHistory(client, companyId, {
+          entityType: "order",
+          eventType: "personnel_assigned",
+          orderId,
+          orderNumber: currentOrder.order_number,
+          description: `Order #${currentOrder.order_number} reassigned from ${from} to ${to}.`
+        });
+      }
     });
 
     const updatedOrder = await this.getOrderById(companyId, orderId);
@@ -555,6 +603,40 @@ export class OrdersService {
     return result.rows;
   }
 
+  // Assigned personnel must be an employee OF THIS COMPANY. The FK on the
+  // column only proves the users row exists — it says nothing about which
+  // tenant it belongs to — so this is the guard that makes a cross-tenant
+  // assigned_personnel_id impossible, exactly as assertCustomerExists does for
+  // customer_id on the same table. Both create and update route through it.
+  //
+  // Returns the display name so the caller can write a history line naming the
+  // person, without a second round trip.
+  private async assertPersonnelExists(
+    companyId: string,
+    personnelId: string,
+    executor?: SqlExecutor
+  ): Promise<string> {
+    const result = await this.databaseService.query<{ display_name: string | null; email: string }>(
+      `
+        SELECT display_name, email
+        FROM users
+        WHERE company_id = $1
+          AND id = $2
+      `,
+      [companyId, personnelId],
+      executor
+    );
+
+    const row = result.rows[0];
+
+    if (!row) {
+      throw new BadRequestException("That person is not an employee of this company.");
+    }
+
+    // display_name is nullable on users (a member who has never set one), so the
+    // email is the fallback label — the same order the staff screen uses.
+    return row.display_name ?? row.email;
+  }
   private async assertCustomerExists(
     companyId: string,
     customerId: string,
@@ -724,6 +806,16 @@ export class OrdersService {
         o.profit_pct,
         o.costing_preset_id,
         o.costing_config,
+        o.assigned_personnel_id,
+        -- A DISPLAY LABEL, not a raw column — the same shape customer_name
+        -- above already has. users.display_name is NULLABLE (a member who never
+        -- set one, which is every member who joined by invite and skipped it),
+        -- so selecting it raw would hand the client a null for somebody who is
+        -- very much assigned, and every render site would have to remember the
+        -- email fallback independently. One COALESCE here means no client can
+        -- get it wrong. NULLIF(btrim(...)) so a display name of spaces falls
+        -- back too, rather than rendering as a blank cell.
+        COALESCE(NULLIF(btrim(u.display_name), ''), u.email) AS assigned_personnel_name,
         o.created_at,
         o.last_updated_at,
         c.customer_type,
@@ -745,6 +837,13 @@ export class OrdersService {
       FROM orders o
       LEFT JOIN customers c
         ON c.customer_id = o.customer_id
+      -- Assigned personnel. Scoped by company_id as well as id: the FK only
+      -- guarantees the user EXISTS, so if a cross-tenant id ever reached the
+      -- column this join refuses to render a name for it rather than leaking
+      -- another company's employee into this company's order list.
+      LEFT JOIN users u
+        ON u.id = o.assigned_personnel_id
+       AND u.company_id = o.company_id
       LEFT JOIN order_pieces op
         ON op.order_id = o.order_id
     `;
