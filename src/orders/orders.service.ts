@@ -1,6 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import type { z } from "zod";
 import { recordOrderHistory } from "../common/order-history";
+import { purgeOrderTx, type OrderPurgeResult } from "./order-purge";
+import { OrderFilesService } from "./order-files.service";
 import { reevaluateBedAfterPieceRemoval, releasePrinterForPieceTx } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
@@ -74,7 +76,8 @@ export class OrdersService {
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly customersService: CustomersService,
-    private readonly orderCosting: OrderCostingService
+    private readonly orderCosting: OrderCostingService,
+    private readonly orderFiles: OrderFilesService
   ) {}
 
   async listOrders(companyId: string, query: ListOrdersQuery) {
@@ -847,6 +850,51 @@ export class OrdersService {
       LEFT JOIN order_pieces op
         ON op.order_id = o.order_id
     `;
+  }
+
+  /**
+   * CANCEL AND DELETE — erase an order completely.
+   *
+   * Distinct from deleteOrder below, and the difference is the point. That one
+   * ends an order and keeps the paper: the invoice survives flagged with
+   * order_deleted_at, a "deleted" breadcrumb goes into the history, the files
+   * stay in the bucket. This one leaves nothing — rows, files and the financial
+   * record all go, and nothing afterwards shows the order existed.
+   *
+   * The cancel half is not a separate step and deliberately so. Setting
+   * status='cancelled' first would fire the piece-cancellation cascade, the
+   * status-change history row and the customer shipping-stage sweep, and every
+   * one of those writes would then have to be erased again by the purge two
+   * statements later. The order is being destroyed; there is no state left for
+   * it to be in. What the operator means by "cancel and delete" — this work is
+   * off, and it leaves no trace — is exactly what the purge does on its own.
+   *
+   * ONE TRANSACTION for every row, so a failure anywhere leaves the order fully
+   * intact rather than half-erased. Storage bytes go afterwards, because a
+   * bucket delete cannot be rolled back and doing it inside would destroy files
+   * for an order that a later failure leaves standing.
+   */
+  async cancelAndDeleteOrder(
+    companyId: string,
+    orderId: string
+  ): Promise<OrderPurgeResult & { files_removed: number; files_orphaned: boolean }> {
+    // 404s if it does not exist or belongs to another company — the tenant
+    // check that has to happen before anything destructive.
+    const order = await this.getOrderById(companyId, orderId);
+
+    const result = await this.databaseService.transaction((client) =>
+      purgeOrderTx(client, companyId, orderId, {
+        order_number: order.order_number,
+        title: order.title,
+        customer_id: order.customer_id
+      })
+    );
+
+    // Committed: the order is gone whatever happens next. removeObjects never
+    // throws for that reason — see the note on it.
+    const files = await this.orderFiles.removeObjects(result.storage_keys);
+
+    return { ...result, files_removed: files.removed, files_orphaned: files.failed };
   }
 
   async deleteOrder(companyId: string, orderId: string) {

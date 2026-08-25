@@ -160,5 +160,29 @@ export class OrdersController {
   ) {
     return this.ordersService.deleteOrder(companyId, orderId);
   }
+
+  /**
+   * Cancel and delete: erase the order completely — rows, files, and its
+   * financial record. There is no undo and nothing is left to find afterwards.
+   *
+   * A POST on its own path rather than a flag on the DELETE above, because the
+   * two are different operations with different consequences and a client
+   * should have to name which one it means. A query parameter on DELETE would
+   * make total erasure one typo away from the ordinary delete.
+   *
+   * Same action_orders permission as DELETE. Deliberately not a new, stronger
+   * one: inventing a permission here would lock it away from the operators who
+   * already hold full destructive rights over orders, and the guard that
+   * actually matters for something irreversible is the confirmation in front of
+   * it, not a role nobody has been granted yet.
+   */
+  @Post(":orderId/cancel-and-delete")
+  @RequirePermission("action_orders")
+  cancelAndDeleteOrder(
+    @CompanyId() companyId: string,
+    @Param("orderId") orderId: string
+  ) {
+    return this.ordersService.cancelAndDeleteOrder(companyId, orderId);
+  }
 }
 
