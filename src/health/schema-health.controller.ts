@@ -31,7 +31,7 @@ export class SchemaHealthController {
   @Public()
   @Get()
   async getSchemaHealth() {
-    const [cols, constraint] = await Promise.all([
+    const [cols, constraint, catalog] = await Promise.all([
       this.db.query<{ table_name: string; column_name: string }>(
         `SELECT table_name, column_name
            FROM information_schema.columns
@@ -57,6 +57,25 @@ export class SchemaHealthController {
           WHERE contype = 'c'
             AND conrelid IN ('public.order_pieces'::regclass, 'public.print_beds'::regclass)
           ORDER BY conrelid::regclass::text, conname`
+      ),
+      // The reference catalogue is GLOBAL by design: nothing in the read path
+      // filters it by tenant, and a tenant-authored row is stamped
+      // source_type='global_custom' precisely to say so. So "brand X is missing
+      // for new tenants" can only ever mean one of two things, and they need
+      // different fixes:
+      //   1. the seed migration was never applied  -> rows simply do not exist
+      //   2. the rows exist but carry a company_id -> they READ fine today, but
+      //      they are one WHERE clause away from becoming tenant-private
+      // Neither is visible from the outside, and the vendor catalogues are the
+      // two migrations most likely to be skipped (they are pure data, so
+      // nothing 500s when they are absent — the catalogue is just short).
+      this.db.query<{ brand: string; total_rows: number; global_rows: number }>(
+        `SELECT brand,
+                count(*)::int                                  AS total_rows,
+                count(*) FILTER (WHERE company_id IS NULL)::int    AS global_rows
+           FROM filament_reference
+          WHERE brand IN ('Patron 3D', 'LynX')
+          GROUP BY brand`
       ),
     ]);
 
@@ -104,6 +123,25 @@ export class SchemaHealthController {
       "chk_ready_requires_core_data.has_bed_escape": readyConstraintHasBedEscape,
     };
 
+    // Counts, deliberately reduced to booleans before they leave here: this
+    // endpoint is public, and "how many references exist" is closer to data
+    // than to shape. The expected totals are the ones each migration's own
+    // verify comment states.
+    const brandRows = (brand: string) =>
+      catalog.rows.find((r) => r.brand === brand) ?? { total_rows: 0, global_rows: 0 };
+    const patron = brandRows("Patron 3D");
+    const lynx = brandRows("LynX");
+
+    const catalogChecks = {
+      "filament_reference.patron_3d_seeded": patron.total_rows >= 75,
+      "filament_reference.lynx_seeded": lynx.total_rows >= 52,
+      // True when every vendor row present is global. Vacuously true while the
+      // catalogues are unseeded, which is why it is reported alongside the two
+      // seeded flags rather than on its own.
+      "filament_reference.vendor_catalogs_global":
+        patron.total_rows === patron.global_rows && lynx.total_rows === lynx.global_rows,
+    };
+
     // Which migration to run for whatever is missing — the whole point is that
     // the answer is actionable without opening the repo.
     const remedies: Record<string, string> = {
@@ -118,8 +156,14 @@ export class SchemaHealthController {
         "migrations/2026-06-30_metadata_driven_readiness.sql, THEN 2026-07-01_readiness_bed_escape_fix.sql",
       "chk_ready_requires_core_data.has_bed_escape":
         "migrations/2026-07-01_readiness_bed_escape_fix.sql",
+      "filament_reference.patron_3d_seeded":
+        "migrations/2026-07-22_patron_filament_catalog.sql",
+      "filament_reference.lynx_seeded":
+        "migrations/2026-08-16_lynx_filament_catalog.sql",
+      "filament_reference.vendor_catalogs_global":
+        "migrations/2026-08-25_vendor_catalogs_global.sql",
     };
-    const missing = Object.entries(checks)
+    const missing = Object.entries({ ...checks, ...catalogChecks })
       .filter(([, ok]) => !ok)
       .map(([name]) => ({ check: name, apply: remedies[name] ?? "see migrations/" }));
 
@@ -132,6 +176,7 @@ export class SchemaHealthController {
         process.env.SOURCE_VERSION ??
         null,
       resin: checks,
+      catalog: catalogChecks,
       missing,
       // Verbatim, so a mismatch these booleans do not model is still visible.
       constraints: Object.fromEntries(
