@@ -83,6 +83,14 @@ export interface BedRow {
   // Source orders / customers of this bed's constituent pieces (a bed may span
   // more than one order). Comma-joined, distinct, ordered. NULL if no pieces.
   order_references: string | null;
+  // The same orders' HUMAN NAMES (orders.title), which is what the Jobs
+  // surfaces actually draw — the serial is identity and lives in the tooltip.
+  //
+  // A PARALLEL LIST, not a paired one: string_agg aggregates the two columns
+  // independently and an untitled order contributes nothing here, so this can
+  // be SHORTER than order_references and the two must never be zipped. The
+  // client's bedOrderLabel() counts off the serials for exactly that reason.
+  order_titles: string | null;
   customer_names: string | null;
 }
 
@@ -494,6 +502,7 @@ export class BedsService {
         pp.post_process_state,
         pp.post_process_state_entered_at,
         src.order_references,
+        src.order_titles,
         src.customer_names
       FROM print_beds pb
       LEFT JOIN printer_instances pi ON pi.printer_id = pb.assigned_printer_id
@@ -537,6 +546,9 @@ export class BedsService {
         -- multiple orders), comma-joined for display.
         SELECT
           string_agg(DISTINCT o.order_number, ', ' ORDER BY o.order_number) AS order_references,
+          -- NULLIF(TRIM(...)) so an order titled with spaces contributes
+          -- nothing rather than an empty member the client has to filter out.
+          string_agg(DISTINCT NULLIF(TRIM(o.title), ''), ', ' ORDER BY NULLIF(TRIM(o.title), '')) AS order_titles,
           string_agg(DISTINCT COALESCE(
             NULLIF(cu.business_name, ''),
             NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')

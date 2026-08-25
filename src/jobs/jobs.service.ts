@@ -846,7 +846,13 @@ export class JobsService {
         return `op.post_process_state_entered_at ASC, ${stable}`;
       case "urgency":     return `${urgencyExpr} ${dir}, ${tie}, ${stable}`;
       case "deadline":    return `o.deadline ${dir}, ${tie}, ${stable}`;
-      case "order":       return `${text("o.order_number")}, ${tie}, ${stable}`;
+      // Sorted on the LABEL, not the serial, because that is what the column
+      // shows: Jobs draws an order by its title and falls back to its number.
+      // Ordering names by hidden serials is a column in no order at all.
+      // Byte-for-byte the same fallback as the client's orderLabel().
+      case "order":       return `${text(
+        `COALESCE(NULLIF(TRIM(o.title), ''), o.order_number)`
+      )}, ${tie}, ${stable}`;
       // Takes the tie-break too: its first term is a no-op against an equal
       // primary, and its second term is what applies the case rule.
       case "piece_name":  return `${text("op.piece_name")}, ${tie}, ${stable}`;
@@ -1194,6 +1200,7 @@ export class JobsService {
          op.piece_id,
          op.piece_name,
          o.order_number AS order_reference,
+         o.title AS order_title,
          o.deadline::text AS order_deadline,
          op.required_print_technology,
          op.resin_tank_id,
@@ -1266,6 +1273,13 @@ export class JobsService {
                 THEN MIN(o.order_number)
                 ELSE COUNT(DISTINCT o.order_id)::text || ' orders'
            END AS order_reference,
+           -- The same answer in the name the floor uses. Falls back to the
+           -- number per order, so a plate off one untitled order still reads as
+           -- something rather than blank.
+           CASE WHEN COUNT(DISTINCT o.order_id) = 1
+                THEN MIN(COALESCE(NULLIF(TRIM(o.title), ''), o.order_number))
+                ELSE COUNT(DISTINCT o.order_id)::text || ' orders'
+           END AS order_title,
            CASE WHEN COUNT(DISTINCT o.customer_id) = 1
                 THEN MIN(COALESCE(
                        NULLIF(cu.business_name, ''),
