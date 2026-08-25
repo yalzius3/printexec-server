@@ -1103,6 +1103,16 @@ export class AuthController {
     // onto a different company's live code. See staff/invite-token.ts.
     const inviteToken = canonicalizeInviteToken(rawInviteToken);
     if (!inviteToken) {
+      // The RESPONSE stays identical to a genuine miss (below) on purpose —
+      // see the comment there. The LOG must not: these two are different
+      // faults, one never reaches the database at all, and for a long time
+      // nothing downstream could tell them apart. Code points, not the raw
+      // value, because the interesting failures here are invisible characters.
+      this.logger.warn(
+        `Invite refused before lookup — entry did not canonicalize ` +
+          `(${[...rawInviteToken].length} code points: ` +
+          `${[...rawInviteToken].map((c) => c.codePointAt(0)!.toString(16)).join(" ")})`
+      );
       // Malformed → deliberately the SAME 404 as a genuine miss. A distinct
       // "that isn't a code" message would read better, but it would also tell a
       // caller which guesses are shaped correctly, and AuthPage matches these
@@ -1127,6 +1137,11 @@ export class AuthController {
 
     // (8) token doesn't exist
     if (!inviteRow.rows.length) {
+      // Distinguishable from the pre-lookup refusal above in the log, and only
+      // there. Safe to name the canonical form: it matched no row, so it is
+      // not a live credential — and it is the one string that makes this
+      // comparable against what the owner's window is showing.
+      this.logger.warn(`Invite lookup matched no row for canonical form ${inviteToken}`);
       throw new NotFoundException("This invite code doesn't exist. Check the code and try again.");
     }
     const inv = inviteRow.rows[0]!;
@@ -1152,11 +1167,37 @@ export class AuthController {
 
     const emptyPerms = {};
 
-    // All-or-nothing, and the invite is CLAIMED first with a compare-and-set:
-    // two people racing the same code can both pass the friendly checks above,
-    // but only one "WHERE used_at IS NULL" update wins — the loser's whole
-    // membership rolls back instead of leaving half-created rows.
+    // All-or-nothing, with a compare-and-set claim on the invite: two people
+    // racing the same code can both pass the friendly checks above, but only
+    // one "WHERE used_at IS NULL" update wins — the loser's whole membership
+    // rolls back instead of leaving half-created rows.
+    //
+    // ORDER IS LOAD-BEARING, and it is the opposite of what it looks like it
+    // should be. The claim used to run FIRST, which meant
+    // `used_by = <this account>` was written before the users row with that id
+    // existed — and company_invites.used_by is a foreign key onto users(id),
+    // the same reference that made removeStaffMember die on RESTRICT. So every
+    // single redemption raised 23503 foreign_key_violation, the transaction
+    // rolled back, and the invite stayed unused and still listed in the
+    // owner's window while the invitee was told the request referenced a
+    // record that does not exist.
+    //
+    // That bug was INVISIBLE until d868afb. While redemption compared codes
+    // byte-exactly, nothing ever got past the 404 to reach this transaction —
+    // which is exactly why used_by had no proven writer and its column
+    // definition was never exercised. Fixing the match unmasked it.
+    //
+    // Claiming AFTER the insert loses nothing: both statements are in the same
+    // transaction, so a racer that loses the compare-and-set still rolls its
+    // own users row back. Atomicity does the work the ordering appeared to.
     await this.db.transaction(async (client) => {
+      await this.db.query(
+        `INSERT INTO users (id, company_id, email, display_name, role, permissions)
+         VALUES ($1, $2, $3, $4, 'staff', $5)`,
+        [userId, companyId, email, displayName, JSON.stringify(emptyPerms)],
+        client
+      );
+
       const claimed = await this.db.query(
         `UPDATE company_invites SET used_at = now(), used_by = $1
           WHERE token = $2 AND used_at IS NULL`,
@@ -1166,13 +1207,6 @@ export class AuthController {
       if (!claimed.rowCount) {
         throw new ConflictException("This invite code has already been used.");
       }
-
-      await this.db.query(
-        `INSERT INTO users (id, company_id, email, display_name, role, permissions)
-         VALUES ($1, $2, $3, $4, 'staff', $5)`,
-        [userId, companyId, email, displayName, JSON.stringify(emptyPerms)],
-        client
-      );
 
       await this.db.query(
         `INSERT INTO company_memberships (company_id, account_id, role, permissions)
