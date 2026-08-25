@@ -114,6 +114,9 @@ export interface BedOutcomePlanPiece {
   piece_name: string;
   order_id: string;
   order_number: string;
+  /** The order's human name. Null for an order nobody titled — the client
+   *  falls back to the number. */
+  order_title: string | null;
   customer_name: string | null;
   order_deadline: string | null;
   share: number;
@@ -759,6 +762,9 @@ export class BedsService {
     const res = await this.databaseService.query(
       `SELECT op.piece_id, op.piece_name, op.description, op.status,
               op.order_id, o.order_number,
+              -- The name the floor uses. The window draws this and keeps the
+              -- number for the hover card; see the client's orderLabel().
+              o.title AS order_title,
               op.cost_inputs,
               COALESCE(
                 NULLIF(cu.business_name, ''),
@@ -769,7 +775,9 @@ export class BedsService {
          JOIN orders o ON o.order_id = op.order_id
          LEFT JOIN customers cu ON cu.customer_id = o.customer_id
         WHERE op.company_id = $1 AND op.bed_id = $2
-        ORDER BY o.order_number, op.piece_name`,
+        -- Grouped in the reading order, not the numbering order: the list is
+        -- read as names, and clustering by serial scatters the names.
+        ORDER BY COALESCE(NULLIF(TRIM(o.title), ''), o.order_number), op.piece_name`,
       [companyId, bedId]
     );
     return res.rows;
@@ -1569,11 +1577,13 @@ export class BedsService {
       piece_name: string;
       order_id: string;
       order_number: string;
+      order_title: string | null;
       customer_name: string | null;
       order_deadline: string | null;
       cost_inputs: { grams?: string[]; time?: string } | null;
     }>(
       `SELECT op.piece_id, op.piece_name, op.order_id, o.order_number,
+              o.title AS order_title,
               COALESCE(
                 NULLIF(cu.business_name, ''),
                 NULLIF(TRIM(CONCAT_WS(' ', cu.first_name, cu.last_name)), '')
@@ -1584,7 +1594,7 @@ export class BedsService {
          JOIN orders o ON o.order_id = op.order_id AND o.company_id = op.company_id
          LEFT JOIN customers cu ON cu.customer_id = o.customer_id
         WHERE op.company_id = $1 AND op.bed_id = $2
-        ORDER BY o.order_number, op.piece_name, op.piece_id`,
+        ORDER BY COALESCE(NULLIF(TRIM(o.title), ''), o.order_number), op.piece_name, op.piece_id`,
       [companyId, bedId]
     );
 
@@ -1627,6 +1637,7 @@ export class BedsService {
         piece_name: p.piece_name,
         order_id: p.order_id,
         order_number: p.order_number,
+        order_title: p.order_title,
         customer_name: p.customer_name,
         order_deadline: p.order_deadline,
         share: Math.round((shares.get(p.piece_id) ?? 0) * 100) / 100
