@@ -61,7 +61,7 @@ test("junk appended to the segment does not disguise it", () => {
 });
 
 test("a directory prefix is discarded before matching", () => {
-  assert.equal(blockedUploadExtension("C:\Users\op\Desktop\shell.php"), ".php");
+  assert.equal(blockedUploadExtension("C:\\Users\\op\\Desktop\\shell.php"), ".php");
   assert.equal(blockedUploadExtension("../../etc/shell.php"), ".php");
   // ...and a blocked word in a FOLDER name is not a blocked file.
   assert.equal(blockedUploadExtension("/srv/www.php/bracket.stl"), null);
@@ -79,7 +79,7 @@ test("every file type this app actually takes is allowed", () => {
     "print.gcode", "print.gco", "print.g", "print.bgcode", "print.gx",
     "print.ctb", "plate.slicer", "batch.zip",
     "invoice.pdf", "logo.png", "photo.jpg", "photo.jpeg", "scan.gif",
-    "render.webp", "logo.svg", "notes.txt", "export.csv",
+    "render.webp", "notes.txt", "export.csv",
     "quote.docx", "sheet.xlsx", "drawing.dxf", "drawing.dwg",
   ];
   for (const name of allowed) {
@@ -123,10 +123,44 @@ test("the exported list covers both families and nothing this app takes", () => 
   const printing = [
     ".stl", ".3mf", ".obj", ".step", ".stp", ".gcode", ".gco", ".g",
     ".bgcode", ".gx", ".ctb", ".zip", ".pdf", ".png", ".jpg", ".jpeg",
-    ".gif", ".webp", ".svg", ".txt", ".csv",
+    ".gif", ".webp", ".txt", ".csv",
   ];
   for (const ext of printing) {
     assert.ok(!BLOCKED_UPLOAD_EXTENSION_LIST.includes(ext), `${ext} must stay uploadable`);
+  }
+});
+
+test("renderable markup is blocked — SVG and the HTML family", () => {
+  // SVG is the one this was added for: served as image/svg+xml it is a
+  // document, and a document served same-origin with the SPA can read the
+  // session out of localStorage. See the header note in upload-file-types.ts.
+  for (const name of [
+    "logo.svg", "logo.svgz",
+    "page.html", "page.htm", "page.xhtml", "page.xht",
+    "page.shtml", "page.mhtml", "page.mht",
+  ]) {
+    assert.notEqual(blockedUploadExtension(name), null, name);
+  }
+});
+
+test("the SVG block survives the same decoys the PHP block does", () => {
+  // Same parser-confusion tricks the PHP family is tested against, because a
+  // gate that stops "logo.svg" but not "logo.svg " is not a gate.
+  assert.equal(blockedUploadExtension("logo.SVG"), ".svg");
+  assert.equal(blockedUploadExtension("logo.svg "), ".svg");
+  assert.equal(blockedUploadExtension("logo.svg."), ".svg");
+  assert.equal(blockedUploadExtension("logo.svg\u0000.png"), ".svg");
+  assert.equal(blockedUploadExtension("logo.svg.png"), ".svg");
+  assert.equal(blockedUploadExtension("C:\\Users\\a\\logo.svg"), ".svg");
+});
+
+test("names that merely resemble the markup extensions are allowed", () => {
+  for (const name of [
+    "svg-holder.stl",   // no dot before svg
+    "part.svgx",        // not .svg
+    "bracket.html5.stl" // interior segment is "html5", not "html"
+  ]) {
+    assert.equal(blockedUploadExtension(name), null, name);
   }
 });
 

@@ -45,6 +45,7 @@ import {
   setHoldSchema
 } from "./licensing.schemas";
 import { AdminAuditInterceptor } from "./admin-audit.interceptor";
+import { Throttle, ThrottleGuard } from "../common/throttle.guard";
 import { AdminSessionService } from "./admin-session.service";
 import { AnalyticsAiService } from "../analytics/analytics-ai.service";
 import { CompanyPurgeService } from "./company-purge.service";
@@ -79,7 +80,18 @@ function substituteVars(template: string, vars: Record<string, string>): string 
 }
 
 @LicenseExempt()
-@UseGuards(PlatformAdminGuard)
+// ThrottleGuard is listed FIRST so a flood is rejected before
+// PlatformAdminGuard spends a database round trip resolving the caller's
+// email on every one of them.
+//
+// 300/minute is deliberately far above anything the console does by hand —
+// opening the admin area fires a handful of requests, not hundreds — so this
+// never fires for a real operator. It exists to cap a SCRIPT: an attacker
+// holding a stolen admin session enumerating companies, or hammering the
+// destructive routes. Per-admin, because req.userId is the only identifier
+// here that cannot be forged (see throttle.guard.ts).
+@Throttle({ limit: 300, windowMs: 60_000 })
+@UseGuards(ThrottleGuard, PlatformAdminGuard)
 @UseInterceptors(AdminAuditInterceptor)
 @Controller("licensing/admin")
 export class LicensingAdminController {
@@ -132,6 +144,15 @@ export class LicensingAdminController {
   // still enforces the email allowlist here (@SkipAdminSession only waives the
   // session factor — this route is what issues it). Failed attempts lock the
   // admin out for a cooling-off period.
+  //
+  // Rate limit on top of the existing failure lockout, which they complement
+  // rather than duplicate: AdminSessionService counts FAILED attempts (5 →
+  // 15-minute lockout), while this caps attempts of ANY outcome. Set
+  // deliberately looser than the lockout so it never fires first for a real
+  // admin — someone mistyping the passphrase hits the 5-failure lockout and
+  // gets that clear message, not an opaque 429. This only engages against
+  // something making requests faster than a person types.
+  @Throttle({ limit: 10, windowMs: 5 * 60_000 })
   @SkipAdminSession()
   @Post("session")
   async unlock(@UserId() userId: string, @Body() body: unknown) {

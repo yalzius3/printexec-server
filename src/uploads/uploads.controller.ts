@@ -71,6 +71,50 @@ const CONTENT_TYPES: Record<string, string> = {
   ".csv": "text/csv"
 };
 
+// Content types that are safe to hand back WITHOUT forcing an opaque origin.
+// Only PDF is here, and only because Chrome's built-in viewer misbehaves under
+// a sandbox CSP — a regression users would notice on every invoice. Everything
+// else gets sandboxed, INCLUDING types added to CONTENT_TYPES in future: the
+// default has to be "restrict", because the alternative failed exactly once
+// and that once was an account-takeover chain.
+const UNSANDBOXED_CONTENT_TYPES = new Set<string>(["application/pdf"]);
+
+/**
+ * Response hardening for anything a TENANT uploaded. Applied by BOTH serve
+ * routes — the public logo route and the cookie-gated file route.
+ *
+ * Two headers, two different jobs:
+ *
+ *   X-Content-Type-Options: nosniff
+ *     Stops the browser overriding the Content-Type we declare. Without it a
+ *     .txt or .csv full of markup can be sniffed into HTML and rendered.
+ *
+ *   Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox
+ *     The important one, and the reason it is here at all. An SVG served as
+ *     image/svg+xml is a DOCUMENT: navigate to it and its <script> runs in
+ *     THIS origin, which the Pages proxy makes the same origin as the SPA —
+ *     so it could read the Supabase session out of localStorage. "default-src
+ *     'none'" blocks the script; "sandbox" (without allow-same-origin) puts
+ *     the document in an opaque origin so even a bypass reaches no app state.
+ *     "style-src 'unsafe-inline'" is deliberate: logo SVGs carry inline
+ *     styling, and stripping it would render existing logos wrong.
+ *
+ * Uploads of .svg are now refused outright (common/upload-file-types.ts), but
+ * that only stops NEW ones — SVG was the offered logo format, so the bucket
+ * already holds them for real tenants. This header is what makes that existing
+ * population inert, and it does so without breaking them: <img> never executes
+ * script, so those logos keep rendering on the brand page and on invoices.
+ */
+function hardenUserFileResponse(reply: FastifyReply, contentType: string): void {
+  reply.header("X-Content-Type-Options", "nosniff");
+  if (!UNSANDBOXED_CONTENT_TYPES.has(contentType)) {
+    reply.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+    );
+  }
+}
+
 const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "uploads";
 
 @Controller("uploads")
@@ -126,6 +170,7 @@ export class UploadsController {
     const contentType = CONTENT_TYPES[path.extname(filename).toLowerCase()] ?? "application/octet-stream";
     reply.header("Content-Type", contentType);
     reply.header("Content-Length", bytes.byteLength);
+    hardenUserFileResponse(reply, contentType);
     reply.header("Cache-Control", "public, max-age=300");
     return reply.send(bytes);
   }
@@ -186,6 +231,7 @@ export class UploadsController {
     // Without this header the Jobs queue re-downloaded every piece thumbnail on
     // every page load, and each one is a full round trip that buffers the object
     // in the API process.
+    hardenUserFileResponse(reply, contentType);
     reply.header("Cache-Control", "private, max-age=31536000, immutable");
     return reply.send(bytes);
   }

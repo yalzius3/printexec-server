@@ -4,6 +4,7 @@ import { EmailModule } from "../email/email.module";
 import { AdminAuditInterceptor } from "./admin-audit.interceptor";
 import { AdminSessionService } from "./admin-session.service";
 import { PlatformAdminGuard } from "./platform-admin.guard";
+import { ThrottleGuard } from "../common/throttle.guard";
 import { CompanyPurgeService } from "./company-purge.service";
 import { DiscountService } from "./discount.service";
 import { LicenseNotificationsService } from "./license-notifications.service";
@@ -36,7 +37,11 @@ import { SubscriptionInvoiceService } from "./subscription-invoice.service";
     // APP_GUARD) because they gate ONLY the admin controller.
     AdminSessionService,
     PlatformAdminGuard,
-    AdminAuditInterceptor
+    AdminAuditInterceptor,
+    // Registered explicitly, like the guard above, so Nest keeps ONE instance.
+    // The rate-limit counters live in that instance's memory — a second copy
+    // would silently double every budget.
+    ThrottleGuard
   ],
   exports: [LicensingService, PaymentsService, SubscriptionInvoiceService]
 })
