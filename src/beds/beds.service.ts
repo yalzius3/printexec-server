@@ -6,6 +6,12 @@ import {
 } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import {
+  StorageFilesService,
+  keysFromRows,
+  BED_FILE_FIELDS,
+  PIECE_FILE_FIELDS
+} from "../storage/storage-files.service";
+import {
   recordOrderHistory,
   recordOrderHistoryBatch,
   type OrderHistoryEvent
@@ -222,7 +228,8 @@ export class BedsService {
     // Books measured plate waste to the ledger (recordOutcome), the same way
     // SimpleJobsService books a single failed piece. One-way: FinanceModule
     // reaches Orders and Email and neither reaches back here, so no cycle.
-    private readonly finance: FinanceService
+    private readonly finance: FinanceService,
+    private readonly storage: StorageFilesService
   ) {}
 
   // ──────────────────────────────────────────────────────────
@@ -2431,6 +2438,9 @@ export class BedsService {
   // ──────────────────────────────────────────────────────────
   async deleteBed(companyId: string, bedId: string): Promise<{ deleted: true; bed_id: string }> {
     const bed = await this.loadBed(companyId, bedId); // 404 if it doesn't exist / wrong company
+    // Removed after the transaction commits, and only the keys nothing else
+    // still points at — a bed's pieces can be duplicates sharing one G-code.
+    const fileKeys: string[] = [];
     await this.databaseService.transaction(async (client) => {
       // A bed that is actively printing holds its printer's lock (a bed's lock
       // has a NULL currently_printing_piece_id, so it's released by printer id,
@@ -2440,10 +2450,16 @@ export class BedsService {
         await releasePrinterTx(client, companyId, bed.assigned_printer_id);
       }
 
-      const pieceRes = await client.query<{ piece_id: string; order_id: string }>(
-        `SELECT piece_id, order_id FROM order_pieces WHERE company_id = $1 AND bed_id = $2`,
+      // `op.*` rather than a named list: the piece file columns each ship in
+      // their own migration, so a field is present exactly when its column is.
+      const pieceRes = await client.query<{ piece_id: string; order_id: string; slicer_file_url?: string | null; stl_file_url?: string | null; stl_thumbnail_url?: string | null }>(
+        `SELECT op.* FROM order_pieces op WHERE op.company_id = $1 AND op.bed_id = $2`,
         [companyId, bedId]
       );
+      // The plate's own files plus every child piece's, captured before the
+      // rows carrying them are deleted below.
+      fileKeys.push(...keysFromRows([bed as unknown as Record<string, unknown>], BED_FILE_FIELDS));
+      fileKeys.push(...keysFromRows(pieceRes.rows, PIECE_FILE_FIELDS));
       // Release each child piece's spool reservations.
       for (const p of pieceRes.rows) {
         await releasePieceSpoolsTx(client, companyId, p.piece_id);
@@ -2463,6 +2479,8 @@ export class BedsService {
         await recomputeOrderStatusTx(client, companyId, orderId);
       }
     });
+    // Committed — the bed and its pieces are gone whatever happens next.
+    await this.storage.removeUnreferenced(fileKeys);
     return { deleted: true, bed_id: bedId };
   }
 

@@ -4,6 +4,10 @@ import {
   releasePrinterForPieceTx,
   reevaluateBedAfterPieceRemoval
 } from "../common/cascade";
+// storage-keys, NOT storage-files.service: this module is pure and reachable
+// from `node --test`, which cannot parse the service's constructor parameter
+// properties. See the header of storage-keys.ts.
+import { keysFromRows, PIECE_FILE_FIELDS } from "../storage/storage-keys";
 
 // ════════════════════════════════════════════════════════════════
 // ORDER PURGE — "cancel and delete", the version that leaves nothing.
@@ -72,24 +76,13 @@ export interface OrderPurgeResult {
   unapplied_amount: string;
 }
 
-/**
- * Map a stored file URL to its Supabase Storage object key.
- *
- * URLs are written as "/api/uploads/<companyId>/<filename>" (legacy
- * "/uploads/..."), and the object key mirrors the trailing
- * "<companyId>/<filename>". Same rule FilePurgeService uses — deliberately
- * duplicated rather than imported, because that service builds a Supabase
- * client in its constructor, and importing it here would drag the whole
- * maintenance module into the orders module for four lines of string work.
- */
-export function storageKeyFromUrl(url: string | null): string | null {
-  if (!url) return null;
-  const marker = "/uploads/";
-  const idx = url.indexOf(marker);
-  if (idx < 0) return null;
-  const key = url.slice(idx + marker.length).split("?")[0] ?? "";
-  return key.length > 0 ? key : null;
-}
+// storageKeyFromUrl used to be redefined here, byte-identical to the copy in
+// FilePurgeService, because importing that service would have dragged its
+// Supabase client into this module for four lines of string work. Both copies
+// now re-export the one in storage-files.service.ts, which is a plain function
+// with no DI — so the reason for duplicating it is gone, and with it the risk
+// of the two parsers drifting apart.
+export { storageKeyFromUrl } from "../storage/storage-keys";
 
 /**
  * Erase one order and everything that exists only because of it.
@@ -115,17 +108,25 @@ export async function purgeOrderTx(
   await client.query("SET LOCAL printexec.purge_order = 'on'");
 
   // ── 1. Pieces: snapshot before anything is released or deleted ────────────
+  // `op.*` rather than a named list. Two reasons: the file columns each ship in
+  // their own migration (naming stl_thumbnail_url on a database that has not
+  // run 2026-07-04_piece_stl_thumbnail.sql raises 42703 and 500s the purge),
+  // and a star cannot silently omit a NEW file column the way the old named
+  // list omitted the thumbnail — which is how "cancel and delete", the path
+  // whose whole promise is that nothing remains, was still leaving every
+  // piece's thumbnail PNG in the bucket.
   const pieces = await client.query<{
     piece_id: string;
     bed_id: string | null;
     status: string;
     assigned_printer_id: string | null;
-    slicer_file_url: string | null;
-    stl_file_url: string | null;
+    slicer_file_url?: string | null;
+    stl_file_url?: string | null;
+    stl_thumbnail_url?: string | null;
   }>(
-    `SELECT piece_id, bed_id, status, assigned_printer_id, slicer_file_url, stl_file_url
-       FROM order_pieces
-      WHERE order_id = $1 AND company_id = $2`,
+    `SELECT op.*
+       FROM order_pieces op
+      WHERE op.order_id = $1 AND op.company_id = $2`,
     [orderId, companyId]
   );
 
@@ -155,15 +156,16 @@ export async function purgeOrderTx(
     `SELECT file_url FROM order_attachments WHERE company_id = $1 AND order_id = $2`,
     [companyId, orderId]
   );
-  const storageKeys = [
-    ...pieces.rows.flatMap((p) => [p.slicer_file_url, p.stl_file_url]),
-    ...attachments.rows.map((a) => a.file_url)
-  ]
-    .map(storageKeyFromUrl)
-    .filter((k): k is string => k !== null);
   // One file can legitimately be referenced twice (a piece duplicated from
-  // another keeps the same slicer URL), and remove() is happier with a set.
-  const uniqueKeys = [...new Set(storageKeys)];
+  // another keeps the same slicer URL) — keysFromRows returns a set, and the
+  // caller passes the result through removeUnreferenced, which is what makes
+  // it safe even when the twin lives outside this order.
+  const uniqueKeys = [
+    ...new Set([
+      ...keysFromRows(pieces.rows, PIECE_FILE_FIELDS),
+      ...keysFromRows(attachments.rows, ["file_url"])
+    ])
+  ];
 
   // ── 3. The financial record ───────────────────────────────────────────────
   // Invoices first: their journal entries have to be captured before the order
@@ -285,7 +287,10 @@ export async function purgeOrderTx(
     ...new Set(pieces.rows.map((p) => p.bed_id).filter((b): b is string => !!b))
   ];
   for (const bedId of affectedBedIds) {
-    await reevaluateBedAfterPieceRemoval(client, companyId, bedId);
+    // A bed emptied by this purge is deleted, and its own plate G-code/STL —
+    // separate objects from any piece's — come back here to be removed with
+    // everything else. Nothing removed them before.
+    uniqueKeys.push(...(await reevaluateBedAfterPieceRemoval(client, companyId, bedId)));
   }
 
   // order_emails is ON DELETE CASCADE from orders, but the whole point of this
@@ -343,7 +348,8 @@ export async function purgeOrderTx(
     pieces: pieces.rows.length,
     beds_settled: affectedBedIds.length,
     attachments: attachments.rows.length,
-    storage_keys: uniqueKeys,
+    // De-duped again: the bed sweep above appended after the first pass.
+    storage_keys: [...new Set(uniqueKeys)],
     invoices: invoices.rows.length,
     invoice_numbers: invoices.rows.map((r) => r.invoice_number),
     journal_entries: entriesDeleted,

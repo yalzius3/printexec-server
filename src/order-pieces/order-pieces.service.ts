@@ -18,6 +18,11 @@ import {
 import { isResinTech, materialFamily, sameColor, techCompatible } from "../jobs/jobs.service";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
 import {
+  StorageFilesService,
+  keysFromRows,
+  PIECE_FILE_FIELDS
+} from "../storage/storage-files.service";
+import {
   createOrderPieceSchema,
   duplicateOrderPieceSchema,
   listOrderPiecesQuerySchema,
@@ -55,6 +60,12 @@ type PieceRow = {
   post_process_state_entered_at: string | null;
   slicer_file_url: string | null;
   slicer_file_uploaded_at: string | null;
+  // Optional because each ships in its own migration, and every read here is
+  // `SELECT op.*` — so the field is present at runtime exactly when the column
+  // is. Declaring them required would make a delete path look safe on a
+  // database where the column does not exist.
+  stl_file_url?: string | null;
+  stl_thumbnail_url?: string | null;
   slicer_profile: string | null;
   slicer_print_time_minutes: number | null;
   slicer_filament_used_grams: string | null;
@@ -229,7 +240,10 @@ export const POST_PROCESS_TECHNOLOGIES = new Set(["MSLA", "SLA"]);
 
 @Injectable()
 export class OrderPiecesService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly storage: StorageFilesService
+  ) {}
 
   async listPieces(companyId: string, query: ListOrderPiecesQuery) {
     const values: unknown[] = [companyId];
@@ -656,6 +670,13 @@ export class OrderPiecesService {
       }
     }
 
+    // Keys the row is pointing at, captured before it disappears. Removed only
+    // after the transaction commits, and only if nothing else still references
+    // them — duplicatePiece copies slicer_file_url onto every duplicate, so
+    // this piece's G-code may well be twenty other pieces' G-code too.
+    const bedKeys: string[] = [];
+    const pieceKeys = keysFromRows([currentPiece as unknown as Record<string, unknown>], PIECE_FILE_FIELDS);
+
     await this.databaseService.transaction(async (client) => {
       // Return any reserved filament to stock before the row disappears.
       await releasePieceSpoolsTx(client, companyId, pieceId);
@@ -680,13 +701,18 @@ export class OrderPiecesService {
       );
 
       if (currentPiece.bed_id) {
-        await reevaluateBedAfterPieceRemoval(client, companyId, currentPiece.bed_id);
+        // Returns the plate's own files when removing this piece emptied the
+        // bed and deleted it; empty in the cancel/dismantle branches.
+        bedKeys.push(...(await reevaluateBedAfterPieceRemoval(client, companyId, currentPiece.bed_id)));
       }
 
       await this.syncOrderStatus(companyId, currentPiece.order_id, client);
       await this.logPieceHistory(client, companyId, null, currentPiece.order_id, currentPiece.piece_name, "deleted",
         `Piece "${currentPiece.piece_name}" deleted.`);
     });
+
+    // Committed — the rows are gone whatever happens next, so this never throws.
+    await this.storage.removeUnreferenced([...pieceKeys, ...bedKeys]);
 
     return { deleted: true, piece_id: pieceId };
   }
@@ -727,6 +753,11 @@ export class OrderPiecesService {
       status: string;
       assigned_printer_id: string | null;
       order_status: string;
+      // Same `op.*` reasoning as above, now load-bearing for a second reason:
+      // these are the keys whose bytes get removed once the delete commits.
+      slicer_file_url?: string | null;
+      stl_file_url?: string | null;
+      stl_thumbnail_url?: string | null;
     }>(
       `SELECT op.*, o.status AS order_status
          FROM order_pieces op
@@ -739,7 +770,7 @@ export class OrderPiecesService {
     // Validated in the caller's id order, applying the same four checks in the
     // same sequence as the per-piece loop did, so the FIRST failure a caller sees
     // is unchanged — same exception type, same message.
-    const pieces: Array<{ piece_id: string; order_id: string; bed_id: string | null; piece_name: string; status: string; assigned_printer_id: string | null }> = [];
+    const pieces: Array<{ piece_id: string; order_id: string; bed_id: string | null; piece_name: string; status: string; assigned_printer_id: string | null; slicer_file_url?: string | null; stl_file_url?: string | null; stl_thumbnail_url?: string | null }> = [];
     for (const pieceId of uniqueIds) {
       const piece = byId.get(pieceId);
       // The join above is inner, so a missing row means either the piece doesn't
@@ -766,6 +797,16 @@ export class OrderPiecesService {
       pieces.push(piece);
     }
 
+    // ONE key set for the whole batch, and ONE reference check on it after the
+    // commit. Per-piece would mean a full scan of every URL column per piece —
+    // there is no index on any of them — turning a 500-piece delete into 500
+    // table scans. The batch shape keeps it at one.
+    const pieceKeys = keysFromRows(
+      pieces as unknown as Record<string, unknown>[],
+      PIECE_FILE_FIELDS
+    );
+    const bedKeys: string[] = [];
+
     await this.databaseService.transaction(async (client) => {
       const bedIds = new Set<string>();
       const orderIds = new Set<string>();
@@ -791,12 +832,15 @@ export class OrderPiecesService {
       // ONE re-evaluation per affected bed, now that every selected piece is
       // gone: all-removed → bed deleted; some kept → bed disassembled.
       for (const bedId of bedIds) {
-        await reevaluateBedAfterPieceRemoval(client, companyId, bedId);
+        bedKeys.push(...(await reevaluateBedAfterPieceRemoval(client, companyId, bedId)));
       }
       for (const orderId of orderIds) {
         await this.syncOrderStatus(companyId, orderId, client);
       }
     });
+
+    // Committed — the rows are gone whatever happens next, so this never throws.
+    await this.storage.removeUnreferenced([...pieceKeys, ...bedKeys]);
 
     return { deleted: uniqueIds.length, piece_ids: uniqueIds };
   }

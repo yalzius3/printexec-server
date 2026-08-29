@@ -22,6 +22,7 @@ import { PrintersModule } from "./printers/printers.module";
 import { RunsModule } from "./runs/runs.module";
 import { SimpleJobsModule } from "./simple-jobs/simple-jobs.module";
 import { StaffModule } from "./staff/staff.module";
+import { StorageModule } from "./storage/storage.module";
 import { UploadsModule } from "./uploads/uploads.module";
 import { SupabaseAuthGuard } from "./auth/supabase.guard";
 import { PermissionGuard } from "./auth/permission.guard";
@@ -31,6 +32,9 @@ import { LicenseGuard } from "./licensing/license.guard";
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     DatabaseModule,
+    // Global, like DatabaseModule: every delete path in the app needs the one
+    // service that removes bytes from the bucket.
+    StorageModule,
     AnalyticsModule,
     AuthModule,
     AssetsModule,

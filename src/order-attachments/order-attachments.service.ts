@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
+import { StorageFilesService, storageKeyFromUrl } from "../storage/storage-files.service";
 import type {
   AttachmentKind,
   CreateAttachmentInput,
@@ -22,7 +23,10 @@ interface AttachmentRow {
 
 @Injectable()
 export class OrderAttachmentsService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly storage: StorageFilesService
+  ) {}
 
   /** Confirm the order belongs to the caller's company before any I/O. */
   private async assertOrderInCompany(companyId: string, orderId: string): Promise<void> {
@@ -106,16 +110,32 @@ export class OrderAttachmentsService {
     return res.rows[0]!;
   }
 
+  /**
+   * Delete an attachment row AND the bytes behind it.
+   *
+   * RETURNING the url is what makes the second half possible: once the row is
+   * gone nothing in the database can name the object again, so the key has to
+   * come back out of the same statement that destroys its only reference.
+   *
+   * removeUnreferenced (not removeObjects) because an attachment's url is not
+   * guaranteed unique — nothing stops the same file being attached to two
+   * orders, and deleting one must not break the other. It runs after the delete
+   * has committed and never throws; a storage failure leaves recoverable bytes
+   * behind rather than failing a delete that already happened.
+   */
   async remove(companyId: string, orderId: string, attachmentId: string): Promise<void> {
     await this.assertOrderInCompany(companyId, orderId);
-    const res = await this.databaseService.query(
+    const res = await this.databaseService.query<{ file_url: string | null }>(
       `DELETE FROM order_attachments
-        WHERE attachment_id = $1 AND order_id = $2 AND company_id = $3`,
+        WHERE attachment_id = $1 AND order_id = $2 AND company_id = $3
+        RETURNING file_url`,
       [attachmentId, orderId, companyId]
     );
     if (res.rowCount === 0) {
       throw new NotFoundException("Attachment not found.");
     }
+    const key = storageKeyFromUrl(res.rows[0]?.file_url ?? null);
+    if (key) await this.storage.removeUnreferenced([key]);
   }
 
   /** Cheap heuristic — file extension + mime type → bucket. */

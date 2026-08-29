@@ -1,7 +1,6 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from "@nestjs/common";
-import { ConfigService } from "@nestjs/config";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { DatabaseService } from "../database/database.service";
+import { StorageFilesService, storageKeyFromUrl } from "../storage/storage-files.service";
 
 type Client = import("pg").PoolClient;
 
@@ -37,21 +36,14 @@ export class FilePurgeService implements OnModuleInit, OnModuleDestroy {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
 
-  private readonly supabase: SupabaseClient;
-  private readonly bucket: string;
   private readonly retentionDays: number;
   private readonly enabled: boolean;
   private readonly sweepIntervalMs: number;
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly config: ConfigService
+    private readonly storage: StorageFilesService
   ) {
-    this.supabase = createClient(
-      this.config.getOrThrow<string>("SUPABASE_URL"),
-      this.config.getOrThrow<string>("SUPABASE_SERVICE_ROLE_KEY")
-    );
-    this.bucket = process.env.SUPABASE_UPLOAD_BUCKET || "uploads";
     this.retentionDays = this.readPositiveInt(process.env.PURGE_FULFILLED_DAYS, 25);
     this.enabled = (process.env.PURGE_ENABLED ?? "").toLowerCase() === "true";
     // 25-day granularity does not need a tight loop; sweep a few times a day.
@@ -92,7 +84,10 @@ export class FilePurgeService implements OnModuleInit, OnModuleDestroy {
 
       if (totalFiles > 0) {
         const gb = (totalBytes / 1024 ** 3).toFixed(3);
-        const verb = this.enabled ? "purged" : "DRY-RUN would purge";
+        const armed = this.enabled && this.storage.deleteEnabled;
+        const verb = armed
+          ? "purged"
+          : `DRY-RUN (${!this.enabled ? "PURGE_ENABLED" : "STORAGE_DELETE_ENABLED"} off) would purge`;
         this.logger.log(
           `file-purge: ${verb} ${totalFiles} file(s) (~${gb} GB tracked) across ` +
             `${purgedOrders} fulfilled order(s) older than ${this.retentionDays}d`
@@ -168,7 +163,7 @@ export class FilePurgeService implements OnModuleInit, OnModuleDestroy {
 
     const all = [...pieceFiles.rows, ...attachmentFiles.rows];
     const keys = all
-      .map((r) => this.storageKeyFromUrl(r.url))
+      .map((r) => storageKeyFromUrl(r.url))
       .filter((k): k is string => k !== null);
     const byteCount = all.reduce(
       (sum, r) => sum + (r.size_bytes ? Number(r.size_bytes) : 0),
@@ -179,23 +174,37 @@ export class FilePurgeService implements OnModuleInit, OnModuleDestroy {
     if (fileCount === 0) return { fileCount: 0, byteCount: 0 };
 
     // Dry-run: report what would happen, change nothing.
-    if (!this.enabled) return { fileCount, byteCount };
+    //
+    // TWO flags, and both must be on. PURGE_ENABLED is this sweep's own switch.
+    // STORAGE_DELETE_ENABLED is the app-wide one, and it is checked HERE rather
+    // than being left to removeObjects to ignore, because this path does
+    // something no other delete path does: it unlinks the DB references FIRST
+    // and asks for the bytes second. Running the unlink while the removal is
+    // dry-run would null the only columns that point at those objects and then
+    // not delete them — stranding them permanently, and stripping exactly the
+    // references that would otherwise have protected them from a future sweep.
+    // A half-executed retention purge is worse than none.
+    if (!this.enabled || !this.storage.deleteEnabled) return { fileCount, byteCount };
 
-    // 2. Delete the bytes from Storage. remove() is idempotent — keys already
-    //    gone are not an error — so a partial prior run self-heals next sweep.
-    const { error } = await this.supabase.storage.from(this.bucket).remove(keys);
-    if (error) {
-      // Leave DB pointers intact so the order stays eligible and we retry next
-      // sweep, rather than orphaning a reference to a file we failed to delete.
-      this.logger.warn(
-        `file-purge: storage remove failed for order ${orderId} ` +
-          `(${keys.length} key(s)): ${error.message}`
-      );
-      return { fileCount: 0, byteCount: 0 };
-    }
-
-    // 3. Unlink the DB references in one transaction: null the piece columns,
-    //    drop the order-level STL attachment rows.
+    // 2. Unlink the DB references FIRST, in one transaction: null the piece
+    //    columns, drop the order-level STL attachment rows.
+    //
+    //    ── WHY THIS ORDER IS THE REVERSE OF WHAT IT WAS ────────────────────
+    //    This used to delete the bytes first and unlink second, so that a
+    //    storage failure left the pointers intact and the order stayed eligible
+    //    for a retry next sweep. That is a real benefit and it was given up
+    //    deliberately, because it is incompatible with the check that matters
+    //    more: removeUnreferenced() asks whether any row still points at a key,
+    //    and while these rows still point at their own files the answer is
+    //    always yes — the guard would pass every time and protect nothing.
+    //
+    //    The guard has to work here. This is the only DESTRUCTIVE path in the
+    //    system that runs on a timer with nobody watching: an automated sweep
+    //    that deletes a file some other row still needs would do it silently,
+    //    at 3am, across every tenant at once. Retry-ability is housekeeping;
+    //    not deleting live G-code is not. removeObjects still logs the keys of
+    //    anything it fails to remove, so a failure leaves recoverable orphans
+    //    rather than an unrecoverable reference.
     await this.db.transaction(async (c: Client) => {
       await c.query(
         `UPDATE order_pieces
@@ -216,25 +225,22 @@ export class FilePurgeService implements OnModuleInit, OnModuleDestroy {
       );
     });
 
+    // 3. Now the bytes — only the keys nothing else still points at.
+    const removal = await this.storage.removeUnreferenced(keys);
+
     // 4. Best-effort history breadcrumb (never roll back the purge over a log).
-    await this.logPurge(companyId, orderId, fileCount);
+    //    Reports what was actually removed, not what was eligible: a key kept
+    //    back because another row shares it is a fact worth being able to see
+    //    in the order's history rather than a silent discrepancy.
+    await this.logPurge(companyId, orderId, removal.removed);
 
-    return { fileCount, byteCount };
+    return { fileCount: removal.removed, byteCount };
   }
 
-  /**
-   * Map a stored file URL to its Supabase Storage object key. URLs are written
-   * as "/api/uploads/<companyId>/<filename>" (legacy "/uploads/...") and the
-   * object key mirrors the trailing "<companyId>/<filename>".
-   */
-  private storageKeyFromUrl(url: string | null): string | null {
-    if (!url) return null;
-    const marker = "/uploads/";
-    const idx = url.indexOf(marker);
-    if (idx < 0) return null;
-    const key = url.slice(idx + marker.length).split("?")[0] ?? "";
-    return key.length > 0 ? key : null;
-  }
+  // storageKeyFromUrl used to be a private method here, byte-identical to the
+  // copy in order-purge.ts. Both now use the one in storage-files.service.ts:
+  // three expressions of one parsing rule is how the three drift apart, and the
+  // rule decides which bytes get deleted.
 
   /** Drop an order_history row recording the purge (populates order_number). */
   private async logPurge(companyId: string, orderId: string, fileCount: number): Promise<void> {

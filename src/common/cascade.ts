@@ -1,4 +1,8 @@
 import type { PoolClient, QueryResult, QueryResultRow } from "pg";
+// storage-keys, NOT storage-files.service: this module is pure and reachable
+// from `node --test`, which cannot parse the service's constructor parameter
+// properties. See the header of storage-keys.ts.
+import { storageKeyFromUrl } from "../storage/storage-keys";
 
 /**
  * Minimal queryable surface shared by `pg`'s `Pool` and `PoolClient` (and the
@@ -247,12 +251,23 @@ async function ordersConstraintAllowsShippingStatuses(
  *        surviving non-terminal pieces are released to standalone 'pending';
  *        terminal pieces (cancelled/done/failed/printing) keep their status
  *        but are detached (bed_id = NULL); the bed is marked 'disassembled'.
+ *
+ * RETURNS the storage keys of a bed that was DELETED (its plate G-code and
+ * STL), for the caller to remove once the transaction commits. Empty in the
+ * cancel and dismantle branches, where the bed row — and its files — survive.
+ *
+ * The keys come back rather than being deleted here for the same reason
+ * purgeOrderTx returns them: a bucket delete cannot be rolled back, so removing
+ * bytes inside a transaction destroys files for a bed that a later failure
+ * leaves standing. Callers that do not care may ignore the return; the four
+ * that predate this signature still compile and still behave identically, they
+ * simply keep leaking bed plates until each is wired up.
  */
 export async function reevaluateBedAfterPieceRemoval(
   client: PoolClient,
   companyId: string,
   bedId: string
-): Promise<void> {
+): Promise<string[]> {
   const res = await client.query<{ status: string }>(
     `SELECT status FROM order_pieces WHERE company_id = $1 AND bed_id = $2`,
     [companyId, bedId]
@@ -261,11 +276,19 @@ export async function reevaluateBedAfterPieceRemoval(
 
   // All child pieces gone → the bed has nothing left; delete it.
   if (pieces.length === 0) {
+    // Read the plate's own files BEFORE the row carrying them disappears.
+    const files = await client.query<{ slicer_file_url: string | null; stl_file_url: string | null }>(
+      `SELECT slicer_file_url, stl_file_url
+         FROM print_beds WHERE company_id = $1 AND bed_id = $2`,
+      [companyId, bedId]
+    );
     await client.query(
       `DELETE FROM print_beds WHERE company_id = $1 AND bed_id = $2`,
       [companyId, bedId]
     );
-    return;
+    return [files.rows[0]?.slicer_file_url, files.rows[0]?.stl_file_url]
+      .map(storageKeyFromUrl)
+      .filter((k): k is string => k !== null);
   }
 
   // Every surviving piece is cancelled → cancel the bed too.
@@ -279,7 +302,8 @@ export async function reevaluateBedAfterPieceRemoval(
         WHERE company_id = $1 AND bed_id = $2`,
       [companyId, bedId]
     );
-    return;
+    // The bed row survives, so its files are still referenced. Nothing to remove.
+    return [];
   }
 
   // Mixed: the bed arrangement is no longer valid — dismantle it. Live
@@ -306,6 +330,8 @@ export async function reevaluateBedAfterPieceRemoval(
       WHERE company_id = $1 AND bed_id = $2`,
     [companyId, bedId]
   );
+  // Dismantled, not deleted — the bed row and its plate files remain.
+  return [];
 }
 
 /**

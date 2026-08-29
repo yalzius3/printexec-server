@@ -2,7 +2,11 @@ import { BadRequestException, Injectable, NotFoundException } from "@nestjs/comm
 import type { z } from "zod";
 import { recordOrderHistory } from "../common/order-history";
 import { purgeOrderTx, type OrderPurgeResult } from "./order-purge";
-import { OrderFilesService } from "./order-files.service";
+import {
+  StorageFilesService,
+  keysFromRows,
+  PIECE_FILE_FIELDS
+} from "../storage/storage-files.service";
 import { reevaluateBedAfterPieceRemoval, releasePrinterForPieceTx } from "../common/cascade";
 import { buildUpdateClause } from "../common/sql";
 import { DatabaseService, type SqlExecutor } from "../database/database.service";
@@ -77,7 +81,7 @@ export class OrdersService {
     private readonly databaseService: DatabaseService,
     private readonly customersService: CustomersService,
     private readonly orderCosting: OrderCostingService,
-    private readonly orderFiles: OrderFilesService
+    private readonly storage: StorageFilesService
   ) {}
 
   async listOrders(companyId: string, query: ListOrdersQuery) {
@@ -856,10 +860,17 @@ export class OrdersService {
    * CANCEL AND DELETE — erase an order completely.
    *
    * Distinct from deleteOrder below, and the difference is the point. That one
-   * ends an order and keeps the paper: the invoice survives flagged with
-   * order_deleted_at, a "deleted" breadcrumb goes into the history, the files
-   * stay in the bucket. This one leaves nothing — rows, files and the financial
-   * record all go, and nothing afterwards shows the order existed.
+   * ends an order and keeps the PAPER: the invoice survives flagged with
+   * order_deleted_at and a "deleted" breadcrumb goes into the history. This one
+   * leaves nothing — the invoice, the journal entry and the history go too, and
+   * nothing afterwards shows the order existed.
+   *
+   * (Both now remove the order's bytes. deleteOrder used to leave them in the
+   * bucket, which was written up here as a deliberate difference between the
+   * two. It was not a real one: keeping the accounting record of an order does
+   * not require keeping its G-code, and nothing ever came back for those files
+   * — no reaper existed. The distinction is about the paper trail, and only
+   * that.)
    *
    * The cancel half is not a separate step and deliberately so. Setting
    * status='cancelled' first would fire the piece-cancellation cascade, the
@@ -890,9 +901,9 @@ export class OrdersService {
       })
     );
 
-    // Committed: the order is gone whatever happens next. removeObjects never
-    // throws for that reason — see the note on it.
-    const files = await this.orderFiles.removeObjects(result.storage_keys);
+    // Committed: the order is gone whatever happens next. removeUnreferenced
+    // never throws for that reason — see the note on it.
+    const files = await this.storage.removeUnreferenced(result.storage_keys);
 
     return { ...result, files_removed: files.removed, files_orphaned: files.failed };
   }
@@ -900,17 +911,34 @@ export class OrdersService {
   async deleteOrder(companyId: string, orderId: string) {
     const order = await this.getOrderById(companyId, orderId);
 
+    // Keys this order's rows point at. Collected inside the transaction below,
+    // removed after it commits, and only for keys nothing else still
+    // references — see StorageFilesService for why that filter is not optional.
+    const fileKeys: string[] = [];
+
     await this.databaseService.transaction(async (client) => {
       // Snapshot pieces before cascading so they can be logged individually.
-      const pieces = await client.query<{ piece_id: string; piece_name: string; bed_id: string | null; status: string; assigned_printer_id: string | null }>(
+      // `op.*` rather than a named list: the file columns each ship in their own
+      // migration, so the field is present exactly when the column is, and
+      // naming one that has not been migrated would 500 the whole delete.
+      const pieces = await client.query<{ piece_id: string; piece_name: string; bed_id: string | null; status: string; assigned_printer_id: string | null; slicer_file_url?: string | null; stl_file_url?: string | null; stl_thumbnail_url?: string | null }>(
         `
-          SELECT piece_id, piece_name, bed_id, status, assigned_printer_id
-          FROM order_pieces
-          WHERE order_id = $1
-            AND company_id = $2
+          SELECT op.*
+          FROM order_pieces op
+          WHERE op.order_id = $1
+            AND op.company_id = $2
         `,
         [orderId, companyId]
       );
+      fileKeys.push(...keysFromRows(pieces.rows, PIECE_FILE_FIELDS));
+
+      // Order-level attachments go with the order (invoices.order_id is SET
+      // NULL, but attachments are children and cascade), so their bytes go too.
+      const attachments = await client.query<{ file_url: string | null }>(
+        `SELECT file_url FROM order_attachments WHERE company_id = $1 AND order_id = $2`,
+        [companyId, orderId]
+      );
+      fileKeys.push(...keysFromRows(attachments.rows, ["file_url"]));
 
       // 0. Release the printer lock held by any piece that is actively printing
       //    BEFORE its row is deleted. Otherwise printer_stock keeps is_in_use =
@@ -949,7 +977,7 @@ export class OrdersService {
         ...new Set(pieces.rows.map((p) => p.bed_id).filter((b): b is string => !!b))
       ];
       for (const bedId of affectedBedIds) {
-        await reevaluateBedAfterPieceRemoval(client, companyId, bedId);
+        fileKeys.push(...(await reevaluateBedAfterPieceRemoval(client, companyId, bedId)));
       }
 
       // 2c. Mark any invoice billing this order BEFORE the row disappears.
@@ -1007,6 +1035,11 @@ export class OrdersService {
         description: `Order #${order.order_number} deleted (${order.title}).`
       });
     });
+
+    // Committed — the order is gone whatever happens next, so this never
+    // throws. The comment at the top of cancelAndDeleteOrder used to say the
+    // files stay in the bucket on this path; they no longer do.
+    await this.storage.removeUnreferenced(fileKeys);
   }
 
   async listHistory(
