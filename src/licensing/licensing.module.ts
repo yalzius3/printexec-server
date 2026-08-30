@@ -38,9 +38,11 @@ import { SubscriptionInvoiceService } from "./subscription-invoice.service";
     AdminSessionService,
     PlatformAdminGuard,
     AdminAuditInterceptor,
-    // Registered explicitly, like the guard above, so Nest keeps ONE instance.
-    // The rate-limit counters live in that instance's memory — a second copy
-    // would silently double every budget.
+    // Registered explicitly, like the guard above, so this module holds a
+    // stable instance carrying the admin routes' counters. AuthModule provides
+    // its own for the same reason; that is safe rather than a bug, because
+    // buckets are keyed by "METHOD path|caller" and the two guard disjoint
+    // routes.
     ThrottleGuard
   ],
   exports: [LicensingService, PaymentsService, SubscriptionInvoiceService]

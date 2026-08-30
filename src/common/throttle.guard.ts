@@ -9,7 +9,11 @@ import {
 } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import type { AuthRequest } from "../auth/supabase.guard";
-import { evaluateThrottle, type ThrottleWindowOptions } from "./throttle-window";
+import {
+  evaluateThrottle,
+  resolveThrottleCaller,
+  type ThrottleWindowOptions
+} from "./throttle-window";
 
 // ════════════════════════════════════════════════════════════════
 // Request throttling.
@@ -69,8 +73,22 @@ export class ThrottleGuard implements CanActivate {
       url?: string;
     }>();
 
+    const caller = resolveThrottleCaller(req);
+
+    // FAIL OPEN on an unidentifiable caller. This only ever happens for
+    // UNAUTHENTICATED traffic (an authenticated request always has req.userId),
+    // and the alternative is far worse than no throttle: lumping every
+    // anonymous request into one shared bucket would let strangers exhaust
+    // each other's budget on the signup path — a self-inflicted outage on the
+    // one flow that must never fail. Skipping leaves that route exactly as
+    // permissive as it is today, so this can never be a regression.
+    if (!caller) {
+      this.warnUnidentifiedOnce();
+      return true;
+    }
+
     const now = Date.now();
-    const bucketKey = `${req.method ?? "?"} ${req.routerPath ?? req.url ?? "?"}|${this.callerKey(req)}`;
+    const bucketKey = `${req.method ?? "?"} ${req.routerPath ?? req.url ?? "?"}|${caller}`;
 
     const decision = evaluateThrottle(
       this.buckets.get(bucketKey) ?? [],
@@ -106,35 +124,20 @@ export class ThrottleGuard implements CanActivate {
     return true;
   }
 
-  /**
-   * Who to count against.
-   *
-   * userId FIRST, and it is the one that matters. The global SupabaseAuthGuard
-   * has already verified the token by the time a controller-bound guard runs,
-   * so req.userId cannot be forged — whereas every IP below can be, because
-   * the Railway origin is reachable without going through Cloudflare (see the
-   * security audit: the origin URL ships in the client bundle). Keying on a
-   * spoofable header alone would let an attacker reset their own bucket at
-   * will by varying it.
-   *
-   * The IP fallback therefore only ever applies to unauthenticated traffic,
-   * where it is better than nothing and no worse than the status quo.
-   */
-  private callerKey(req: AuthRequest & { ip?: string }): string {
-    if (req.userId) return `user:${req.userId}`;
+  // Caller identity lives in throttle-window.ts (resolveThrottleCaller) so it
+  // can be unit-tested — this guard can never be imported by node --test.
 
-    const header = (name: string): string | undefined => {
-      const raw = req.headers?.[name];
-      const value = Array.isArray(raw) ? raw[0] : raw;
-      return typeof value === "string" && value.trim() ? value.trim() : undefined;
-    };
-
-    // CF-Connecting-IP is set by Cloudflare and is the real client when the
-    // request actually came through it. X-Forwarded-For's FIRST hop is the
-    // originating client per RFC 7239 convention.
-    const cf = header("cf-connecting-ip");
-    const xff = header("x-forwarded-for")?.split(",")[0]?.trim();
-    return `ip:${cf ?? xff ?? req.ip ?? "unknown"}`;
+  /** Say it once per process: a throttle that cannot identify callers is not
+   *  protecting anything, and that fact must be discoverable in the log. */
+  private warnedUnidentified = false;
+  private warnUnidentifiedOnce(): void {
+    if (this.warnedUnidentified) return;
+    this.warnedUnidentified = true;
+    this.logger.warn(
+      "Throttle skipped: no per-client identifier on an anonymous request " +
+        "(no cf-connecting-ip, no usable x-forwarded-for). Rate limiting is " +
+        "INERT for unauthenticated routes until the edge forwards a client IP."
+    );
   }
 
   /** Drop buckets whose every timestamp has aged out. */

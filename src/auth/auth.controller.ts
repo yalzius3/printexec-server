@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Ip, Logger, Post, Res, UnauthorizedException, BadRequestException, ConflictException, NotFoundException, GoneException, Headers } from "@nestjs/common";
+import { Body, Controller, Get, Ip, Logger, Post, Res, UnauthorizedException, BadRequestException, ConflictException, NotFoundException, GoneException, Headers, UseGuards } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import type { FastifyReply } from "fastify";
 import { DatabaseService } from "../database/database.service";
@@ -11,6 +11,7 @@ import { UserRole } from "../common/user-role.decorator";
 import { Public } from "./public.decorator";
 import { buildUploadCookieHeader, signUploadCookie } from "./upload-cookie";
 import { verifyToken } from "./verify-token";
+import { Throttle, ThrottleGuard } from "../common/throttle.guard";
 // Redemption has to fold a typed code onto the format staff.service mints.
 // Pure module (no DI) so this is a plain import, not a module dependency.
 import { canonicalizeInviteToken, inviteIsExpiredSql } from "../staff/invite-token";
@@ -755,6 +756,34 @@ export class AuthController {
     return { ok: true, email };
   }
 
+  // Unauthenticated, and it answers "does this address have an account?" —
+  // so left unlimited it hands anyone a free oracle for enumerating the
+  // whole user base at network speed.
+  //
+  // Rate limiting is the honest fix, NOT silencing the answer. Silencing it
+  // would cost real UX and close nothing: supabase.auth.signUp one call
+  // later reveals the same fact, because an already-confirmed address comes
+  // back as a user with zero identities and AuthPage deliberately surfaces
+  // that as "an account already exists". Revealing existence at signup is a
+  // product decision — the alternative is sending someone to watch an inbox
+  // that will never receive anything. What is NOT a decision is letting that
+  // fact be harvested in bulk.
+  //
+  // 15 per 10 minutes per client. A real signup spends one, plus a few on
+  // typos; fifteen is far past a person and well under a scraper. Signup is
+  // the OWNER path — staff join by invite code — so simultaneous signups
+  // from one office NAT are rare enough that a shared IP is not a hazard.
+  //
+  // This is only as strong as the identity behind it. Anonymous callers are
+  // keyed on an IP header, and those are forgeable while the Railway origin
+  // stays reachable without going through Cloudflare; if no usable header
+  // arrives at all the guard FAILS OPEN and logs once, rather than lumping
+  // every stranger into one bucket and breaking signup for all of them. It
+  // raises the cost of bulk harvesting; it cannot stop someone confirming
+  // ONE address they already suspect, and nothing here could, while signUp
+  // answers the same question.
+  @Throttle({ limit: 15, windowMs: 10 * 60_000 })
+  @UseGuards(ThrottleGuard)
   @Public()
   @Post("check-email")
   async checkEmail(@Body() body: unknown) {

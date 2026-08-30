@@ -64,3 +64,59 @@ export function evaluateThrottle(
 
   return { allowed: true, hits: [...live, now], retryAfterSec: 0 };
 }
+
+// ── Caller identity ─────────────────────────────────────────────────────────
+
+/** The subset of a request this needs. Kept structural so no Nest type leaks
+ *  into a module that must stay importable by node --test. */
+export interface ThrottleCallerInput {
+  userId?: string;
+  ip?: string;
+  headers?: Record<string, string | string[] | undefined>;
+}
+
+/**
+ * Who to count a request against, or null when it cannot be told apart from
+ * anyone else.
+ *
+ * userId FIRST and it is the one that matters: the global auth guard has
+ * already verified the token by the time any controller-bound guard runs, so
+ * it cannot be forged. Every IP below can be, because the Railway origin is
+ * reachable without going through Cloudflare.
+ *
+ * Returning NULL is the important case. If a proxy header is present but
+ * unusable, req.ip is the PROXY — an address shared by every caller on earth —
+ * and keying on it would let strangers exhaust each other's budget. On a signup
+ * path that is a self-inflicted outage, so the caller must fail open instead.
+ */
+export function resolveThrottleCaller(req: ThrottleCallerInput): string | null {
+  if (req.userId) return `user:${req.userId}`;
+
+  const header = (name: string): string | undefined => {
+    const raw = req.headers?.[name];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  };
+
+  // CF-Connecting-IP is set by Cloudflare and is the real client when the
+  // request genuinely came through it. X-Forwarded-For's FIRST hop is the
+  // originating client by convention.
+  const cf = header("cf-connecting-ip");
+  const xff = header("x-forwarded-for")?.split(",")[0]?.trim();
+  const chosen = cf ?? xff;
+  if (chosen) return `ip:${chosen}`;
+
+  // No proxy header at all means nothing is in front of us, so req.ip really is
+  // the client (local dev, or a direct hit).
+  //
+  // Presence is tested on the RAW header, deliberately, not through header()
+  // above — header() returns undefined for an empty or whitespace value, so
+  // using it here could not tell "no proxy" from "a proxy that sent an empty
+  // X-Forwarded-For". That collapse is the dangerous direction: it would fall
+  // through to req.ip, which behind a proxy is an address every caller shares.
+  const hasRawHeader = (name: string): boolean =>
+    req.headers?.[name] !== undefined;
+  const behindProxy = hasRawHeader("x-forwarded-for") || hasRawHeader("forwarded");
+  if (!behindProxy && req.ip) return `ip:${req.ip}`;
+  return null;
+}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { evaluateThrottle } from "../src/common/throttle-window.ts";
+import { evaluateThrottle, resolveThrottleCaller } from "../src/common/throttle-window.ts";
 
 const OPTS = { limit: 3, windowMs: 60_000 };
 
@@ -119,4 +119,91 @@ test("the unlock budget outlasts the 5-failure lockout it sits beside", () => {
     assert.equal(d.allowed, true, `unlock attempt ${i + 1} must reach the lockout logic`);
     hits = d.hits;
   }
+});
+
+// ── Caller identity ─────────────────────────────────────────────────────────
+//
+// The fail-open case below is the one that matters most: getting it wrong does
+// not weaken a rate limit, it breaks signup for everyone at once.
+
+test("an authenticated caller is keyed on the unforgeable userId", () => {
+  const key = resolveThrottleCaller({
+    userId: "u-1",
+    ip: "9.9.9.9",
+    headers: { "cf-connecting-ip": "1.2.3.4", "x-forwarded-for": "5.6.7.8" }
+  });
+  assert.equal(key, "user:u-1", "userId must win over every spoofable header");
+});
+
+test("an anonymous caller behind Cloudflare is keyed on CF-Connecting-IP", () => {
+  const key = resolveThrottleCaller({
+    ip: "10.0.0.1",
+    headers: { "cf-connecting-ip": "1.2.3.4", "x-forwarded-for": "5.6.7.8" }
+  });
+  assert.equal(key, "ip:1.2.3.4");
+});
+
+test("without CF, the FIRST X-Forwarded-For hop is the client", () => {
+  const key = resolveThrottleCaller({
+    ip: "10.0.0.1",
+    headers: { "x-forwarded-for": "1.2.3.4, 10.0.0.9, 172.16.0.2" }
+  });
+  assert.equal(key, "ip:1.2.3.4", "later hops are proxies, not the caller");
+});
+
+test("with no proxy in front, req.ip IS the client", () => {
+  const key = resolveThrottleCaller({ ip: "127.0.0.1", headers: {} });
+  assert.equal(key, "ip:127.0.0.1");
+});
+
+test("FAIL OPEN: a proxy header that is present but unusable yields null", () => {
+  // This is the signup-outage guard. req.ip here is the PROXY, shared by every
+  // caller on earth; keying on it would let strangers exhaust one another's
+  // budget. null tells the guard to skip instead.
+  for (const headers of [
+    { "x-forwarded-for": "" },
+    { "x-forwarded-for": "   " },
+    { forwarded: "for=1.2.3.4" }, // RFC 7239 form this deliberately does not parse
+  ]) {
+    assert.equal(
+      resolveThrottleCaller({ ip: "10.0.0.1", headers }),
+      null,
+      JSON.stringify(headers)
+    );
+  }
+});
+
+test("FAIL OPEN: no identifier of any kind yields null", () => {
+  assert.equal(resolveThrottleCaller({}), null);
+  assert.equal(resolveThrottleCaller({ headers: {} }), null);
+});
+
+test("a header arriving as an array uses its first value", () => {
+  const key = resolveThrottleCaller({ headers: { "cf-connecting-ip": ["1.2.3.4", "9.9.9.9"] } });
+  assert.equal(key, "ip:1.2.3.4");
+});
+
+test("the check-email budget does not fire for a real signup", () => {
+  // 15 per 10 min. One request per signup attempt; simulate a user fumbling
+  // through five tries and assert none is refused — a throttled signup is a
+  // lost customer, which is a worse outcome than the enumeration it prevents.
+  const opts = { limit: 15, windowMs: 10 * 60_000 };
+  let hits: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    const d = evaluateThrottle(hits, 1_000 + i * 20_000, opts);
+    assert.equal(d.allowed, true, `signup attempt ${i + 1} must not be throttled`);
+    hits = d.hits;
+  }
+});
+
+test("the check-email budget does stop a scraper", () => {
+  const opts = { limit: 15, windowMs: 10 * 60_000 };
+  let hits: number[] = [];
+  let blockedAt = -1;
+  for (let i = 0; i < 40; i++) {
+    const d = evaluateThrottle(hits, 1_000 + i * 100, opts);
+    if (!d.allowed) { blockedAt = i; break; }
+    hits = d.hits;
+  }
+  assert.equal(blockedAt, 15, "the 16th rapid request is the first refused");
 });
