@@ -53,9 +53,19 @@ describe(
     const otherPrinterId = randomUUID();
 
     before(async () => {
-      pool = new Pool({ connectionString: TEST_DB_URL });
+      pool = new Pool({ connectionString: TEST_DB_URL, max: 4 });
       await pool.query(`CREATE SCHEMA "${SCHEMA}"`);
+      // The statement under test is unqualified ("FROM printer_instances"),
+      // exactly as production sends it, so search_path is what points it at the
+      // throwaway schema. It is per-CONNECTION, and a pool hands out whichever
+      // connection is free — so setting it once would only cover whichever one
+      // happened to answer, and a later query on a different connection would
+      // silently read the PUBLIC schema instead. Same idiom as
+      // nozzle-pool.integration.test.ts.
       await pool.query(`SET search_path TO "${SCHEMA}"`);
+      pool.on("connect", (client) => {
+        void client.query(`SET search_path TO "${SCHEMA}"`);
+      });
 
       // Only the columns this statement touches. A narrower table than
       // production on purpose: the test is about the predicate, and inventing
@@ -83,11 +93,30 @@ describe(
       await pool.end();
     });
 
-    const check = async (company: string, printer: string) => {
-      const r = await pool.query(`SET search_path TO "${SCHEMA}"`);
-      void r;
-      return pool.query(OWNERSHIP_SQL, [company, printer]);
-    };
+    const check = (company: string, printer: string) =>
+      pool.query(OWNERSHIP_SQL, [company, printer]);
+
+    it("the fixture really is isolated — nothing leaked into public", async () => {
+      // Pins the search_path handling above. Before it was added, the fixture
+      // was created on whichever pooled connection answered first: if that was
+      // not the one carrying search_path, CREATE TABLE landed in PUBLIC, the
+      // assertions still passed by reading it there, and the shared test
+      // database was quietly polluted for every other integration file.
+      //
+      // So assert the table exists where we meant it to and NOWHERE else. This
+      // is the test that would have caught the bug, rather than passing through
+      // it.
+      const mine = await pool.query(
+        `SELECT to_regclass($1) IS NOT NULL AS present`,
+        [`"${SCHEMA}".printer_instances`]
+      );
+      assert.equal(mine.rows[0].present, true, "fixture must live in the throwaway schema");
+
+      const leaked = await pool.query(
+        `SELECT to_regclass('public.printer_instances') IS NOT NULL AS present`
+      );
+      assert.equal(leaked.rows[0].present, false, "fixture must NOT exist in public");
+    });
 
     it("executes at all — the table and columns are real", async () => {
       // The failure this retires: a wrong identifier here is not a wrong

@@ -1855,7 +1855,11 @@ export class JobsService {
       `SELECT 1 FROM printer_instances WHERE company_id = $1 AND printer_id = $2`,
       [companyId, input.printer_id]
     );
-    if (printerOwned.rowCount === 0) {
+    // rows.length, NOT rowCount: pg types rowCount as `number | null`, and
+    // `null === 0` is false — so a null would skip the throw and silently wave
+    // the assignment through. On a tenant-isolation check the null case has to
+    // fail CLOSED, and rows.length cannot be null.
+    if (printerOwned.rows.length === 0) {
       throw new BadRequestException("That printer doesn't exist.");
     }
 
