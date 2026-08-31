@@ -1827,6 +1827,38 @@ export class JobsService {
       );
     }
 
+    // The printer must belong to THIS company. Nothing above establishes that,
+    // and everything below assumes it.
+    //
+    // For an FDM piece it was previously true only by ACCIDENT: the nozzle probe
+    // further down is "WHERE company_id = $1 AND printer_id = $2 AND
+    // nozzle_asset_id = $3", so a foreign printer matched no row and the call
+    // failed — with a message about nozzles. Right outcome, wrong reason, and
+    // that whole branch is skipped for resin, which has no nozzle. A resin piece
+    // could therefore be assigned to another tenant's printer, or to a UUID
+    // naming no printer at all.
+    //
+    // It also has to run HERE, before the busy-time queries below: those select
+    // on assigned_printer_id with no company predicate, and their result is
+    // folded into the "printer's free time (N min)" error. Validating later
+    // would still have leaked a number derived from another tenant's schedule.
+    //
+    // Existence scoped to the company, and deliberately nothing more. The
+    // candidate list this mirrors (findCandidates) filters on pi.company_id
+    // alone and returns offline/maintenance as FLAGS rather than filters, so
+    // adding any further condition here would reject assignments that are legal
+    // today.
+    //
+    // One message for "not yours" and "does not exist" alike — distinguishing
+    // them would turn this into an existence oracle for printer ids.
+    const printerOwned = await this.databaseService.query(
+      `SELECT 1 FROM printer_instances WHERE company_id = $1 AND printer_id = $2`,
+      [companyId, input.printer_id]
+    );
+    if (printerOwned.rowCount === 0) {
+      throw new BadRequestException("That printer doesn't exist.");
+    }
+
     // Recompute free minutes for THIS printer in the deadline horizon,
     // excluding minutes already committed by this very piece. Mirrors the
     // findCandidates calculation so the hard-fail check is consistent with
