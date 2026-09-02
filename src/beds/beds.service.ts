@@ -20,7 +20,8 @@ import {
   quoteAssumedMeta,
   releasePieceSpoolsTx,
   recomputeOrderStatusTx,
-  releasePrinterTx
+  releasePrinterTx,
+  deleteEmptyBedTx
 } from "../common/cascade";
 import { FinanceService } from "../finance/finance.service";
 import { JobsService, isResinTech, materialFamily, type NozzleSwitch } from "../jobs/jobs.service";
@@ -921,7 +922,10 @@ export class BedsService {
   // standalone scheduling. Sets the bed's status to 'disassembled' for
   // audit; we never physically delete a bed row.
   // ──────────────────────────────────────────────────────────
-  async disassemble(companyId: string, bedId: string): Promise<{ released: number }> {
+  async disassemble(
+    companyId: string,
+    bedId: string
+  ): Promise<{ released: number; bed_deleted: boolean }> {
     const bed = await this.loadBed(companyId, bedId);
     if (bed.status === "scheduled" || bed.status === "printing") {
       throw new ConflictException(
@@ -931,7 +935,10 @@ export class BedsService {
     if (bed.status === "disassembled") {
       throw new ConflictException("Bed is already disassembled.");
     }
-    return this.databaseService.transaction(async (client) => {
+    // Only the keys of a plate that was actually removed, and only removed once
+    // the transaction commits — a bucket delete cannot be rolled back.
+    const fileKeys: string[] = [];
+    const result = await this.databaseService.transaction(async (client) => {
       // Pieces return to 'pending', clean slate.
       const released = await client.query(
         `UPDATE order_pieces
@@ -951,8 +958,22 @@ export class BedsService {
           WHERE company_id = $1 AND bed_id = $2`,
         [companyId, bedId]
       );
-      return { released: released.rowCount ?? 0 };
+      // Every piece has just left, so the plate holds nothing. It used to be
+      // left standing as an "archive" — but nothing can read that archive:
+      // GET /beds excludes 'disassembled', so do the queue and the timeline,
+      // and the only reference to a bed anywhere in the schema is the
+      // order_pieces.bed_id this statement just cleared. So the row was
+      // unreachable, not archived. A plate that genuinely RAN still keeps its
+      // row (that is real history, and what recordOutcome leaves behind); one
+      // that never ran is removed here, along with its own G-code and STL.
+      const removal = await deleteEmptyBedTx(client, companyId, bedId, { keepIfItRan: true });
+      fileKeys.push(...removal.keys);
+      return { released: released.rowCount ?? 0, bed_deleted: removal.deleted };
     });
+    // Committed — the plate is gone whatever happens next, so this never throws,
+    // and it only removes keys nothing else still points at.
+    await this.storage.removeUnreferenced(fileKeys);
+    return result;
   }
 
   /** Readiness/scheduling is gated on slicer METADATA (print time + the

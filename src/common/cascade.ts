@@ -2,7 +2,7 @@ import type { PoolClient, QueryResult, QueryResultRow } from "pg";
 // storage-keys, NOT storage-files.service: this module is pure and reachable
 // from `node --test`, which cannot parse the service's constructor parameter
 // properties. See the header of storage-keys.ts.
-import { storageKeyFromUrl } from "../storage/storage-keys";
+import { keysFromRows, BED_FILE_FIELDS } from "../storage/storage-keys";
 
 /**
  * Minimal queryable surface shared by `pg`'s `Pool` and `PoolClient` (and the
@@ -239,6 +239,60 @@ async function ordersConstraintAllowsShippingStatuses(
 }
 
 /**
+ * Delete a bed row that has nothing left on it, returning the plate's OWN
+ * storage keys (its sliced G-code and source model) for the caller to remove
+ * once the transaction commits.
+ *
+ * `keepIfItRan` is the difference between the two ways a plate comes to be
+ * empty, and it carries the whole safety argument:
+ *
+ *   - Its pieces were DELETED — none of that work survives anywhere — so the
+ *     plate describes nothing and goes unconditionally. `keepIfItRan: false`.
+ *   - Its pieces were DETACHED and are still alive (a dismantle). The row is
+ *     then worth keeping only if it is the record of a print that actually
+ *     happened; a plate that never ran is a dead row that no screen can show.
+ *     `keepIfItRan: true`.
+ *
+ * Emptiness is re-tested INSIDE the delete statement rather than trusted from
+ * the caller, so a bed that still holds pieces cannot be removed by a mistaken
+ * call, and there is no window between the check and the delete.
+ *
+ * `RETURNING *` rather than a named column list, for the reason `deleteOrder`
+ * uses `SELECT op.*`: the plate's file columns each shipped in their own
+ * migration, so naming one that has not been applied would 500 the delete, and
+ * a file column added later is picked up here without touching this function.
+ */
+export async function deleteEmptyBedTx(
+  client: PoolClient,
+  companyId: string,
+  bedId: string,
+  opts: { keepIfItRan: boolean }
+): Promise<{ deleted: boolean; keys: string[] }> {
+  const neverRan = opts.keepIfItRan
+    ? `AND pb.print_started_at IS NULL
+         AND pb.print_completed_at IS NULL
+         AND pb.actual_print_time_minutes IS NULL`
+    : "";
+  const res = await client.query<Record<string, unknown>>(
+    `DELETE FROM print_beds pb
+      WHERE pb.company_id = $1
+        AND pb.bed_id = $2
+        AND NOT EXISTS (
+              SELECT 1 FROM order_pieces op
+               WHERE op.company_id = pb.company_id
+                 AND op.bed_id = pb.bed_id
+            )
+        ${neverRan}
+      RETURNING *`,
+    [companyId, bedId]
+  );
+  return {
+    deleted: (res.rowCount ?? 0) > 0,
+    keys: keysFromRows(res.rows, BED_FILE_FIELDS)
+  };
+}
+
+/**
  * Re-evaluate a bed after one or more of its child pieces have been removed
  * (deleted) or cancelled. Call this once, AFTER the piece status/delete has
  * been applied, with the open transaction client.
@@ -250,11 +304,13 @@ async function ordersConstraintAllowsShippingStatuses(
  *     but live pieces remain)                    → DISMANTLE the bed:
  *        surviving non-terminal pieces are released to standalone 'pending';
  *        terminal pieces (cancelled/done/failed/printing) keep their status
- *        but are detached (bed_id = NULL); the bed is marked 'disassembled'.
+ *        but are detached (bed_id = NULL); the plate itself is then removed,
+ *        unless it had actually run — see deleteEmptyBedTx.
  *
  * RETURNS the storage keys of a bed that was DELETED (its plate G-code and
  * STL), for the caller to remove once the transaction commits. Empty in the
- * cancel and dismantle branches, where the bed row — and its files — survive.
+ * cancel branch, and in the dismantle branch when the plate had run and its
+ * row is therefore kept.
  *
  * The keys come back rather than being deleted here for the same reason
  * purgeOrderTx returns them: a bucket delete cannot be rolled back, so removing
@@ -274,21 +330,11 @@ export async function reevaluateBedAfterPieceRemoval(
   );
   const pieces = res.rows;
 
-  // All child pieces gone → the bed has nothing left; delete it.
+  // All child pieces gone → the bed has nothing left; delete it. Unconditional:
+  // the work those pieces represented no longer exists anywhere, so even a
+  // plate that ran has nothing left to be the record OF.
   if (pieces.length === 0) {
-    // Read the plate's own files BEFORE the row carrying them disappears.
-    const files = await client.query<{ slicer_file_url: string | null; stl_file_url: string | null }>(
-      `SELECT slicer_file_url, stl_file_url
-         FROM print_beds WHERE company_id = $1 AND bed_id = $2`,
-      [companyId, bedId]
-    );
-    await client.query(
-      `DELETE FROM print_beds WHERE company_id = $1 AND bed_id = $2`,
-      [companyId, bedId]
-    );
-    return [files.rows[0]?.slicer_file_url, files.rows[0]?.stl_file_url]
-      .map(storageKeyFromUrl)
-      .filter((k): k is string => k !== null);
+    return (await deleteEmptyBedTx(client, companyId, bedId, { keepIfItRan: false })).keys;
   }
 
   // Every surviving piece is cancelled → cancel the bed too.
@@ -310,13 +356,38 @@ export async function reevaluateBedAfterPieceRemoval(
   // pieces return to standalone 'pending'; terminal pieces keep their
   // status. Everything detaches from the bed.
   await client.query(
-    `UPDATE order_pieces
+    `UPDATE order_pieces op
         SET bed_id = NULL,
             status = CASE
-              WHEN status IN ('cancelled', 'done', 'failed', 'printing') THEN status
+              WHEN op.status IN ('cancelled', 'done', 'failed', 'printing') THEN op.status
               ELSE 'pending'
+            END,
+            -- A terminal piece must carry OUT the evidence its status requires.
+            -- Every status CHECK on order_pieces holds an "OR bed_id IS NOT
+            -- NULL" escape, and this statement REVOKES that escape on the very
+            -- line that clears bed_id — the same trap that produced a bare 500
+            -- on the bed-outcome 'done' write. A piece kept at 'done' with no
+            -- print_completed_at (60 of them in production when this was
+            -- written) violated chk_done_requires_completed_at and aborted the
+            -- whole delete, so the plate could never be dismantled at all.
+            --
+            -- The stamps come off the PLATE, clamped to now(): a plate can be
+            -- dismantled while still scheduled, and a scheduled window can be
+            -- in the future, which would otherwise record a part that finished
+            -- before it started. Mirrors recordOutcome's step 3 exactly.
+            print_started_at = CASE
+              WHEN op.status IN ('printing', 'done') AND op.print_started_at IS NULL
+                THEN LEAST(COALESCE(pb.print_started_at, pb.scheduled_start_at, now()), now())
+              ELSE op.print_started_at
+            END,
+            print_completed_at = CASE
+              WHEN op.status = 'done' AND op.print_completed_at IS NULL
+                THEN LEAST(COALESCE(pb.print_completed_at, pb.scheduled_end_at, now()), now())
+              ELSE op.print_completed_at
             END
-      WHERE company_id = $1 AND bed_id = $2`,
+       FROM print_beds pb
+      WHERE op.company_id = $1 AND op.bed_id = $2
+        AND pb.company_id = op.company_id AND pb.bed_id = op.bed_id`,
     [companyId, bedId]
   );
   await client.query(
@@ -330,8 +401,18 @@ export async function reevaluateBedAfterPieceRemoval(
       WHERE company_id = $1 AND bed_id = $2`,
     [companyId, bedId]
   );
-  // Dismantled, not deleted — the bed row and its plate files remain.
-  return [];
+  // The statement above detached EVERY piece, so the plate now holds nothing
+  // and — because `order_pieces.bed_id` is the only reference to a bed that
+  // exists anywhere in the schema — nothing can ever reach it again. That is
+  // precisely how empty 'disassembled' rows came to accumulate: dismantling
+  // severed the one link this function needs, so deleting the remaining pieces
+  // afterwards could no longer see the plate they used to sit on. Removing it
+  // here is what closes that hole at the source.
+  //
+  // `keepIfItRan` because the survivors are still alive: a plate that actually
+  // printed stays as the record of that run (the shape recordOutcome relies on),
+  // while one that never ran is a row no screen can display.
+  return (await deleteEmptyBedTx(client, companyId, bedId, { keepIfItRan: true })).keys;
 }
 
 /**

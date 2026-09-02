@@ -142,6 +142,10 @@ try {
     process.execPath,
     [
       "--disable-warning=MODULE_TYPELESS_PACKAGE_JSON",
+      // Lets a test import a src/ module that has extensionless relative
+      // imports of its own (cascade.ts → storage-keys). See the hook's header.
+      "--import",
+      "./scripts/register-ts-extension-resolver.mjs",
       "--test",
       ...INTEGRATION_TESTS,
     ],
